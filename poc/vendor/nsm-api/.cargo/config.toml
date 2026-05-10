@@ -1,0 +1,9 @@
+# Day 5 (Phase 1 Finding J fix): force cargo to use pre-vendored deps in
+# vendor/ instead of resolving fresh from crates.io. Without this, the
+# Dockerfile's `cargo build --offline --locked` would fail because cargo
+# couldn't find any sources.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

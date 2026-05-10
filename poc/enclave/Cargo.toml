@@ -1,0 +1,31 @@
+[package]
+name = "signer-enclave"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+# Phase 3 will add: aws-nitro-enclaves-nsm-api, reqwest, aws-sigv4, webpki-roots, rsa, cms
+
+# vsock is Linux-only; gate the dep so darwin / windows hosts can still
+# run `cargo fmt / clippy / test` against the cross-platform parts
+# (signer.rs HMAC tests, handler.rs unit tests, proto.rs serde tests).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+
+[[bin]]
+name = "signer-enclave"
+path = "src/main.rs"

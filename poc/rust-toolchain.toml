@@ -1,0 +1,9 @@
+[toolchain]
+channel = "1.83.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# musl target is needed inside the EIF builder image (Dockerfile does
+# `cargo build --target x86_64-unknown-linux-musl`). Listing it here
+# means rustup auto-installs it on any host the toolchain is materialized,
+# regardless of whether the base image had it preinstalled.
+targets = ["x86_64-unknown-linux-musl"]
