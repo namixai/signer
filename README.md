@@ -60,12 +60,42 @@ poc/
   policies/   # KMS key policies (PCR0-locked) + build pins
   scripts/    # build-eif.sh, deploy.sh, check-drift.sh, reproducibility-check.sh
   vendor/     # Vendored Rust crates for offline `cargo build --locked`
+  contracts/  # Foundry workspace: UsenamiAttestationRegistry.sol (Phase 1.5 on-chain trust anchor)
 
 sdk/
   python/     # usenami-signer Python SDK — `pip install usenami-signer`
               # Per-exchange namespaces: signer.kucoin, signer.binance,
               # signer.bybit, signer.okx, signer.hyperliquid_main
 ```
+
+---
+
+## On-chain trust anchor (Phase 1.5)
+
+You don't have to trust `usenami.io` to publish a truthful enclave measurement. The current production PCR0 is registered in an immutable on-chain registry on Base mainnet:
+
+- **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
+- **Owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
+- **Active PCR0**: `9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab`
+
+To verify the enclave you're talking to is the one we publish:
+
+```bash
+cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
+  "isPCR0Active(bytes)(bool,address)" \
+  0x9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab \
+  --rpc-url https://mainnet.base.org
+# → (true, 0x21538eBF6598e5866BA496A954dE8E39097bFB59)
+```
+
+Compare that PCR0 against what `nitro-cli describe-enclaves` reports on the running EC2. Both must match — and the contract owner must equal the address we publish out-of-band. If anything diverges, you've caught a swap.
+
+Contract design:
+- **Append-only** — `deprecatePCR0` marks expired but never deletes history.
+- **Owner-scoped** — each address controls its own PCR0 chain. Reading the registry answers "which owner registered this PCR0 and is it still active?"
+- **No proxy.** If the schema evolves, deploy v2; clients choose which address to trust.
+
+Source + tests + deploy script live in [`poc/contracts/`](./poc/contracts). 13/13 forge tests pass (10 functional + 1 fuzz @ 256 runs + 1 gas snapshot + production PCR0 sanity).
 
 ---
 

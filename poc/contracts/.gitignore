@@ -1,0 +1,14 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Dependencies (managed via forge install)
+# Keep lib/ tracked? Yes — checked-in deps make builds reproducible without forge install step.
+# Actually skip — too much churn. Standard Foundry workflow uses lib/ as gitignored.
+lib/
+
+# Local artifacts
+*.log
+.env
+.env.local
