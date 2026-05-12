@@ -1,0 +1,67 @@
+{
+  "name": "@usenami/signer",
+  "version": "0.1.0",
+  "description": "Hardware-isolated signing for crypto exchanges. AWS Nitro Enclave + KMS attestation. TypeScript SDK.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./verifier": {
+      "types": "./dist/verifier.d.ts",
+      "import": "./dist/verifier.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup src/index.ts src/verifier.ts --format esm,cjs --dts --clean",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "undici": "^6.19.0"
+  },
+  "peerDependencies": {
+    "viem": "^2.20.0"
+  },
+  "peerDependenciesMeta": {
+    "viem": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsup": "^8.2.4",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "eslint": "^9.9.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "signing",
+    "tee",
+    "nitro-enclave",
+    "crypto-exchange",
+    "ai-agent",
+    "policy-bounded-signing",
+    "upl",
+    "usenami"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/namixai/signer.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/namixai/signer/tree/main/sdk/typescript",
+  "bugs": "https://github.com/namixai/signer/issues"
+}

@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Id": "signer-poc-day3-attestation",
+  "Statement": [
+    {
+      "Sid": "EnableRootAdmin",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::194173164271:root"},
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AdminUserFullAccess",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::194173164271:user/alex-admin"},
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "BuilderManagementOnly",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::194173164271:user/signer-poc-builder"},
+      "Action": ["kms:DescribeKey","kms:GetKeyPolicy","kms:PutKeyPolicy","kms:Encrypt","kms:GenerateDataKey","kms:CreateAlias","kms:UpdateAlias","kms:ListAliases"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EnclaveAttestedDecryptOnly",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::194173164271:role/signer-poc-enclave-role"},
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:ImageSha384": "d3af9d9b78a3052874e694539d9ff0d3c768337bb9e62631c848a59ebcfbb5f76e8c01168bb2a9d7a97d84987aceef05"
+        }
+      }
+    },
+    {
+      "Sid": "DenyDirectDecryptWithoutAttestation",
+      "Effect": "Deny",
+      "Principal": {"AWS": ["arn:aws:iam::194173164271:user/signer-poc-builder","arn:aws:iam::194173164271:role/signer-poc-enclave-role"]},
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "Null": {"kms:RecipientAttestation:ImageSha384": "true"},
+        "StringNotEqualsIfExists": {"kms:ViaService": "s3.us-east-1.amazonaws.com"}
+      }
+    }
+  ]
+}
