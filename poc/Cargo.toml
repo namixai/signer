@@ -1,0 +1,41 @@
+[workspace]
+members = ["enclave", "parent", "gateway"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "Proprietary"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time"] }
+tokio-vsock = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }  # IndexMap → preserves JSON key order. CRITICAL for Hyperliquid msgpack (action keys must stay in insertion order to match HL spec).
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.5"
+zeroize = { version = "1.7", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+thiserror = "1"
+
+# Phase 1 Stage 2 — EIP-712 signing (Hyperliquid family).
+# Pinned minor versions so cargo --offline --locked picks identical deps
+# across rebuilds (Finding J determinism contract). RustCrypto crates are
+# audited, no_std-compat, and avoid pulling in async runtimes / network
+# layers that would bloat the EIF and balloon the PCR0 surface.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+rmp-serde = "1.3"  # OK with Rust 1.95 (edition2024 stable since 1.85)
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = "z"

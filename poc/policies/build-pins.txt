@@ -1,0 +1,116 @@
+# Signer PoC — reproducible build pins
+#
+# Captured: 2026-05-07
+# Purpose: every dependency and base image is pinned to an immutable
+# identifier (commit SHA or image digest) so two clean builds produce
+# byte-identical EIF and therefore identical PCR0.
+#
+# Without this file, Day 2 Finding F: floating tags + git tags that can
+# be force-pushed produce different PCR0 each rebuild → KMS attestation
+# policy locked to a PCR0 becomes impossible to renew on rebuild.
+
+###############################################################################
+# Docker base images — pinned by digest (immutable)
+###############################################################################
+# clux/muslrust:1.83.0-stable
+clux_muslrust_digest=sha256:b7fc8af3935272606a9682e5bbe21516744cf2f3934ce6f4d250198db3b2bd5c
+
+# public.ecr.aws/amazonlinux/amazonlinux:2
+amazonlinux_2_digest=sha256:c80c6d724a1907d0fdfe1e04f6ddff1e839311dadf19f9645646d4506bc0d2e5
+
+###############################################################################
+# Git source pins — by commit SHA (immutable; tag annotations are ignored)
+###############################################################################
+aws_lc=cb7712dfa896d32d55992e2cb13d5fa54fb77002              # tag v1.12.0
+s2n_tls=e954ee5dc878c5c343d35574e7d07246a1e59314             # tag v1.3.46
+aws_c_common=be35e65a6c67ae2ffd126516c9783ac1dd2e8910        # tag v0.8.0
+aws_c_sdkutils=e3c23f4aca31d9e66df25827645f72cbcbfb657a      # tag v0.1.2
+aws_c_cal=1458c70a26877345ca28e333a092096afd410774           # tag v0.5.18
+aws_c_io=8f4508f5ec7d2949d5545e2b1ddcd1beb47a76a8            # tag v0.11.0
+aws_c_compression=5fab8bc5ab5321d86f6d153b06062419080820ec   # tag v0.2.14
+aws_c_http=0600662610aa871a11aebe6ed67a11997317cbef          # tag v0.7.6
+aws_c_auth=831fa583b83574db29cbae139b42e0d7a1d1ebb8          # tag v0.6.15
+json_c=13fede6e87d94ea9015b8d2745a235e1b02700e7              # tag json-c-0.16-20220414
+aws_nitro_enclaves_nsm_api=5798fec36f49e1d199c77947f4e51f86b663750f  # tag v0.4.0
+aws_nitro_enclaves_sdk_c=4c88098890de1e371820b9e3c6bc535e69493119    # tag v0.4.0
+
+###############################################################################
+# Rust toolchain — exact version (not floating)
+###############################################################################
+rust_enclave=1.83.0           # rust-toolchain.toml
+rust_kmstool_nsm_lib=1.92.0   # built inside kmstool-builder stage
+
+###############################################################################
+# Vendored Rust deps (Day 5 — Phase 1 Finding J close)
+###############################################################################
+# Day 4 left Finding J (PCR0 reproducibility) partially closed: yum packages
+# pinned, but two clean builds STILL produced different PCR0 (472-byte diff
+# in 174 MB EIF). Root cause confirmed Day 5: aws-nitro-enclaves-nsm-api
+# upstream does NOT commit Cargo.lock → transitive Rust crates resolved
+# fresh from crates.io each build → libnsm.so contents drifted → PCR0
+# diff. Fix: vendor all 71 transitive deps + commit Cargo.lock + build
+# --offline --locked.
+#
+# Generation procedure (re-runnable):
+#   git clone https://github.com/aws/aws-nitro-enclaves-nsm-api.git
+#   cd aws-nitro-enclaves-nsm-api
+#   git checkout 5798fec36f49e1d199c77947f4e51f86b663750f  # tag v0.4.0
+#   rustup install 1.92.0 --profile minimal
+#   rustup run 1.92.0 cargo generate-lockfile
+#   rustup run 1.92.0 cargo vendor
+#   # Then add .cargo/config.toml with [source.crates-io] replace-with = "vendored-sources"
+#   # and copy whole tree (no .git, no target) to _signer/poc/vendor/nsm-api/
+#
+# Vendored 2026-05-10:
+nsm_api_upstream_tag_sha=5798fec36f49e1d199c77947f4e51f86b663750f  # annotated-tag SHA (refs/tags/v0.4.0)
+nsm_api_actual_commit_sha=4b851f3006c6fa98f23dcffb2cba03b39de9b8af # commit pointed-to by tag
+nsm_api_upstream_version=0.4.0
+nsm_api_vendored_path=_signer/poc/vendor/nsm-api/
+nsm_api_vendored_crate_count=71
+nsm_api_vendored_size=83M
+nsm_api_lockfile_size=17058 bytes
+nsm_api_cargo_resolver_version=automatic
+nsm_api_compatible_rust=1.92.0+  # rust-version field in Cargo.toml
+
+###############################################################################
+# yum packages (Day 4 — Finding J fix)
+###############################################################################
+# Captured 2026-05-08 by building probe image (yum install + rpm -qa).
+# These are the explicit packages requested in Dockerfile kmstool-builder
+# stage. Yum may pull in transitive deps which are NOT pinned here — but
+# Amazon Linux 2 yum is supposedly stable enough that locking explicit
+# packages drives reproducibility for the binary subset we care about.
+# If transitive deps still cause non-determinism, next escalation =
+# `yum-config-manager --enablerepo=amzn2-core --setopt=releasever=…` or
+# fully rebase to a custom locked image.
+yum_cmake3=cmake3-3.17.5-1.amzn2
+yum_gcc=gcc-7.3.1-18.amzn2
+yum_git=git-2.47.3-1.amzn2.0.1
+yum_tar=tar-1.26-35.amzn2.0.4
+yum_make=make-3.82-24.amzn2
+yum_gcc_cpp=gcc-c++-7.3.1-18.amzn2
+yum_golang=golang-1.25.9-1.amzn2.0.1   # "go" → "golang" via yum's name resolution
+yum_ninja_build=ninja-build-1.7.2-2.amzn2.0.1
+
+###############################################################################
+# Reproducibility verification protocol
+###############################################################################
+# 1. From a clean clone, run scripts/build-eif.sh
+# 2. Capture PCR0 from `nitro-cli describe-eif`
+# 3. Delete docker image: sudo docker rmi signer-enclave:latest
+# 4. Run scripts/build-eif.sh again
+# 5. Capture PCR0 again — must be byte-identical to step 2
+#
+# Day 4 (2026-05-08) verification: PCR0 = 936b6e78… RETIRED Day 5
+# Day 5 (2026-05-10) verification: PCR0 = d3af9d9b78a3052874e694539d9ff0d3c768337bb9e62631c848a59ebcfbb5f76e8c01168bb2a9d7a97d84987aceef05
+#
+# DAY 5 STATUS — Finding J STILL NOT FULLY CLOSED:
+# - Vendored nsm-api (71 crates, --offline --locked) → 7 fewer diff bytes (472 → 465).
+# - Build #1 PCR0 a11df7a6… vs Build #2 PCR0 d3af9d9b… still differ.
+# - Same ~465 byte diff regions across Day 4 + Day 5 builds (1KB blocks 0, 4964-66, 7475, 14693, 38279, 64834).
+# - File size IDENTICAL byte-for-byte (182,158,819) → not crate version drift.
+# - Hypothesis: remaining non-determinism in (a) git-cloned + cmake-built C libs (aws-lc, s2n-tls, 7 aws-c-*, json-c, aws-nitro-enclaves-sdk-c) OR (b) nitro-cli EIF format (AWS-side build-time nonce/timestamp).
+# - Phase 2 path: vendor C libs (1 week effort, uncertain) OR pin PCR1+PCR2 instead of PCR0 (less strict, possibly reproducible).
+#
+# OPERATOR IMPLICATION: each rebuild produces new PCR0. Operator must re-lock
+# KMS policy after every rebuild via runbook _hub/RUNBOOKS/signer-poc-rebuild.md.

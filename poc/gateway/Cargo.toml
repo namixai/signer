@@ -1,0 +1,58 @@
+[package]
+name = "signer-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+zeroize.workspace = true
+clap = { version = "=4.5.20", features = ["derive", "env"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+
+# Async sync primitives
+parking_lot = "0.12"
+
+# IMDSv2 is a 2-call HTTP flow over the link-local 169.254.169.254 address.
+# We pin reqwest at 0.12.5, which still resolves under digest 0.10 (newer
+# 0.12 minors transitively pull in `digest 0.11` which requires edition2024,
+# unavailable in our pinned Rust 1.83 toolchain).
+#
+# The S3 GetObject for the KMS-encrypted blob is intentionally NOT done
+# in-process. The operator pre-stages the ciphertext to a local file (via
+# `aws s3 cp` in the systemd unit's ExecStartPre), and the gateway reads
+# the file path from `SIGNER_BLOB_PATH`. That keeps the gateway dep set
+# small and removes a SigV4 surface from the auditable binary.
+reqwest = { version = "=0.12.5", default-features = false, features = ["rustls-tls", "json"] }
+http = "1"
+
+# Pin away from `idna_adapter >= 1.2.2` and friends — those require
+# Cargo's edition2024 feature, unavailable on Rust 1.83.
+idna_adapter = "=1.2.1"
+litemap = "=0.7.4"
+zerofrom = "=0.1.5"
+icu_collections = "=1.5.0"
+icu_locid = "=1.5.0"
+icu_locid_transform = "=1.5.0"
+icu_normalizer = "=1.5.0"
+icu_properties = "=1.5.0"
+icu_provider = "=1.5.0"
+
+# Vsock (Linux-only). Gated so darwin / windows hosts can still
+# `cargo fmt / clippy / test` against the cross-platform parts.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+
+[[bin]]
+name = "signer-gateway"
+path = "src/main.rs"

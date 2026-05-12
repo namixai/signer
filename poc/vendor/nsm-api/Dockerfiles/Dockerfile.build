@@ -1,0 +1,15 @@
+FROM public.ecr.aws/amazonlinux/amazonlinux:2
+ARG RUST_VERSION=stable
+ENV RUST_VERSION=${RUST_VERSION}
+
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN yum install -y ca-certificates gcc libc6-dev && \
+	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain ${RUST_VERSION} && \
+	rm -rf /var/lib/apt/lists/*
+
+ADD . /build
+WORKDIR /build 
