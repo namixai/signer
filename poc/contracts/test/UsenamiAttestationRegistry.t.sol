@@ -405,6 +405,12 @@ contract UsenamiAttestationRegistryTest is Test {
 contract RegistryHandler is Test {
     UsenamiAttestationRegistry public registry;
     address[] internal _actors;
+    /// Dedup guard: prevents `_actors` from growing with duplicates when the
+    /// same actor's `registerNew` succeeds multiple times (the registry's
+    /// auto-deprecate semantics let that happen). Gemini Code Assist catch
+    /// on PR #20 / OSS #6: without this, `invariant_*` does redundant work
+    /// proportional to the duplicate count, slowing fuzz runs noticeably.
+    mapping(address => bool) internal _isActor;
 
     constructor(UsenamiAttestationRegistry _registry) {
         registry = _registry;
@@ -439,7 +445,15 @@ contract RegistryHandler is Test {
 
         vm.prank(actor);
         try registry.registerPCR0(pcr, bytes32(0), "") {
-            _actors.push(actor);
+            // Dedup: only push if we haven't seen this actor before.
+            // Foundry's invariant fuzzer can call registerNew for the same
+            // derived actor multiple times across runs; the registry's
+            // auto-deprecate semantics allow it to succeed each time. Without
+            // dedup `_actors` grows unboundedly and slows invariant checks.
+            if (!_isActor[actor]) {
+                _isActor[actor] = true;
+                _actors.push(actor);
+            }
         } catch {
             // Swallow expected reverts (e.g. fresh-actor double-register
             // race within the same fuzz run).
