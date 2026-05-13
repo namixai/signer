@@ -206,5 +206,20 @@ contract UsenamiAttestationRegistryTest is Test {
         // The disciplined customer who strict-compares `owner == ALICE_CANONICAL`
         // would reject. Both behaviours pinned here so v2 work doesn't silently
         // break either expectation.
+
+        // Blast-radius assertions — Alice (legitimate prior owner) is now
+        // completely locked out of this PCR0 hash:
+        //   - cannot re-register: bob owns it, registerPCR0 reverts.
+        //   - cannot deprecate:   she's not msg.sender for this hash anymore.
+        // These two reverts demonstrate why "registry consistency" alone is
+        // not a substitute for the strict-owner check in customer SDKs —
+        // even if Alice tries to reclaim her own previously-registered PCR0,
+        // the contract correctly refuses (it doesn't know Alice was first).
+        vm.startPrank(alice);
+        vm.expectRevert(UsenamiAttestationRegistry.PCR0AlreadyRegistered.selector);
+        registry.registerPCR0(PCR_A, bytes32(uint256(3)), "alice retake attempt");
+        vm.expectRevert(UsenamiAttestationRegistry.NotOwnerOfPCR0.selector);
+        registry.deprecatePCR0(PCR_A);
+        vm.stopPrank();
     }
 }
