@@ -11,7 +11,7 @@ evm_version = "cancun"
 [invariant]
 runs = 1000
 depth = 25
-fail_on_revert = false
+fail_on_revert = true
 
 [rpc_endpoints]
 base = "https://mainnet.base.org"
