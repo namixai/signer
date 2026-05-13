@@ -360,40 +360,23 @@ contract UsenamiAttestationRegistryTest is Test {
     function invariant_ActiveOwnerMatchesUndeprecatedRecord() public view {
         address[] memory actorList = handler.getActors();
         for (uint256 i = 0; i < actorList.length; i++) {
-            UsenamiAttestationRegistry.PCR0Record[] memory hist =
-                registry.getOwnerHistory(actorList[i]);
-            if (hist.length == 0) continue;
+            bytes memory lastPcr0 = handler.getLastPCR0(actorList[i]);
+            if (lastPcr0.length == 0) continue;
 
-            // Last record in history is the most recently registered for
-            // this owner. The mapping must agree with its deprecation
-            // status. v1-realistic predicate (see NatSpec above and the
-            // H-1 squatter regression test for full context):
-            //   - deprecatedAt == 0  =>  mapping points to this owner
-            //   - deprecatedAt > 0   =>  mapping does NOT claim this owner
-            //                            (zero OR a different squatter address)
-            // The strict reading (mapping == zero in the deprecated case)
-            // does not hold in v1 because the squatter scenario can flip
-            // the mapping to another address after deprecation.
-            UsenamiAttestationRegistry.PCR0Record memory last =
-                hist[hist.length - 1];
-            bytes32 h = keccak256(last.pcr0);
+            bytes32 h = keccak256(lastPcr0);
             address owner = registry.activePCR0OwnerByHash(h);
 
-            if (last.deprecatedAt == 0) {
+            if (handler.isLastRecordActive(actorList[i])) {
                 assertEq(
                     owner,
                     actorList[i],
                     "invariant break (active branch): active record but mapping points elsewhere"
                 );
             } else {
-                // v1-realistic: mapping either is zero (no one squatted)
-                // OR points to a DIFFERENT address (squatter took over).
-                // Either way, it must NOT still claim the original owner.
-                // See NatSpec above for H-1 context.
                 assertNotEq(
                     owner,
                     actorList[i],
-                    "invariant break (deprecated branch): deprecated record but mapping still claims original owner - would indicate a non-H-1 state drift"
+                    "invariant break (deprecated branch): deprecated record but mapping still claims original owner"
                 );
             }
         }
@@ -418,15 +401,23 @@ contract RegistryHandler is Test {
     /// on PR #20 / OSS #6: without this, `invariant_*` does redundant work
     /// proportional to the duplicate count, slowing fuzz runs noticeably.
     mapping(address => bool) internal _isActor;
+    mapping(address => bytes) internal _lastPCR0;
+    mapping(address => bool) internal _lastRecordActive;
 
     constructor(UsenamiAttestationRegistry _registry) {
         registry = _registry;
     }
 
-    /// Read-only accessor for the invariant function. Returns a memory
-    /// snapshot of the actor list at call time.
     function getActors() external view returns (address[] memory) {
         return _actors;
+    }
+
+    function getLastPCR0(address actor) external view returns (bytes memory) {
+        return _lastPCR0[actor];
+    }
+
+    function isLastRecordActive(address actor) external view returns (bool) {
+        return _lastRecordActive[actor];
     }
 
     /// Fuzz target: register a fresh PCR0. The fuzzer chooses both the
@@ -455,11 +446,8 @@ contract RegistryHandler is Test {
 
         vm.prank(actor);
         try registry.registerPCR0(pcr, bytes32(0), "") {
-            // Dedup: only push if we haven't seen this actor before.
-            // Foundry's invariant fuzzer can call registerNew for the same
-            // derived actor multiple times across runs; the registry's
-            // auto-deprecate semantics allow it to succeed each time. Without
-            // dedup `_actors` grows unboundedly and slows invariant checks.
+            _lastPCR0[actor] = pcr;
+            _lastRecordActive[actor] = true;
             if (!_isActor[actor]) {
                 _isActor[actor] = true;
                 _actors.push(actor);
@@ -481,7 +469,9 @@ contract RegistryHandler is Test {
             UsenamiAttestationRegistry.PCR0Record memory r
         ) {
             vm.prank(actor);
-            try registry.deprecatePCR0(r.pcr0) {} catch {
+            try registry.deprecatePCR0(r.pcr0) {
+                _lastRecordActive[actor] = false;
+            } catch {
                 // Already deprecated by a previous fuzz step.
             }
         } catch {
