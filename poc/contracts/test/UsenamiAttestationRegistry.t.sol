@@ -286,11 +286,13 @@ contract UsenamiAttestationRegistryTest is Test {
     /// anyone" (blocked) — OR provide a separate `unretireOwn` entry point.
     /// This test documents the v1 baseline for that v2 design decision.
     function test_OwnReRegisterAfterDeprecate() public {
-        // Round 1: alice registers + deprecates.
-        vm.prank(alice);
+        // Round 1: alice registers + deprecates. Use startPrank/stopPrank to
+        // group calls from the same actor — matches the style used in
+        // test_V1_SquatterAfterDeprecateRecycle elsewhere in this file.
+        vm.startPrank(alice);
         registry.registerPCR0(PCR_A, bytes32(uint256(1)), "build v1");
-        vm.prank(alice);
         registry.deprecatePCR0(PCR_A);
+        vm.stopPrank();
 
         (bool active1, address owner1) = registry.isPCR0Active(PCR_A);
         assertFalse(active1);
@@ -363,10 +365,15 @@ contract UsenamiAttestationRegistryTest is Test {
             if (hist.length == 0) continue;
 
             // Last record in history is the most recently registered for
-            // this owner. The mapping should agree with its deprecation
-            // status:
+            // this owner. The mapping must agree with its deprecation
+            // status. v1-realistic predicate (see NatSpec above and the
+            // H-1 squatter regression test for full context):
             //   - deprecatedAt == 0  =>  mapping points to this owner
-            //   - deprecatedAt > 0   =>  mapping is zero (deprecated)
+            //   - deprecatedAt > 0   =>  mapping does NOT claim this owner
+            //                            (zero OR a different squatter address)
+            // The strict reading (mapping == zero in the deprecated case)
+            // does not hold in v1 because the squatter scenario can flip
+            // the mapping to another address after deprecation.
             UsenamiAttestationRegistry.PCR0Record memory last =
                 hist[hist.length - 1];
             bytes32 h = keccak256(last.pcr0);
@@ -431,11 +438,14 @@ contract RegistryHandler is Test {
 
         // Build a 48-byte PCR0 from the seed: 32 bytes keccak + 16 bytes
         // derived. Total = 48 bytes exactly.
+        // Build a 48-byte PCR0: abi.encodePacked of bytes32 (32) + bytes16
+        // (16) is guaranteed by the type system to produce exactly 48 bytes,
+        // so no runtime length check is needed here. (Gemini Code Assist
+        // catch on PR #20 — removed redundant `if (pcr.length != 48) return`.)
         bytes memory pcr = abi.encodePacked(
             keccak256(abi.encode(seed)),
             bytes16(keccak256(abi.encode(seed, "_lo")))
         );
-        if (pcr.length != 48) return; // belt + braces
 
         // Skip if already registered (the validPCR0 modifier would still
         // accept, but registerPCR0 would revert PCR0AlreadyRegistered —
