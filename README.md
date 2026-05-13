@@ -4,7 +4,7 @@
 
 Your exchange API secrets never leave a measured AWS Nitro Enclave. Even root on the host VM can't read them. AWS KMS releases secrets only to a specific, attested binary — change one byte, KMS denies.
 
-🔗 **Live demo:** [signer-demo.usenami.io:8443/healthz](http://signer-demo.usenami.io:8443/healthz)
+🔗 **Live demo:** [signer-demo.usenami.io:8443/healthz](http://signer-demo.usenami.io:8443/healthz) (allowlisted pilots only) &middot; full walkthrough in [`DEMO.md`](DEMO.md)
 📜 **License:** Apache-2.0
 
 ---
