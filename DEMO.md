@@ -247,6 +247,21 @@ Or with no tools at all, in your browser:
 
 Click *2. isPCR0Active*, paste the PCR0 hex above, read the result.
 
+**A note on RPC trust for high-stakes verifiers.** The `cast` command
+above uses a public RPC endpoint, which is itself a trust assumption.
+A sophisticated adversary controlling that RPC could return a fake
+`true` response. For verification under high adversarial assumption
+(large funds at stake, suspected targeted attack):
+
+- Run your own Base node, or use a self-hosted RPC.
+- Query the contract through at least two independent RPC providers
+  and require agreement.
+- Cross-check via Basescan's UI in your browser, which is served by
+  a different infrastructure path.
+
+The on-chain state itself is canonical; only your *view* of it is
+RPC-mediated.
+
 Expected output:
 
 ```
@@ -327,6 +342,18 @@ Mitigations in flight:
 Until Phase 2 ships, the practical security argument is "key
 compromise of one EOA = registry compromise"; we are honest that this
 is below where we want the bar.
+
+**Note on historical PCR0s.** The contract enforces single-active-
+per-owner: registering a new PCR0 auto-deprecates the previous one in
+the same owner's history, and the `activePCR0OwnerByHash` mapping is
+cleared for the deprecated hash. A query for an old (deprecated) PCR0
+returns `(false, 0x0000…)` — old measurements cannot remain "active in
+parallel" with the current one. This matters because a sophisticated
+adversary would otherwise target an older enclave version still
+marked active. SDKs integrating against the registry should still
+check that the *currently registered* PCR0 matches what their session
+attestation reports — not just that the registry knows about the
+attestation's PCR0.
 
 (Mandatory caveat for any reader integrating against this: when your
 software calls `isPCR0Active`, you must strict-check that the returned
@@ -462,6 +489,58 @@ allows us to be honest about it: a gateway compromise is recoverable
 without secret rotation, because the secrets never lived on the
 gateway in the first place.
 
+### What the gateway *does* see — strategy-leakage honesty
+
+The flip side of the gateway's untrusted role: in the current Phase 1
+wire format, the gateway sees the request metadata in plaintext. For
+the `/sign` POST body, this means:
+
+- The exchange you are trading on.
+- The HTTP method and API path you target (e.g.
+  `POST /api/v5/trade/order`).
+- The request body itself (for HMAC venues) — your order parameters,
+  prices, sizes.
+
+It does *not* see exchange API secrets. But a compromised gateway —
+or, in the worst case, a malicious Usenami operator — could in
+principle observe your trading strategy in real time. For a
+funding-arbitrage or stat-arb strategy this is information that has
+market value to a sophisticated front-runner.
+
+This is a trust-but-verify property of Phase 1, and we are not
+hand-waving it. Phase 2 introduces an enclave-side session key
+exchange (via the Nitro attestation document, see above) and shifts
+request bodies to ciphertext between client and enclave. After
+Phase 2 ships, the gateway sees only an opaque blob plus
+non-strategic routing metadata.
+
+If your strategy's value depends on its informational secrecy (not
+just on its execution security), you may want to wait for Phase 2.
+We will say so explicitly during pilot onboarding.
+
+### KMS policy is the load-bearing constraint
+
+The single most important architectural commitment is in the KMS key
+policy that protects the encrypted secret blobs. It must allow
+`kms:Decrypt` *only* via Nitro Enclave attestation matching a
+specific PCR0 — never via an IAM principal alone, never with an
+"admin debug" bypass, never with a wildcard role.
+
+Concretely, the policy uses
+`kms:RecipientAttestation:ImageSha384` as a `StringEquals` condition,
+locking decryption to the production PCR0 measurement. No IAM user,
+not even the AWS root account holder, can `kms:Decrypt` the secret
+blob outside the attested enclave. This is the property that makes
+the entire architecture mean anything — if KMS could be persuaded to
+hand over plaintext to a non-enclave caller, all other defenses are
+decorative.
+
+We publish the production KMS key policy alongside the signer source
+under `poc/policies/`, and the Phase 2 roadmap includes a formal
+**KMS Key Policy Audit** as part of every pre-production release
+checklist — a second pair of eyes confirming no IAM-only decrypt path
+ever lands in production.
+
 ---
 
 ## What this demo does not show
@@ -480,6 +559,15 @@ To stay honest:
   published as of 2026, but the theoretical risk is not zero.
 - **Multi-party key rotation ceremonies.** Out of scope for a
   five-minute demo. Documented internally and available on request.
+- **Deep UPL policy semantics.** The Phase 1.5 Usenami Policy Layer
+  enforces coarse-grained limits (allowed venues, allowed methods,
+  per-window value caps). It does not currently deep-inspect every
+  exchange-specific body parameter for semantic equivalence with a
+  declared intent. A sophisticated insider could in principle abuse
+  exchange API polymorphism (special order types, hidden parameters)
+  to take an action that the UPL rule did not anticipate. Phase 2 of
+  UPL adds per-exchange semantic models — until then, pilot users
+  should treat UPL as a coarse safety net, not a complete sandbox.
 
 ---
 
