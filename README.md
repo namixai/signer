@@ -78,7 +78,11 @@ You don't have to trust `usenami.io` to publish a truthful enclave measurement. 
 - **Owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
 - **Active PCR0**: `9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab`
 
-To verify the enclave you're talking to is the one we publish:
+### How to verify (the correct way — read this carefully)
+
+The PCR0 alone is **not** enough. Three checks must all pass; any one of them is bypassable on its own.
+
+**1. PCR0 registered, owned by us, currently active:**
 
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
@@ -88,14 +92,56 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 # → (true, 0x21538eBF6598e5866BA496A954dE8E39097bFB59)
 ```
 
-Compare that PCR0 against what `nitro-cli describe-enclaves` reports on the running EC2. Both must match — and the contract owner must equal the address we publish out-of-band. If anything diverges, you've caught a swap.
+⚠️ **Critical: strict-compare the owner address.** If your code just checks `if (active) accept` and ignores the owner, an attacker can register the same 48 bytes after we deprecate and you will accept their fake attestation. The canonical Usenami owner is:
 
-Contract design:
+```
+0x21538eBF6598e5866BA496A954dE8E39097bFB59
+```
+
+(Published here in the OSS source, on Basescan as the contract deployer, and in our [`STATUS.md`](https://github.com/namixai/usenami-platform/blob/main/_signer/STATUS.md). If any of these three sources disagree, do not trust this registry — open an issue.)
+
+Reference snippet for SDKs:
+
+```rust
+let (active, owner) = registry.is_pcr0_active(pcr0).await?;
+const USENAMI_OWNER: Address = address!("0x21538eBF6598e5866BA496A954dE8E39097bFB59");
+if !active || owner != USENAMI_OWNER {
+    return Err(AttestationError::UnauthorizedEnclave);
+}
+```
+
+**2. Running enclave measurement matches the registered PCR0:**
+
+```bash
+# On the host running the enclave you intend to trust:
+nitro-cli describe-enclaves | jq -r '.[0].Measurements.PCR0'
+# Must equal the PCR0 you queried in step 1.
+```
+
+**3. KMS key policy is bound to that specific PCR0 (not "any enclave"):**
+
+```bash
+aws kms get-key-policy --key-id <our-kms-key-id> --policy-name default \
+  | jq -r '.Policy | fromjson | .Statement[]
+           | select(.Sid == "EnclaveAttestedDecryptOnly")
+           | .Condition.StringEqualsIgnoreCase["kms:RecipientAttestation:ImageSha384"]'
+# Must equal the PCR0 from steps 1 and 2.
+```
+
+All four sources (registry, running enclave, KMS policy, [`STATUS.md`](https://github.com/namixai/usenami-platform/blob/main/_signer/STATUS.md)) must hold the same PCR0. If any diverge, you've caught either a misconfiguration or an active attack — refuse to use the service until resolved.
+
+### Contract design notes
+
 - **Append-only** — `deprecatePCR0` marks expired but never deletes history.
-- **Owner-scoped** — each address controls its own PCR0 chain. Reading the registry answers "which owner registered this PCR0 and is it still active?"
-- **No proxy.** If the schema evolves, deploy v2; clients choose which address to trust.
+- **Owner-scoped** — each address controls its own PCR0 chain. The registry answers "which owner registered this PCR0 and is it still active?" — answering "yes" to the second half does NOT imply the answer to "is this Usenami's enclave?"; that's why step 1 above includes the strict owner check.
+- **`description` field is self-reported by the registrant.** Any UI/SDK displaying it MUST prefix with `[self-reported by <owner>]` — it is not validated, signed, or attested. Treat as you would treat ENS profile data.
+- **No proxy.** If the schema evolves, we deploy v2 and republish the canonical address. Clients choose which contract address to trust based on the published owner.
 
-Source + tests + deploy script live in [`poc/contracts/`](./poc/contracts). 13/13 forge tests pass (10 functional + 1 fuzz @ 256 runs + 1 gas snapshot + production PCR0 sanity).
+### Known limitation (will be fixed in v2)
+
+**Squatter risk after deprecation** — when we deprecate a PCR0, the `activePCR0OwnerByHash` mapping clears to zero. The current v1 contract allows anyone to register the same 48 bytes afterward and become the new "owner" of that PCR0 hash. Customers MUST rely on the strict-owner check in step 1 above; v2 will additionally maintain a `retired` mapping that permanently blocks re-registration of previously-seen PCR0s. Tracked in [issue #4](https://github.com/namixai/signer/issues/4).
+
+Source + tests + deploy script live in [`poc/contracts/`](./poc/contracts). 13/13 forge tests pass (10 functional + 1 fuzz @ 256 runs + 1 gas snapshot + production PCR0 sanity). See [`poc/contracts/test/`](./poc/contracts/test) for the squatter regression test which pins v1 behavior and documents the v2 contract.
 
 ---
 

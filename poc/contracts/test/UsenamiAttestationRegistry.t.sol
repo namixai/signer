@@ -164,4 +164,47 @@ contract UsenamiAttestationRegistryTest is Test {
         vm.prank(alice);
         registry.registerPCR0(PCR_A, bytes32(uint256(42)), "production v1");
     }
+
+    /// @notice Documents the v1 squatter vulnerability — H-1 finding from the
+    ///         2026-05-13 AI security team dogfood audit. After alice deprecates
+    ///         her PCR0, the `activePCR0OwnerByHash` mapping clears to zero, and
+    ///         bob can register the IDENTICAL 48 bytes and become the new owner
+    ///         of that hash. Customers who only check `active == true` (and not
+    ///         `owner == hardcoded_usenami_address`) will accept bob's
+    ///         attestation as canonical.
+    ///
+    ///         This test PINS v1 behaviour. The v2 contract MUST flip this test
+    ///         to revert on bob's register (via a permanent `retired` mapping).
+    ///         See issue #4 for the v2 plan.
+    ///
+    ///         Operational mitigation for v1: customer SDKs strict-compare the
+    ///         returned owner against the canonical Usenami address published
+    ///         out-of-band. The README's "How to verify" section documents the
+    ///         required SDK pattern.
+    function test_V1_SquatterAfterDeprecateRecycle() public {
+        // Alice — the legitimate registrant — registers and then deprecates.
+        vm.startPrank(alice);
+        registry.registerPCR0(PCR_A, bytes32(uint256(1)), "v1 alice");
+        registry.deprecatePCR0(PCR_A);
+        vm.stopPrank();
+
+        // Mapping cleared.
+        (bool stillActive, address stillOwner) = registry.isPCR0Active(PCR_A);
+        assertFalse(stillActive);
+        assertEq(stillOwner, address(0));
+
+        // Bob (the squatter) registers the same 48 bytes. v1 lets him through.
+        vm.prank(bob);
+        registry.registerPCR0(PCR_A, bytes32(uint256(2)), "v1 squatted by bob");
+
+        // Now the registry's answer is "yes, this PCR0 is active — and bob owns it."
+        (bool active, address owner) = registry.isPCR0Active(PCR_A);
+        assertTrue(active);
+        assertEq(owner, bob);
+
+        // The naive customer who just checks `active` would accept bob.
+        // The disciplined customer who strict-compares `owner == ALICE_CANONICAL`
+        // would reject. Both behaviours pinned here so v2 work doesn't silently
+        // break either expectation.
+    }
 }
