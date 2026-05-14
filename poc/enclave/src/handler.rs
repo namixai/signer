@@ -655,12 +655,11 @@ fn validate_asterdex_body(body: &str, derived: &[u8; 20]) -> Result<(), &'static
 
     // Expected signer literal: `signer=0xabcdef0123...` (lowercase).
     // 49 bytes total (`signer=` + `0x` + 40 hex chars).
-    let mut expected_signer = String::with_capacity(49);
-    expected_signer.push_str("signer=0x");
-    for b in derived.iter() {
-        use std::fmt::Write as _;
-        let _ = write!(&mut expected_signer, "{:02x}", b);
-    }
+    //
+    // Round-4 Gemini catch: use `format!` + `hex::encode` to match the
+    // address formatting at the bottom of `handle_sign_asterdex` instead
+    // of the manual byte-by-byte write! loop.
+    let expected_signer = format!("signer=0x{}", hex::encode(derived));
 
     // ── signer=<derived> check ─────────────────────────────────────────
     //

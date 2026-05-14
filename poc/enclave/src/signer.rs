@@ -621,12 +621,14 @@ pub fn parse_evm_private_key(s: &str) -> Result<Zeroizing<[u8; 32]>> {
     if stripped.len() != 64 {
         anyhow::bail!("private key must be 32 bytes (64 hex chars)");
     }
-    let mut bytes = Zeroizing::new(
+    // `Zeroizing<Vec<u8>>` automatically zeros its backing storage on
+    // drop at function exit — no manual loop needed. Round-4 Gemini
+    // catch on OSS PR #8.
+    let bytes = Zeroizing::new(
         hex::decode(stripped).map_err(|_| anyhow::anyhow!("private key is not valid hex"))?,
     );
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&bytes);
-    bytes.iter_mut().for_each(|b| *b = 0);
     Ok(out)
 }
 
