@@ -639,12 +639,17 @@ fn handle_sign_hyperliquid_main_cancel(req: SignRequest) -> SignResponse {
 /// find-first + reject-duplicate pattern. The current implementation
 /// applies the find-first + reject-duplicate rule symmetrically to both
 /// `signer=` and `nonce=`.
+/// Hard cap on Asterdex v3 request body length. The longest legitimate
+/// batch order we've seen is ~2KB; 8KB gives 4x margin. Anything beyond
+/// is treated as DoS / abuse. Hoisted to module scope so the dispatcher
+/// can check it BEFORE a KMS round-trip (Gemini round 3 catch).
+const ASTERDEX_MAX_BODY_LEN: usize = 8 * 1024;
+
 fn validate_asterdex_body(body: &str, derived: &[u8; 20]) -> Result<(), &'static str> {
-    // Cap body length aggressively. The longest legitimate Asterdex v3
-    // request body we've seen (batch order with 20 entries) is ~2KB.
-    // 8KB gives 4x margin. Beyond that = abuse / DoS attempt.
-    const MAX_BODY_LEN: usize = 8 * 1024;
-    if body.len() > MAX_BODY_LEN {
+    // Defense in depth: even though handle_sign_asterdex now checks the
+    // body length before KMS decrypt, keep the validator's own check so
+    // direct unit-test callers still get the protection.
+    if body.len() > ASTERDEX_MAX_BODY_LEN {
         return Err(err_code::BAD_REQUEST);
     }
 
@@ -676,13 +681,35 @@ fn validate_asterdex_body(body: &str, derived: &[u8; 20]) -> Result<(), &'static
     }
     // Value at that position must equal expected literal exactly. This
     // is the strict-owner-binding line.
+    //
+    // Round-3 Gemini catch: `starts_with` alone would accept
+    // `signer=0x<40_hex>EXTRA...` (any trailing chars before `&`). The
+    // backend parser would read those trailing chars as part of the
+    // value, but the enclave's commit would be over a different
+    // (truncated) byte string — signature would fail validation, but
+    // worse, an attacker could intentionally craft body that hashes
+    // one way for us and another way for the backend. We require the
+    // byte immediately AFTER the expected literal to be either `&`
+    // (next param) or string-end. No trailing characters allowed.
     if !body[first_signer_start..].starts_with(&expected_signer) {
         return Err(err_code::BAD_REQUEST);
     }
-    // Reject duplicate `signer=` param anywhere later in the body. We
-    // skip past our own match (offset by `signer=`.len()) and look again.
-    let signer_field_len = "signer=".len();
-    if body[first_signer_start + signer_field_len..].contains("signer=") {
+    let signer_value_end = first_signer_start + expected_signer.len();
+    if signer_value_end != body.len()
+        && body.as_bytes().get(signer_value_end).copied() != Some(b'&')
+    {
+        return Err(err_code::BAD_REQUEST);
+    }
+    // Reject duplicate `signer=` param anywhere later in the body.
+    //
+    // Round-3 Gemini catch: `contains("signer=")` would false-positive
+    // on substrings inside other param values (e.g. `note=signer=foo`).
+    // The find-first boundary check already rejected `note=signer=...`
+    // as the FIRST occurrence, but for the duplicate scan we look only
+    // after our matched value. Using `&signer=` (with leading `&`) as
+    // the duplicate-needle correctly identifies parameter boundaries
+    // without false-positiving on substrings within values.
+    if body[signer_value_end..].contains("&signer=") {
         return Err(err_code::BAD_REQUEST);
     }
 
@@ -709,9 +736,8 @@ fn validate_asterdex_body(body: &str, derived: &[u8; 20]) -> Result<(), &'static
     if !nonce_value.chars().all(|c| c.is_ascii_digit()) {
         return Err(err_code::BAD_REQUEST);
     }
-    // Reject duplicate `nonce=` param.
-    let nonce_field_len = "nonce=".len();
-    if body[first_nonce_start + nonce_field_len..].contains("nonce=") {
+    // Round-3 Gemini catch: same `&nonce=` boundary fix as signer=.
+    if body[nonce_end..].contains("&nonce=") {
         return Err(err_code::BAD_REQUEST);
     }
 
@@ -735,6 +761,13 @@ fn handle_sign_asterdex(req: SignRequest) -> SignResponse {
         // accepts it) but a no-body Asterdex request makes no sense
         // operationally — every signed endpoint needs at least nonce
         // and signer. Reject as bad_request to catch SDK bugs early.
+        return SignResponse::err(err_code::BAD_REQUEST);
+    }
+    // Round-3 Gemini catch: hoisted body-length check before KMS round-trip.
+    // The validator also checks this (defense in depth), but rejecting
+    // oversized inputs here saves an expensive KMS Decrypt + secp256k1
+    // derive on abuse traffic.
+    if body.len() > ASTERDEX_MAX_BODY_LEN {
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
@@ -1357,6 +1390,83 @@ mod tests {
         let body = "signer=0x2222222222222222222222222222222222222222\
                     &nonce=1234567890123\
                     &signer=0x1111111111111111111111111111111111111111";
+        assert!(validate_asterdex_body(body, &derived).is_err());
+    }
+
+    // ─── Round-3 Gemini catches — strict value-end + boundary needles ─
+
+    /// Round-3 catch: `signer=0x<derived>EXTRA...` with trailing chars
+    /// before `&` would pass `starts_with` but commit to the wrong
+    /// canonical bytes vs. what the backend parses. Reject.
+    #[test]
+    fn validate_asterdex_body_rejects_signer_with_trailing_chars() {
+        let derived: [u8; 20] = [0x11; 20];
+        // Body has signer=0x1111...1111 followed by extra hex chars
+        // before the next param boundary. Backend would read the full
+        // value (including EXTRA) as the signer parameter; enclave
+        // commit is over the full body, but our 49-byte expected
+        // literal stops at hex[40] — mismatch.
+        let body = "signer=0x1111111111111111111111111111111111111111EXTRA\
+                    &nonce=1234567890123";
+        assert!(validate_asterdex_body(body, &derived).is_err());
+    }
+
+    /// Round-3 catch: signer value ends at body-end with no trailing
+    /// chars — must PASS. (Sanity: the strict end-check shouldn't break
+    /// the common case where signer= is the last param.)
+    #[test]
+    fn validate_asterdex_body_accepts_signer_at_body_end() {
+        let derived: [u8; 20] = [0x11; 20];
+        let body = "nonce=1234567890123\
+                    &signer=0x1111111111111111111111111111111111111111";
+        assert!(validate_asterdex_body(body, &derived).is_ok());
+    }
+
+    /// Round-3 catch: `note=signer=foo` should NOT trip the duplicate
+    /// `signer=` detection, because the substring is inside another
+    /// param's value, not a real duplicate parameter. With the legit
+    /// signer= as first param, this body is valid.
+    #[test]
+    fn validate_asterdex_body_accepts_signer_substring_inside_value() {
+        let derived: [u8; 20] = [0x11; 20];
+        let body = "signer=0x1111111111111111111111111111111111111111\
+                    &nonce=1234567890123\
+                    &note=mysigner=foo";
+        // The substring `signer=` appears inside the value of `note=`,
+        // but it's not preceded by `&`. The `&signer=` needle now
+        // correctly skips it. Body is valid.
+        assert!(validate_asterdex_body(body, &derived).is_ok());
+    }
+
+    /// Round-3 catch: same for `nonce=` inside another param's value.
+    #[test]
+    fn validate_asterdex_body_accepts_nonce_substring_inside_value() {
+        let derived: [u8; 20] = [0x11; 20];
+        let body = "signer=0x1111111111111111111111111111111111111111\
+                    &nonce=1234567890123\
+                    &note=mynonce=stuff";
+        assert!(validate_asterdex_body(body, &derived).is_ok());
+    }
+
+    /// Round-3 catch: real duplicate `&signer=` after the value must
+    /// still be rejected (regression guard on the new `&`-prefixed
+    /// duplicate scan).
+    #[test]
+    fn validate_asterdex_body_still_rejects_real_duplicate_signer_after_fix() {
+        let derived: [u8; 20] = [0x11; 20];
+        let body = "signer=0x1111111111111111111111111111111111111111\
+                    &nonce=1234567890123\
+                    &signer=0x2222222222222222222222222222222222222222";
+        assert!(validate_asterdex_body(body, &derived).is_err());
+    }
+
+    /// Round-3 catch: real duplicate `&nonce=` still rejected.
+    #[test]
+    fn validate_asterdex_body_still_rejects_real_duplicate_nonce_after_fix() {
+        let derived: [u8; 20] = [0x11; 20];
+        let body = "signer=0x1111111111111111111111111111111111111111\
+                    &nonce=1234567890123\
+                    &nonce=9999999999999";
         assert!(validate_asterdex_body(body, &derived).is_err());
     }
 
