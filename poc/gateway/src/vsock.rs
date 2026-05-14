@@ -185,6 +185,11 @@ mod tests {
             }),
             ciphertext_blob_base64: Some("Zm9v".to_owned()),
             query: None,
+            // Phase 1 Stage 2 — EIP-712 fields. HMAC-only test sets
+            // them to None; serde omits via `skip_serializing_if`.
+            hl_action: None,
+            nonce: None,
+            vault_address: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         assert!(s.contains("\"action\":\"sign_kucoin\""));

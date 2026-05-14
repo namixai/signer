@@ -289,8 +289,8 @@ pub fn okx_iso8601_from_ms(timestamp_ms: u64) -> String {
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = if m <= 2 { y + 1 } else { y };
 
     // seconds-of-day -> hh:mm:ss.
@@ -616,15 +616,17 @@ pub fn sign_eip712_digest(
 /// resulting scalar is `< n` (the secp256k1 order); `k256::ecdsa::
 /// SigningKey::from_bytes` rejects that with a clear error and pre-checking
 /// here would just add a second code path that could drift.
-pub fn parse_evm_private_key(s: &str) -> Result<[u8; 32]> {
+pub fn parse_evm_private_key(s: &str) -> Result<Zeroizing<[u8; 32]>> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
     if stripped.len() != 64 {
         anyhow::bail!("private key must be 32 bytes (64 hex chars)");
     }
-    let bytes =
-        hex::decode(stripped).map_err(|_| anyhow::anyhow!("private key is not valid hex"))?;
-    let mut out = [0u8; 32];
+    let mut bytes = Zeroizing::new(
+        hex::decode(stripped).map_err(|_| anyhow::anyhow!("private key is not valid hex"))?,
+    );
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&bytes);
+    bytes.iter_mut().for_each(|b| *b = 0);
     Ok(out)
 }
 
@@ -652,7 +654,6 @@ pub fn parse_evm_address(s: &str) -> Result<[u8; 20]> {
 ///   3. keccak256 of those 64 bytes.
 ///   4. Take the trailing 20 bytes → address.
 pub fn derive_address_from_private_key(private_key_bytes: &[u8; 32]) -> Result<[u8; 20]> {
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
     let signing_key = SigningKey::from_bytes(private_key_bytes.into())
         .map_err(|_| anyhow::anyhow!("invalid secp256k1 private key"))?;
     let verifying = signing_key.verifying_key();
@@ -688,6 +689,104 @@ pub fn sign_hyperliquid(
     let domain_separator = hyperliquid_main_domain_separator();
     let digest = eip712_digest(&domain_separator, &agent_struct_hash);
     sign_eip712_digest(private_key_bytes, &digest)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Asterdex v3 (BNB-chain perp DEX) EIP-712 signing — Phase 1 Stage 3
+//
+// Reference: github.com/asterdex/api-docs `aster-finance-futures-api-v3.md`
+// Custom EIP-712 variant: domain is `AsterSignTransaction` / chainId 1666,
+// message is a single `string msg` containing the URL-encoded request
+// params. Output is a 65-byte `r||s||v` hex string (v = recid + 27)
+// appended to the request as `signature=...`. The customer also injects
+// the API agent `signer` address and a microsecond `nonce` into the
+// request body BEFORE URL-encoding for signing — we expect the canonical
+// param string fully assembled by the caller.
+//
+// See `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md` for the full recon.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Compute the EIP-712 domain separator for Asterdex v3 signing.
+///
+/// Domain fields (constant for `asterdex`):
+///   name              = "AsterSignTransaction"
+///   version           = "1"
+///   chainId           = 1666  (internal signing domain, NOT BNB Chain's 56)
+///   verifyingContract = 0x0000000000000000000000000000000000000000
+///
+/// Domain separator (precomputed, also asserted in tests as a known-good
+/// constant so the implementation pins to the documented schema):
+///   0xa95d0a7a6f3f17fcebb0c2336645385ce79cde7523f71ab147fdb7f15e9f37f9
+pub fn asterdex_domain_separator() -> [u8; 32] {
+    let type_hash = eip712_type_hash(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak256(b"AsterSignTransaction");
+    let version_hash = keccak256(b"1");
+    let mut chain_id_be = [0u8; 32];
+    // 1666 = 0x682. Big-endian, stored in trailing bytes.
+    chain_id_be[30] = 0x06;
+    chain_id_be[31] = 0x82;
+    let verifying_contract_padded = [0u8; 32]; // 20 zero bytes already inside.
+
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&version_hash);
+    buf.extend_from_slice(&chain_id_be);
+    buf.extend_from_slice(&verifying_contract_padded);
+    keccak256(&buf)
+}
+
+/// Compute the EIP-712 struct hash of Asterdex's `Message` envelope:
+///
+/// ```text
+/// hashStruct(Message) = keccak256(
+///     typeHash("Message(string msg)")
+///     || keccak256(msg_bytes)          // URL-encoded params string
+/// )
+/// ```
+///
+/// The `msg` is the literal URL-encoded params string the caller will send
+/// to Asterdex (e.g. `nonce=1715610000000000&signer=0xabc&symbol=ASTERUSDT&...`).
+/// `signer` and `nonce` MUST already be injected by the caller — the
+/// enclave doesn't reorder, doesn't validate ASCII-sort, just commits to
+/// the exact bytes provided.
+pub fn asterdex_message_struct_hash(msg: &str) -> [u8; 32] {
+    let type_hash = eip712_type_hash("Message(string msg)");
+    let msg_hash = keccak256(msg.as_bytes());
+    let mut buf = Vec::with_capacity(2 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&msg_hash);
+    keccak256(&buf)
+}
+
+/// Sign an Asterdex v3 request. Returns the 65-byte signature as a
+/// `0x`-prefixed lowercase hex string, ready to be appended to the
+/// request as `signature=...`.
+///
+/// The customer is responsible for:
+///   1. Injecting `nonce` (microseconds, monotonic) and `signer` (address
+///      derived from the signing key) into the params dict.
+///   2. URL-encoding the full params dict into a single string.
+///   3. Passing that exact string here.
+///
+/// Encoding format of the returned signature:
+///   `0x` || hex(r 32 bytes) || hex(s 32 bytes) || hex(v 1 byte)
+///   where v ∈ {27, 28} (Ethereum convention; v = recovery_id + 27).
+pub fn sign_asterdex(
+    private_key_bytes: &[u8; 32],
+    msg: &str,
+) -> Result<String> {
+    let struct_hash = asterdex_message_struct_hash(msg);
+    let domain_separator = asterdex_domain_separator();
+    let digest = eip712_digest(&domain_separator, &struct_hash);
+    let sig = sign_eip712_digest(private_key_bytes, &digest)?;
+
+    // r/s arrive as "0x..." hex strings; v is u8. Concatenate to 65-byte hex.
+    let r_clean = sig.r.strip_prefix("0x").unwrap_or(&sig.r);
+    let s_clean = sig.s.strip_prefix("0x").unwrap_or(&sig.s);
+    Ok(format!("0x{}{}{:02x}", r_clean, s_clean, sig.v))
 }
 
 #[cfg(test)]
@@ -1479,10 +1578,9 @@ mod tests {
     #[test]
     fn parse_evm_private_key_round_trip() {
         let k = parse_evm_private_key(TEST_HL_PRIVATE_KEY).unwrap();
-        assert_eq!(k, [0x01u8; 32]);
-        // Also without `0x` prefix.
+        assert_eq!(*k, [0x01u8; 32]);
         let k2 = parse_evm_private_key("0101010101010101010101010101010101010101010101010101010101010101").unwrap();
-        assert_eq!(k2, [0x01u8; 32]);
+        assert_eq!(*k2, [0x01u8; 32]);
     }
 
     /// Bad length / non-hex private keys are rejected.
@@ -1735,5 +1833,149 @@ mod tests {
         assert_eq!(sig.r, "0x348ff44b3c53aac13989f298e0cb66050522a841a51629b027b86aa83fa964f0");
         assert_eq!(sig.s, "0x4e69694254a8e68f47a0d7854370d596aba2c88742cf478cc1e0e34389dbca29");
         assert_eq!(sig.v, 27);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Asterdex EIP-712 signing tests — Phase 1 Stage 3
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Pin the Asterdex domain separator to the value derived from the
+    /// documented domain fields (AsterSignTransaction / 1 / 1666 / 0x0).
+    /// If this test fails, somebody changed a constant — investigate before
+    /// fixing, because the deployed Asterdex backend uses these exact
+    /// values and a divergence here would silently break every live call.
+    ///
+    /// Expected value computed offline via eth-utils + eth-abi:
+    ///   keccak256(
+    ///     EIP712Domain_typehash
+    ///     || keccak256("AsterSignTransaction")
+    ///     || keccak256("1")
+    ///     || u256_be(1666)
+    ///     || address_padded(0x0)
+    ///   ) == 0xa95d0a7a6f3f17fcebb0c2336645385ce79cde7523f71ab147fdb7f15e9f37f9
+    #[test]
+    fn asterdex_domain_separator_pins_to_documented_value() {
+        let sep = asterdex_domain_separator();
+        let expected = hex::decode(
+            "a95d0a7a6f3f17fcebb0c2336645385ce79cde7523f71ab147fdb7f15e9f37f9",
+        )
+        .unwrap();
+        assert_eq!(
+            sep.as_slice(),
+            expected.as_slice(),
+            "Asterdex domain separator drifted from documented value — \
+             check that constants for name/version/chainId/verifyingContract \
+             match the v3 API docs exactly."
+        );
+    }
+
+    /// `Message(string msg)` type hash matches the precomputed value.
+    /// Computed offline as `keccak256("Message(string msg)")`.
+    #[test]
+    fn asterdex_message_type_hash_correct() {
+        let t = eip712_type_hash("Message(string msg)");
+        let expected = hex::decode(
+            "c4cfb57eea370ef2a92403a7e865b2de262d7ca272333665b54ad7e6a602ef68",
+        )
+        .unwrap();
+        assert_eq!(t.as_slice(), expected.as_slice());
+    }
+
+    /// Determinism: signing the same input twice yields identical bytes
+    /// (RFC 6979 deterministic ECDSA, inherited via sign_eip712_digest).
+    #[test]
+    fn sign_asterdex_is_deterministic() {
+        let pk = [0x11u8; 32];
+        let msg = "nonce=1715610000000000&signer=0xabcdef&symbol=ASTERUSDT";
+        let a = sign_asterdex(&pk, msg).unwrap();
+        let b = sign_asterdex(&pk, msg).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// Output shape: 0x-prefixed 132-char string (65 bytes encoded).
+    #[test]
+    fn sign_asterdex_output_is_well_formed() {
+        let pk = [0x42u8; 32];
+        let sig = sign_asterdex(&pk, "test").unwrap();
+        assert!(sig.starts_with("0x"));
+        assert_eq!(sig.len(), 132, "expected 0x + 130 hex chars (65 bytes)");
+        // v byte (last 2 hex chars) is 1b or 1c (27 or 28).
+        let v_hex = &sig[sig.len() - 2..];
+        assert!(
+            v_hex == "1b" || v_hex == "1c",
+            "v must encode to 0x1b or 0x1c, got 0x{v_hex}"
+        );
+        // r and s are non-zero (degenerate signing would be a serious bug).
+        let r_hex = &sig[2..66];
+        let s_hex = &sig[66..130];
+        assert_ne!(r_hex, "0".repeat(64));
+        assert_ne!(s_hex, "0".repeat(64));
+    }
+
+    /// Golden-vector cross-check against the official eth_account Python
+    /// reference (see `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`).
+    ///
+    /// Inputs:
+    ///   private_key = 0x1111...1111 (32 bytes)
+    ///   msg         = (URL-encoded params, see below)
+    ///   signer_addr_derived_from_pk = 0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A
+    ///
+    /// Expected signature (from `Account.sign_message` on `encode_typed_data`):
+    ///   0x55ed23a055281699127a9eaf4cd7f434e554d3b43ea0005bb9148a90b0c77df2
+    ///     5d652dcd2ee8d37f90ea3838fff681e30e0ed812698327e2449b6915edb2c847
+    ///     1c
+    ///
+    /// Failure here means EIP-712 schema, domain separator, struct hash,
+    /// digest construction, or ECDSA signing diverged from the canonical
+    /// path the deployed Asterdex backend expects. Treat as P0.
+    #[test]
+    fn sign_asterdex_matches_python_reference_golden_vector() {
+        let pk = [0x11u8; 32];
+        // NOTE: the signer field in the msg is a placeholder string — the
+        // EIP-712 signing function commits to bytes regardless. The address
+        // actually derived from pk=0x11...11 is 0x19E7E376E7C213B7..., but
+        // since msg.msg is a free-form string, what matters here is byte
+        // exactness of the input/output, not internal consistency.
+        let msg = "nonce=1715610000000000\
+                   &signer=0xd1d6e1efb53cad17f1cf21a01b76b3ad81b2c4c2\
+                   &symbol=ASTERUSDT\
+                   &side=BUY\
+                   &type=LIMIT\
+                   &quantity=20\
+                   &price=0.5";
+        let sig = sign_asterdex(&pk, msg).unwrap();
+        let expected = "0x55ed23a055281699127a9eaf4cd7f434e554d3b43ea0005bb9148a90b0c77df2\
+                          5d652dcd2ee8d37f90ea3838fff681e30e0ed812698327e2449b6915edb2c847\
+                          1c";
+        assert_eq!(
+            sig, expected,
+            "sign_asterdex output diverged from the eth_account Python \
+             reference golden vector. This is a P0 — investigate keccak, \
+             domain separator, struct hash, or k256 signing path."
+        );
+    }
+
+    /// Empty msg is a valid input (some endpoints have no body). Verify it
+    /// signs without panicking and produces a deterministic value.
+    #[test]
+    fn sign_asterdex_empty_msg_signs_cleanly() {
+        let pk = [0x33u8; 32];
+        let sig = sign_asterdex(&pk, "").unwrap();
+        assert_eq!(sig.len(), 132);
+        // Determinism check: empty input → fixed output for fixed key.
+        let again = sign_asterdex(&pk, "").unwrap();
+        assert_eq!(sig, again);
+    }
+
+    /// Invalid private key (zero scalar) is rejected by the underlying
+    /// k256 signing path. We surface this as a clean error rather than
+    /// silently producing an undefined signature.
+    #[test]
+    fn sign_asterdex_rejects_zero_private_key() {
+        let zero = [0u8; 32];
+        assert!(
+            sign_asterdex(&zero, "anything").is_err(),
+            "zero scalar must be rejected"
+        );
     }
 }

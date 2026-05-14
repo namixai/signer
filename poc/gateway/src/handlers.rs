@@ -3,7 +3,7 @@
 //! Endpoints:
 //!   - `POST /sign`      — main signing endpoint.
 //!   - `GET  /healthz`   — liveness probe; succeeds if a vsock ping
-//!                         round-trip completes within ~1s.
+//!     round-trip completes within ~1s.
 //!
 //! Both handlers go through `vsock::round_trip`. The gateway never touches
 //! the secret directly — it forwards the encrypted blob and AWS creds to

@@ -510,6 +510,73 @@ impl fmt::Debug for HyperliquidSecret {
     }
 }
 
+/// Asterdex v3 (BNB-chain perp DEX) signing secret.
+///
+/// Asterdex uses EIP-712 typed-data signing with a `Message(string msg)`
+/// envelope (see `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`). The
+/// signing key is a plain secp256k1 PK; the `signer_address` field is
+/// the address derived from that PK, stored explicitly so the enclave
+/// can sanity-check the blob (drift here = wrong PK/address paired).
+///
+/// Phase 1 deliberately only supports the case where the signer IS the
+/// user (single-account API key). Multi-account / agent setups will
+/// require an extension with a separate `user_address` field; not now.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsterdexSecret {
+    /// Informational venue tag. Not validated.
+    #[serde(default)]
+    pub exchange: String,
+    /// 32-byte secp256k1 private key as `0x`-prefixed hex (66 chars total).
+    pub private_key: String,
+    /// 20-byte Ethereum-style address as `0x`-prefixed hex (42 chars total).
+    /// MUST match `keccak256(uncompressed_pubkey[1..])[12..]` of
+    /// `private_key`. Mismatch yields a parse rejection at handler level.
+    pub signer_address: String,
+}
+
+impl AsterdexSecret {
+    /// True if the secret has the required shape. Reject malformed blobs
+    /// before any cryptographic work. Same length / hex-charset checks as
+    /// `HyperliquidSecret`.
+    pub fn is_complete(&self) -> bool {
+        if self.private_key.len() != 66 || !self.private_key.starts_with("0x") {
+            return false;
+        }
+        if !self.private_key[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        if self.signer_address.len() != 42 || !self.signer_address.starts_with("0x") {
+            return false;
+        }
+        if !self.signer_address[2..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+        {
+            return false;
+        }
+        true
+    }
+}
+
+impl Drop for AsterdexSecret {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.exchange);
+        zeroize_string(&mut self.private_key);
+        zeroize_string(&mut self.signer_address);
+    }
+}
+
+impl fmt::Debug for AsterdexSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AsterdexSecret")
+            .field("exchange", &self.exchange)
+            .field("private_key", &"[REDACTED]")
+            .field("signer_address", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Best-effort wipe of the heap bytes backing a `String`. We move the bytes
 /// out into a `Vec<u8>`, zeroize that, drop it, and assign an empty `String`
 /// back so that subsequent uses observe an empty string rather than freed
