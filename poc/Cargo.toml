@@ -1,5 +1,5 @@
 [workspace]
-members = ["enclave", "parent", "gateway"]
+members = ["enclave", "parent", "gateway", "policy-cli"]
 resolver = "2"
 
 [workspace.package]
