@@ -33,6 +33,7 @@ pub const ALLOWED_EXCHANGES: &[&str] = &[
     "bybit",
     "okx",
     "hyperliquid_main",
+    "asterdex",
 ];
 
 /// Map an `(exchange, kind)` pair to the enclave-side action string.
@@ -57,6 +58,7 @@ pub fn enclave_action_for(exchange: &str, kind: Option<&str>) -> Option<&'static
             Some("cancel") => Some("sign_hyperliquid_main_cancel"),
             _ => None,
         },
+        "asterdex" => Some("sign_asterdex"),
         _ => None,
     }
 }
@@ -186,11 +188,7 @@ pub fn http_status_for(code: &str) -> u16 {
 /// Both arguments are in milliseconds since the Unix epoch. We use saturating
 /// arithmetic so an underflow at the start of the epoch can't cause a wrap.
 pub fn timestamp_in_window(now_ms: u64, ts_ms: u64) -> Result<(), ()> {
-    let delta = if now_ms > ts_ms {
-        now_ms - ts_ms
-    } else {
-        ts_ms - now_ms
-    };
+    let delta = now_ms.abs_diff(ts_ms);
     if delta <= MAX_TIMESTAMP_SKEW_MS {
         Ok(())
     } else {
@@ -258,7 +256,7 @@ mod tests {
         assert_eq!(req.exchange, "kucoin");
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/api/v1/orders");
-        assert!(req.body.contains("clientOid"));
+        assert_eq!(req.body, "{\"clientOid\":\"x\"}");
         assert_eq!(req.timestamp_ms, Some(1714997000000));
     }
 
@@ -273,6 +271,7 @@ mod tests {
                 "bybit",
                 "okx",
                 "hyperliquid_main",
+                "asterdex",
             ]
         );
     }

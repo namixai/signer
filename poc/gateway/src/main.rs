@@ -9,7 +9,7 @@
 //!   - `--enclave-cid 16`          — vsock CID where the enclave runs.
 //!   - `--enclave-port 5000`       — vsock port the enclave listens on.
 //!   - `--blob-path /var/lib/...`  — path to the KMS-encrypted ciphertext
-//!                                  blob (operator pre-stages with `aws s3 cp`).
+//!     blob (operator pre-stages with `aws s3 cp`).
 //!
 //! Request body limits: enforced by `tower-http::limit::RequestBodyLimitLayer`
 //! at 32 KiB. Anything larger gets a `413 payload_too_large` before the body
@@ -39,6 +39,7 @@ use crate::state::{AppState, EnclaveTarget};
 /// `--blobs-dir` named `{exchange}.enc`. Blobs not present at startup are
 /// skipped — operator can stage them later and restart.
 const SUPPORTED_EXCHANGES: &[&str] = &[
+    "asterdex",
     "kucoin",
     "binance",
     "binance_futures",
