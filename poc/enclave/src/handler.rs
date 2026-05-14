@@ -193,6 +193,17 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     if !path.starts_with(prefix) {
         return false;
     }
+    // If the prefix itself already ends on a path-boundary character,
+    // `starts_with` is sufficient — the boundary is INSIDE the prefix.
+    // (Gemini OSS PR #9 catch: prefix="/api/" must accept "/api/v1"
+    // even though the byte at position prefix.len() is `v`, because the
+    // boundary `/` is at position prefix.len()-1, already inside the
+    // declared prefix.)
+    if matches!(prefix.as_bytes().last().copied(), Some(b'/') | Some(b'?')) {
+        return true;
+    }
+    // Otherwise, the byte immediately after the prefix in `path` must
+    // be EOS / `/` / `?` to count as a structural match.
     match path.as_bytes().get(prefix.len()) {
         None => true,         // EOS — exact prefix match
         Some(b'/') => true,   // path component boundary
@@ -2189,6 +2200,54 @@ mod tests {
             &policy_test_req("sign_binance", "POST", "/api/v1/order")
         )
         .is_ok());
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api?foo=bar")
+        )
+        .is_ok());
+    }
+
+    /// Round-3 Gemini catch on OSS PR #9: when the prefix itself ends
+    /// with `/` or `?`, the boundary is already inside the prefix; the
+    /// byte AFTER prefix.len() can be any character. Previous logic
+    /// incorrectly rejected `/api/v1` when prefix was `/api/` because
+    /// the char at `prefix.len()` was `v` (not boundary).
+    #[test]
+    fn enforce_policy_path_prefix_with_trailing_slash_accepts_subpaths() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api/".to_owned()]),
+            ..Policy::default()
+        };
+        // prefix="/api/" should accept ANY path that starts with "/api/"
+        // — the trailing `/` makes the boundary unambiguous.
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api/v1/order")
+        )
+        .is_ok(), "prefix='/api/' must accept /api/v1/order");
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api/")
+        )
+        .is_ok(), "prefix='/api/' must accept exact match");
+        // But NOT match "/api" without the slash — that's a different
+        // path (would be matched by prefix "/api" without trailing /).
+        let err = enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api"),
+        )
+        .unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// Same fix for prefix ending in `?` (query-string terminator).
+    #[test]
+    fn enforce_policy_path_prefix_with_trailing_question_accepts_query() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api?".to_owned()]),
+            ..Policy::default()
+        };
+        // prefix="/api?" should match any query string.
         assert!(enforce_policy(
             Some(&p),
             &policy_test_req("sign_binance", "POST", "/api?foo=bar")
