@@ -168,7 +168,11 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<(), Sign
     //    semantics that match what a human writes. Gemini medium catch.
     if let Some(ref label) = p.label {
         if label.chars().count() > 128 {
-            return Err(SignResponse::err(err_code::BAD_REQUEST));
+            // Gemini OSS PR #9 catch: a policy whose own label violates the
+            // schema is a policy-level rejection, not a request-shape
+            // problem. Use POLICY_DENIED so SDKs distinguish "your call was
+            // malformed" from "your secret's policy is malformed".
+            return Err(SignResponse::err(err_code::POLICY_DENIED));
         }
     }
 
@@ -2033,7 +2037,9 @@ mod tests {
         };
         let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
         let err = enforce_policy(Some(&p), &req).unwrap_err();
-        assert_eq!(err.error.as_deref(), Some(err_code::BAD_REQUEST));
+        // Gemini OSS PR #9: label violation = policy-level rejection,
+        // not request-shape failure → POLICY_DENIED.
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
     }
 
     #[test]
@@ -2296,6 +2302,7 @@ mod tests {
             ..Policy::default()
         };
         let err = enforce_policy(Some(&p), &req).unwrap_err();
-        assert_eq!(err.error.as_deref(), Some(err_code::BAD_REQUEST));
+        // Same as label_too_long_rejects: policy-level rejection.
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
     }
 }

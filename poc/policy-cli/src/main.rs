@@ -154,7 +154,11 @@ fn main() -> Result<()> {
     //    operator readability — KMS encrypt is byte-exact, so the
     //    resulting ciphertext bytes are deterministic for given input.
     let wrapped = PolicyWrappedSecret { policy, secret };
-    let plaintext = serde_json::to_vec_pretty(&wrapped).context("serializing wrapped blob")?;
+    // Compact JSON (no pretty-printing): KMS ciphertext blobs have an
+    // 8 KiB hard ceiling (`MAX_CIPHERTEXT_BYTES`). Pretty-printing wastes
+    // ~30% on whitespace and pushes realistic Hyperliquid/Asterdex secrets
+    // (multi-line ABI fragments) over the wire limit. Gemini OSS PR #9 catch.
+    let plaintext = serde_json::to_vec(&wrapped).context("serializing wrapped blob")?;
 
     std::fs::write(&cli.output, &plaintext)
         .with_context(|| format!("writing output: {}", cli.output.display()))?;
