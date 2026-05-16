@@ -577,6 +577,193 @@ impl fmt::Debug for AsterdexSecret {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// UPL v0 — Usenami Policy Language (JSON policy co-encrypted with secret).
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The policy is stored INSIDE the KMS ciphertext alongside the exchange
+// secret. This is the critical security invariant: an attacker who
+// compromises the gateway (but not KMS) cannot forge, weaken, or swap
+// a policy without also re-encrypting the secret with KMS attestation.
+//
+// The outer KMS plaintext shape becomes:
+// ```json
+// {
+//   "policy": { ... },       // UPL v0 policy — may be absent for legacy blobs
+//   "secret": { ... }        // exchange-specific secret (KucoinSecret, etc.)
+// }
+// ```
+//
+// Legacy blobs (Phase 1 Stage 1–3) that contain a flat secret without a
+// `"policy"` wrapper are treated as UNRESTRICTED — the handler enforces
+// no policy constraints. This preserves backward compatibility during the
+// migration window. A future flag `require_policy: true` on the gateway
+// will make policy mandatory.
+//
+// Design constraints:
+//   - Policy is validated INSIDE the enclave after KMS decrypt, never on
+//     the gateway. The gateway is untrusted and could forge a policy if
+//     it were sent separately.
+//   - All policy fields are optional. Absent field = no constraint. This
+//     makes the schema additive — new fields can be added without breaking
+//     existing policies.
+//   - `allowed_actions` is the primary enforcement lever. A policy that
+//     says `["sign_binance"]` will refuse to sign Hyperliquid requests
+//     even though the underlying secret might technically support it
+//     (defense in depth: wrong blob loaded for wrong exchange).
+//   - Size limits are expressed in the asset's native unit (not USD) for
+//     v0. USD conversion requires an oracle feed we don't have inside
+//     the enclave yet.
+
+/// UPL v0 policy. Co-encrypted with the exchange secret inside a single
+/// KMS ciphertext blob. Validated by the enclave after decryption;
+/// never touches the gateway.
+///
+/// Every field is optional. Absent = no constraint (permit all).
+///
+/// `Debug` is derived: policies contain no secret material (they describe
+/// WHAT is allowed, not WHO — the secret half is the WHO). Logging the
+/// policy on enforcement failures is actively helpful for debugging
+/// mis-configured blobs without leaking keys.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Policy {
+    /// Allowed `action` values for `SignRequest.action`. If present and
+    /// non-empty, the enclave rejects any action not in this list BEFORE
+    /// touching the secret material.
+    ///
+    /// Example: `["sign_binance", "sign_okx"]` — this key can only be
+    /// used for Binance and OKX HMAC signing. A `sign_hyperliquid_main_order`
+    /// request with this blob will get `policy_denied`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_actions: Option<Vec<String>>,
+
+    /// Allowed HTTP methods. Overrides the global `ALLOWED_METHODS` const.
+    /// If absent, the global list applies. Useful for read-only keys that
+    /// should only sign GET requests.
+    ///
+    /// Example: `["GET"]` — key can only be used for signed read endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_methods: Option<Vec<String>>,
+
+    /// Allowed URL path prefixes. If present, the request's `path` must
+    /// start with at least one of these prefixes. Absent = all paths.
+    ///
+    /// Example: `["/api/v1/orders", "/api/v1/position"]` — key can only
+    /// hit order and position endpoints, not withdrawal/transfer endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_path_prefixes: Option<Vec<String>>,
+
+    /// Denied URL path prefixes. If present, the request's `path` must NOT
+    /// start with any of these. Checked AFTER `allowed_path_prefixes`.
+    /// Designed for "allow everything EXCEPT withdrawals" use cases.
+    ///
+    /// Example: `["/api/v1/withdraw", "/api/v1/transfer"]`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_path_prefixes: Option<Vec<String>>,
+
+    /// Maximum requests per minute. v0: tracked per-key inside the enclave
+    /// with a simple sliding window counter. Absent = unlimited.
+    ///
+    /// NOTE: v0 defines the schema only; enforcement is deferred to v0.1
+    /// because stateful rate-limiting inside a stateless enclave requires
+    /// a decision on counter persistence (in-memory with restart reset,
+    /// or vsock-reported to gateway for durable tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_minute: Option<u32>,
+
+    /// Human-readable label for this policy. Not enforced, just logged
+    /// on policy violations for operator debugging. Max 128 chars.
+    ///
+    /// Example: `"binance-readonly-prod"`, `"okx-trading-pilot-quant1"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Wrapper that co-locates a `Policy` with the raw secret JSON. This is
+/// the shape inside the KMS ciphertext blob for UPL-enabled keys.
+///
+/// The `secret` field is a raw `serde_json::Value` because the enclave
+/// doesn't know which exchange-specific type to deserialize into until
+/// it reads `SignRequest.action`. Handler code first extracts the policy,
+/// then passes `secret` to the exchange-specific parser (which IS
+/// `Zeroize`-on-drop).
+///
+/// SECURITY NOTE (Gemini OSS PR #8 round-1 catch, deferred to UPL v0.1):
+/// `serde_json::Value` (and its internal `String`/`Map` types) does NOT
+/// implement `Zeroize` on drop. While `serde_json::from_value::<T>` MOVES
+/// the inner allocation into the target type (no clone) — so the Value's
+/// String becomes T's String which IS zeroized — the brief window during
+/// which the Value sits in memory is technically a leak. In the Nitro
+/// Enclave model, memory is isolated per-instance and freed pages are
+/// not reachable to co-tenants, so the practical impact is minimal. A
+/// proper fix uses `serde_json::value::RawValue` with `#[serde(borrow)]`
+/// to reference bytes from the underlying `Zeroizing<Vec<u8>>` buffer
+/// directly. Tracked as UPL v0.1.
+#[derive(Debug, Deserialize)]
+pub struct PolicyWrappedSecret {
+    pub policy: Policy,
+    pub secret: serde_json::Value,
+}
+
+/// Result of parsing a KMS-decrypted plaintext: either a policy-wrapped
+/// secret (new format) or a raw secret blob (legacy format, no policy).
+pub enum ParsedBlob {
+    /// New format: policy + secret extracted from wrapper.
+    WithPolicy {
+        policy: Policy,
+        secret_json: serde_json::Value,
+    },
+    /// Legacy format: flat secret blob, no policy constraints.
+    Legacy(serde_json::Value),
+}
+
+impl ParsedBlob {
+    /// Parse the decrypted KMS plaintext.
+    ///
+    /// CRITICAL (Gemini OSS PR #8 round-1 review of UPL v0): the previous
+    /// "try-wrapped-then-fall-back-to-legacy" approach was fail-open. A
+    /// malformed policy-intended blob (e.g., missing `secret` field, or
+    /// invalid `policy` JSON) would silently fall through to the legacy
+    /// path and bypass policy enforcement entirely.
+    ///
+    /// The new approach parses once to `serde_json::Value`, inspects the
+    /// top-level `"policy"` key, and dispatches to strict deserialization
+    /// for the indicated format. If the format is policy-wrapped but the
+    /// blob is malformed, we return an error — NEVER fall back to legacy.
+    pub fn from_plaintext(plaintext: &[u8]) -> Result<Self, serde_json::Error> {
+        let val: serde_json::Value = serde_json::from_slice(plaintext)?;
+        if val.get("policy").is_some() {
+            // Policy-wrapped format: BOTH `policy` and `secret` MUST parse.
+            // If `secret` is missing or `policy` is malformed → error,
+            // not fallback.
+            let wrapped: PolicyWrappedSecret = serde_json::from_value(val)?;
+            Ok(ParsedBlob::WithPolicy {
+                policy: wrapped.policy,
+                secret_json: wrapped.secret,
+            })
+        } else {
+            // No `"policy"` key at top level → legacy flat secret.
+            Ok(ParsedBlob::Legacy(val))
+        }
+    }
+
+    /// Extract the policy if present.
+    pub fn policy(&self) -> Option<&Policy> {
+        match self {
+            ParsedBlob::WithPolicy { policy, .. } => Some(policy),
+            ParsedBlob::Legacy(_) => None,
+        }
+    }
+
+    /// Extract the raw secret JSON for exchange-specific parsing.
+    pub fn secret_json(&self) -> &serde_json::Value {
+        match self {
+            ParsedBlob::WithPolicy { secret_json, .. } => secret_json,
+            ParsedBlob::Legacy(v) => v,
+        }
+    }
+}
+
 /// Best-effort wipe of the heap bytes backing a `String`. We move the bytes
 /// out into a `Vec<u8>`, zeroize that, drop it, and assign an empty `String`
 /// back so that subsequent uses observe an empty string rather than freed
@@ -598,4 +785,11 @@ pub mod err_code {
     pub const INTERNAL_ERROR: &str = "internal_error";
     /// Phase 3 only — emitted when KMS rejects Decrypt (wrong key/policy).
     pub const KMS_DECRYPT_DENIED: &str = "kms_decrypt_denied";
+    /// UPL v0: the co-encrypted policy denies this request. The wire code
+    /// is intentionally distinct from `bad_request` so SDK consumers can
+    /// distinguish "malformed request" from "well-formed but not permitted
+    /// by policy". The response body carries no detail about WHICH rule
+    /// fired (adversarial-mindset doc: don't help attackers enumerate the
+    /// policy boundary).
+    pub const POLICY_DENIED: &str = "policy_denied";
 }

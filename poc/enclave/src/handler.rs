@@ -15,7 +15,7 @@
 use crate::kms_client::{self, DecryptError};
 use crate::proto::{
     err_code, AsterdexSecret, AwsCredentials, BinanceSecret, BybitSecret, HyperliquidSecret,
-    KucoinSecret, OkxSecret, SignRequest, SignResponse,
+    KucoinSecret, OkxSecret, ParsedBlob, Policy, SignRequest, SignResponse,
 };
 use crate::signer;
 use anyhow::Result;
@@ -79,6 +79,182 @@ enum LoadSecretError {
     Internal,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// UPL v0 — Policy enforcement.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `enforce_policy` runs AFTER KMS decrypt but BEFORE any signing. It
+// checks the co-encrypted policy against the incoming `SignRequest`.
+// If the policy denies the request, the handler returns `policy_denied`
+// without ever touching the secret material.
+//
+// Policy is `Option<&Policy>` — `None` means legacy blob (no policy),
+// which is unrestricted.
+
+/// Enforce the co-encrypted policy against the incoming request.
+/// Returns `Ok(())` if the request is permitted, or `Err(SignResponse)`
+/// with `policy_denied` if any rule rejects.
+///
+/// `None` policy = unrestricted (legacy blob backward compat).
+#[allow(clippy::result_large_err)] // SignResponse is our wire type; boxing adds indirection for no gain.
+fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<(), SignResponse> {
+    let Some(p) = policy else {
+        return Ok(()); // Legacy blob — no policy, permit all.
+    };
+
+    // 1. Action whitelist.
+    //
+    // SECURITY (Gemini OSS PR #8 round-1 HIGH catch): empty whitelist
+    // MUST deny all, NOT permit all. `None` is "no constraint"; the
+    // distinction from `Some(vec![])` is that empty vec is an EXPLICIT
+    // "permit nothing" rule. The previous `!allowed.is_empty()` guard
+    // was fail-open.
+    if let Some(ref allowed) = p.allowed_actions {
+        if !allowed.iter().any(|a| a == &req.action) {
+            return Err(SignResponse::err(err_code::POLICY_DENIED));
+        }
+    }
+
+    // 2. HTTP method whitelist (FURTHER RESTRICTS the global
+    //    `ALLOWED_METHODS` — cannot widen it).
+    //
+    // Every sign handler validates `req.method` against the static
+    // `ALLOWED_METHODS` set BEFORE calling `load_and_parse_blob`, so by
+    // the time we get here, `req.method` is already a global-allowed verb.
+    // Policy then narrows the set further (e.g., a read-only key can
+    // restrict to `["GET"]` even though the exchange allows POST/DELETE).
+    // Gemini OSS PR #9 round-4 wording catch.
+    //
+    // Same fail-open fix as #1: empty whitelist denies all.
+    if let Some(ref allowed) = p.allowed_methods {
+        if let Some(ref method) = req.method {
+            if !allowed.iter().any(|m| m == method) {
+                return Err(SignResponse::err(err_code::POLICY_DENIED));
+            }
+        }
+        // If method is None (EIP-712 flows), skip — EIP-712 doesn't
+        // use HTTP methods for signing. The method whitelist only
+        // applies to HMAC-based exchanges. This is intentional: an
+        // EIP-712 request is governed by `allowed_actions` not
+        // `allowed_methods`.
+    }
+
+    // 3. Path prefix allowlist.
+    //
+    // Same fail-open fix as #1: empty whitelist denies all.
+    //
+    // Boundary safety: `path_matches_prefix` requires the matched
+    // prefix to terminate at end-of-string, `/`, or `?` — preventing
+    // `/api` from accidentally matching `/api-internal/withdraw`.
+    if let Some(ref prefixes) = p.allowed_path_prefixes {
+        if let Some(ref path) = req.path {
+            if !prefixes.iter().any(|prefix| path_matches_prefix(path, prefix)) {
+                return Err(SignResponse::err(err_code::POLICY_DENIED));
+            }
+        }
+        // If path is None (EIP-712 flows), skip — same rationale as
+        // method.
+    }
+
+    // 4. Path prefix denylist (checked AFTER allowlist).
+    //
+    // For deny-list we keep `starts_with` semantics: a deny on
+    // `/api/v1/withdraw` should also block `/api/v1/withdrawal/...`
+    // and `/api/v1/withdraw-anything` (cautious / pessimistic). Using
+    // the boundary-safe matcher here would let an attacker bypass
+    // a denylist by appending arbitrary suffix to the denied prefix.
+    if let Some(ref prefixes) = p.denied_path_prefixes {
+        if let Some(ref path) = req.path {
+            if prefixes.iter().any(|prefix| path.starts_with(prefix)) {
+                return Err(SignResponse::err(err_code::POLICY_DENIED));
+            }
+        }
+    }
+
+    // 5. Label length sanity. Use char count (not byte len) — a 128-char
+    //    UTF-8 label might be up to 512 bytes; we want operator-visible
+    //    semantics that match what a human writes. Gemini medium catch.
+    if let Some(ref label) = p.label {
+        if label.chars().count() > 128 {
+            // Gemini OSS PR #9 catch: a policy whose own label violates the
+            // schema is a policy-level rejection, not a request-shape
+            // problem. Use POLICY_DENIED so SDKs distinguish "your call was
+            // malformed" from "your secret's policy is malformed".
+            return Err(SignResponse::err(err_code::POLICY_DENIED));
+        }
+    }
+
+    // max_requests_per_minute: v0 schema only, enforcement deferred.
+
+    Ok(())
+}
+
+/// Boundary-safe path prefix matcher for `allowed_path_prefixes`.
+///
+/// Returns true iff `prefix` is a structural prefix of `path` — i.e.
+/// the byte immediately following the match is either string-end, `/`
+/// (path component boundary), or `?` (query string start).
+///
+/// Without this check, an allow-list entry `/api` would accept
+/// `/api-internal/withdraw`, defeating the intent of the allow-list.
+///
+/// We do NOT apply this to denied_path_prefixes — for denials we WANT
+/// the cautious matching (deny `/withdraw` blocks `/withdraw-anything`)
+/// so an attacker can't suffix-bypass a denylist entry.
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    // Gemini round-4 catch (HIGH): empty prefix would bypass the allowlist.
+    // `path.starts_with("")` is unconditionally true, so a policy with
+    // `allowed_path_prefixes: [""]` would silently match any request path.
+    // An empty prefix has no security meaning — treat as "matches nothing".
+    // The CLI sanity-check rejects empty prefixes at wrap time, but defense
+    // in depth: the enclave is the source of truth and must enforce this
+    // regardless of what produced the blob (legacy operator scripts,
+    // attacker-crafted ciphertext that survives KMS, etc.).
+    if prefix.is_empty() {
+        return false;
+    }
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    // If the prefix itself already ends on a path-boundary character,
+    // `starts_with` is sufficient — the boundary is INSIDE the prefix.
+    // (Gemini OSS PR #9 catch: prefix="/api/" must accept "/api/v1"
+    // even though the byte at position prefix.len() is `v`, because the
+    // boundary `/` is at position prefix.len()-1, already inside the
+    // declared prefix.)
+    if matches!(prefix.as_bytes().last().copied(), Some(b'/') | Some(b'?')) {
+        return true;
+    }
+    // Otherwise, the byte immediately after the prefix in `path` must
+    // be EOS / `/` / `?` to count as a structural match.
+    match path.as_bytes().get(prefix.len()) {
+        None => true,         // EOS — exact prefix match
+        Some(b'/') => true,   // path component boundary
+        Some(b'?') => true,   // query string start
+        _ => false,           // partial token match — reject
+    }
+}
+
+/// Load the KMS-decrypted plaintext and parse it as either a
+/// policy-wrapped secret or a legacy flat secret.
+///
+/// Returns `(Option<Policy>, raw_secret_json)` on success.
+fn load_and_parse_blob(
+    req: &SignRequest,
+) -> Result<(Option<Policy>, serde_json::Value), LoadSecretError> {
+    let plaintext = load_secret_for(req)?;
+
+    let parsed = ParsedBlob::from_plaintext(&plaintext).map_err(|_| LoadSecretError::BadRequest)?;
+
+    match parsed {
+        ParsedBlob::WithPolicy {
+            policy,
+            secret_json,
+        } => Ok((Some(policy), secret_json)),
+        ParsedBlob::Legacy(v) => Ok((None, v)),
+    }
+}
+
 /// Dispatch one request and produce one response. Never panics.
 pub fn handle(req: SignRequest) -> SignResponse {
     match req.action.as_str() {
@@ -111,6 +287,11 @@ fn handle_sign(req: SignRequest) -> SignResponse {
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
+    // UPL v0: `sign` is a Day-2 legacy action. It uses load_secret_for
+    // directly (raw bytes, not JSON-parsed) because the KuCoin Day-2
+    // secret is a bare HMAC key, not a JSON blob. Policy enforcement
+    // is not applicable here — this action is deprecated in favor of
+    // `sign_kucoin` which handles the full JSON blob + policy wrapper.
     let secret = match load_secret_for(&req) {
         Ok(s) => s,
         Err(LoadSecretError::BadRequest) => {
@@ -133,6 +314,10 @@ fn handle_sign(req: SignRequest) -> SignResponse {
 /// Day 3 `sign_kucoin` action. Same input contract as `sign` but the decrypted
 /// blob is a JSON object `{"key","secret","passphrase"}` and the response
 /// carries the full KuCoin v2 auth header set instead of a bare signature.
+///
+/// UPL v0: supports policy-wrapped blobs `{"policy": {...}, "secret": {...}}`.
+/// Legacy flat blobs `{"key","secret","passphrase"}` remain supported
+/// (backward compatible, no policy enforcement).
 fn handle_sign_kucoin(req: SignRequest) -> SignResponse {
     let (Some(method), Some(path), Some(body), Some(ts)) = (
         req.method.as_deref(),
@@ -147,8 +332,9 @@ fn handle_sign_kucoin(req: SignRequest) -> SignResponse {
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
-    let plaintext = match load_secret_for(&req) {
-        Ok(p) => p,
+    // UPL v0: load + parse blob (policy-wrapped or legacy).
+    let (policy, secret_json) = match load_and_parse_blob(&req) {
+        Ok(t) => t,
         Err(LoadSecretError::BadRequest) => {
             return SignResponse::err(err_code::BAD_REQUEST);
         }
@@ -160,10 +346,15 @@ fn handle_sign_kucoin(req: SignRequest) -> SignResponse {
         }
     };
 
-    // Parse the plaintext as a KuCoin secret triple. KucoinSecret zeroizes
+    // UPL v0: enforce policy BEFORE touching secret material.
+    if let Err(resp) = enforce_policy(policy.as_ref(), &req) {
+        return resp;
+    }
+
+    // Parse the secret JSON as a KuCoin secret triple. KucoinSecret zeroizes
     // every field on drop — we hold it only as long as it takes to read the
     // borrowed slices into the HMAC routine.
-    let secret_triple: KucoinSecret = match serde_json::from_slice(&plaintext) {
+    let secret_triple: KucoinSecret = match serde_json::from_value(secret_json) {
         Ok(s) => s,
         Err(_) => {
             // Malformed JSON inside the ciphertext blob is operationally
@@ -196,8 +387,8 @@ fn handle_sign_kucoin(req: SignRequest) -> SignResponse {
         Ok(headers) => SignResponse::ok_headers(headers),
         Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
     }
-    // secret_triple, secret_bytes, plaintext all wiped via their respective
-    // Drop impls when this function returns.
+    // secret_triple, secret_bytes wiped via their respective Drop impls
+    // when this function returns.
 }
 
 /// Phase 1 Week 4: `sign_binance` action. Decrypts a `{key,secret}` JSON blob
@@ -207,6 +398,8 @@ fn handle_sign_kucoin(req: SignRequest) -> SignResponse {
 /// Per Binance docs, the signed string is `query_string + body`, hex-HMAC-SHA256.
 /// The parent extracts user-supplied query params from the path and forwards
 /// them in `req.query`; we append `timestamp=<ms>&recvWindow=5000` ourselves.
+///
+/// UPL v0: supports policy-wrapped blobs.
 fn handle_sign_binance(req: SignRequest) -> SignResponse {
     let (Some(method), Some(body), Some(ts)) = (
         req.method.as_deref(),
@@ -223,8 +416,8 @@ fn handle_sign_binance(req: SignRequest) -> SignResponse {
     // `query` is optional; absent = empty.
     let user_query = req.query.as_deref().unwrap_or("");
 
-    let plaintext = match load_secret_for(&req) {
-        Ok(p) => p,
+    let (policy, secret_json) = match load_and_parse_blob(&req) {
+        Ok(t) => t,
         Err(LoadSecretError::BadRequest) => {
             return SignResponse::err(err_code::BAD_REQUEST);
         }
@@ -236,7 +429,11 @@ fn handle_sign_binance(req: SignRequest) -> SignResponse {
         }
     };
 
-    let secret_pair: BinanceSecret = match serde_json::from_slice(&plaintext) {
+    if let Err(resp) = enforce_policy(policy.as_ref(), &req) {
+        return resp;
+    }
+
+    let secret_pair: BinanceSecret = match serde_json::from_value(secret_json) {
         Ok(s) => s,
         Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
     };
@@ -259,6 +456,8 @@ fn handle_sign_binance(req: SignRequest) -> SignResponse {
 ///
 /// Bybit signs `timestamp + key + recv_window + (query | body)`. For GET/DELETE
 /// the payload is the query string; for POST/PUT it's the body.
+///
+/// UPL v0: supports policy-wrapped blobs.
 fn handle_sign_bybit(req: SignRequest) -> SignResponse {
     let (Some(method), Some(body), Some(ts)) = (
         req.method.as_deref(),
@@ -274,8 +473,8 @@ fn handle_sign_bybit(req: SignRequest) -> SignResponse {
 
     let user_query = req.query.as_deref().unwrap_or("");
 
-    let plaintext = match load_secret_for(&req) {
-        Ok(p) => p,
+    let (policy, secret_json) = match load_and_parse_blob(&req) {
+        Ok(t) => t,
         Err(LoadSecretError::BadRequest) => {
             return SignResponse::err(err_code::BAD_REQUEST);
         }
@@ -287,7 +486,11 @@ fn handle_sign_bybit(req: SignRequest) -> SignResponse {
         }
     };
 
-    let secret_pair: BybitSecret = match serde_json::from_slice(&plaintext) {
+    if let Err(resp) = enforce_policy(policy.as_ref(), &req) {
+        return resp;
+    }
+
+    let secret_pair: BybitSecret = match serde_json::from_value(secret_json) {
         Ok(s) => s,
         Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
     };
@@ -315,6 +518,8 @@ fn handle_sign_bybit(req: SignRequest) -> SignResponse {
 /// canonical-string assembly unambiguous on the enclave side). For
 /// backwards compatibility we also accept a separate `query` field and
 /// merge it ourselves.
+///
+/// UPL v0: supports policy-wrapped blobs.
 fn handle_sign_okx(req: SignRequest) -> SignResponse {
     let (Some(method), Some(path), Some(body), Some(ts)) = (
         req.method.as_deref(),
@@ -329,8 +534,8 @@ fn handle_sign_okx(req: SignRequest) -> SignResponse {
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
-    let plaintext = match load_secret_for(&req) {
-        Ok(p) => p,
+    let (policy, secret_json) = match load_and_parse_blob(&req) {
+        Ok(t) => t,
         Err(LoadSecretError::BadRequest) => {
             return SignResponse::err(err_code::BAD_REQUEST);
         }
@@ -342,7 +547,11 @@ fn handle_sign_okx(req: SignRequest) -> SignResponse {
         }
     };
 
-    let secret_triple: OkxSecret = match serde_json::from_slice(&plaintext) {
+    if let Err(resp) = enforce_policy(policy.as_ref(), &req) {
+        return resp;
+    }
+
+    let secret_triple: OkxSecret = match serde_json::from_value(secret_json) {
         Ok(s) => s,
         Err(_) => {
             // Malformed JSON inside ciphertext blob is operationally
@@ -386,7 +595,7 @@ fn handle_sign_okx(req: SignRequest) -> SignResponse {
         // non-ASCII). Map to bad_request — the customer's blob is malformed.
         Err(_) => SignResponse::err(err_code::BAD_REQUEST),
     }
-    // secret_triple, secret_bytes, plaintext all wiped on Drop.
+    // secret_triple, secret_bytes wiped on Drop.
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -407,9 +616,19 @@ fn handle_sign_okx(req: SignRequest) -> SignResponse {
 // from the components we return.
 
 /// Common pre-flight + decrypt path shared by `order` and `cancel`.
-/// Returns the decrypted `HyperliquidSecret` and the parsed action data on
-/// success, or a populated `SignResponse::err` on any validation/decrypt
-/// failure.
+/// Returns the decrypted `HyperliquidSecret` and parsed action data on
+/// success, or a populated `SignResponse::err` on any validation, decrypt,
+/// or policy-enforcement failure.
+///
+/// Note: the co-encrypted UPL policy is enforced INTERNALLY (inside
+/// `enforce_policy(...)`) before the secret is returned to the caller —
+/// callers do not see the policy because no decision they could make
+/// after this function returns would need it. If you ever need the
+/// policy at the call site (e.g., to log the matched action+label),
+/// thread it through here explicitly.
+///
+/// UPL v0: extracts and enforces the co-encrypted policy before returning
+/// the secret. If the policy denies the request, returns `policy_denied`.
 #[allow(clippy::result_large_err, clippy::type_complexity)]
 fn load_hyperliquid_request(
     req: &SignRequest,
@@ -430,9 +649,9 @@ fn load_hyperliquid_request(
         _ => None,
     };
 
-    // 3. Decrypt + parse secret blob.
-    let plaintext = match load_secret_for(req) {
-        Ok(p) => p,
+    // 3. Decrypt + parse secret blob (policy-wrapped or legacy).
+    let (policy, secret_json) = match load_and_parse_blob(req) {
+        Ok(t) => t,
         Err(LoadSecretError::BadRequest) => {
             return Err(SignResponse::err(err_code::BAD_REQUEST));
         }
@@ -444,7 +663,10 @@ fn load_hyperliquid_request(
         }
     };
 
-    let secret: HyperliquidSecret = match serde_json::from_slice(&plaintext) {
+    // UPL v0: enforce policy BEFORE parsing secret material.
+    enforce_policy(policy.as_ref(), req)?;
+
+    let secret: HyperliquidSecret = match serde_json::from_value(secret_json) {
         Ok(s) => s,
         Err(_) => return Err(SignResponse::err(err_code::BAD_REQUEST)),
     };
@@ -770,8 +992,8 @@ fn handle_sign_asterdex(req: SignRequest) -> SignResponse {
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
-    let plaintext = match load_secret_for(&req) {
-        Ok(p) => p,
+    let (policy, secret_json) = match load_and_parse_blob(&req) {
+        Ok(t) => t,
         Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
         Err(LoadSecretError::KmsDenied) => {
             return SignResponse::err(err_code::KMS_DECRYPT_DENIED);
@@ -779,7 +1001,11 @@ fn handle_sign_asterdex(req: SignRequest) -> SignResponse {
         Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
     };
 
-    let secret: AsterdexSecret = match serde_json::from_slice(&plaintext) {
+    if let Err(resp) = enforce_policy(policy.as_ref(), &req) {
+        return resp;
+    }
+
+    let secret: AsterdexSecret = match serde_json::from_value(secret_json) {
         Ok(s) => s,
         Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
     };
@@ -1400,19 +1626,13 @@ mod tests {
     #[test]
     fn validate_asterdex_body_rejects_signer_with_trailing_chars() {
         let derived: [u8; 20] = [0x11; 20];
-        // Body has signer=0x1111...1111 followed by extra hex chars
-        // before the next param boundary. Backend would read the full
-        // value (including EXTRA) as the signer parameter; enclave
-        // commit is over the full body, but our 49-byte expected
-        // literal stops at hex[40] — mismatch.
         let body = "signer=0x1111111111111111111111111111111111111111EXTRA\
                     &nonce=1234567890123";
         assert!(validate_asterdex_body(body, &derived).is_err());
     }
 
     /// Round-3 catch: signer value ends at body-end with no trailing
-    /// chars — must PASS. (Sanity: the strict end-check shouldn't break
-    /// the common case where signer= is the last param.)
+    /// chars — must PASS.
     #[test]
     fn validate_asterdex_body_accepts_signer_at_body_end() {
         let derived: [u8; 20] = [0x11; 20];
@@ -1421,23 +1641,18 @@ mod tests {
         assert!(validate_asterdex_body(body, &derived).is_ok());
     }
 
-    /// Round-3 catch: `note=signer=foo` should NOT trip the duplicate
-    /// `signer=` detection, because the substring is inside another
-    /// param's value, not a real duplicate parameter. With the legit
-    /// signer= as first param, this body is valid.
+    /// Round-3 catch: `note=signer=foo` should NOT trip duplicate
+    /// `signer=` detection. With legit signer= as first param, valid.
     #[test]
     fn validate_asterdex_body_accepts_signer_substring_inside_value() {
         let derived: [u8; 20] = [0x11; 20];
         let body = "signer=0x1111111111111111111111111111111111111111\
                     &nonce=1234567890123\
                     &note=mysigner=foo";
-        // The substring `signer=` appears inside the value of `note=`,
-        // but it's not preceded by `&`. The `&signer=` needle now
-        // correctly skips it. Body is valid.
         assert!(validate_asterdex_body(body, &derived).is_ok());
     }
 
-    /// Round-3 catch: same for `nonce=` inside another param's value.
+    /// Round-3 catch: same for nonce= substring inside another value.
     #[test]
     fn validate_asterdex_body_accepts_nonce_substring_inside_value() {
         let derived: [u8; 20] = [0x11; 20];
@@ -1447,9 +1662,7 @@ mod tests {
         assert!(validate_asterdex_body(body, &derived).is_ok());
     }
 
-    /// Round-3 catch: real duplicate `&signer=` after the value must
-    /// still be rejected (regression guard on the new `&`-prefixed
-    /// duplicate scan).
+    /// Round-3 catch: real `&signer=` duplicate still rejected.
     #[test]
     fn validate_asterdex_body_still_rejects_real_duplicate_signer_after_fix() {
         let derived: [u8; 20] = [0x11; 20];
@@ -1459,7 +1672,7 @@ mod tests {
         assert!(validate_asterdex_body(body, &derived).is_err());
     }
 
-    /// Round-3 catch: real duplicate `&nonce=` still rejected.
+    /// Round-3 catch: real `&nonce=` duplicate still rejected.
     #[test]
     fn validate_asterdex_body_still_rejects_real_duplicate_nonce_after_fix() {
         let derived: [u8; 20] = [0x11; 20];
@@ -1662,5 +1875,504 @@ mod tests {
         // Phase 1 only routes order + cancel; anything else hits the
         // dispatcher's catch-all → bad_request.
         assert_eq!(resp.error.as_deref(), Some(err_code::BAD_REQUEST));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // UPL v0 — Policy enforcement unit tests.
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // These test `enforce_policy` in isolation (no KMS, no signing).
+    // The function only needs a `Policy` reference and a `SignRequest`
+    // reference to make its decision.
+
+    use crate::proto::Policy;
+
+    fn policy_test_req(action: &str, method: &str, path: &str) -> SignRequest {
+        SignRequest {
+            action: action.to_owned(),
+            method: Some(method.to_owned()),
+            path: Some(path.to_owned()),
+            body: Some(String::new()),
+            timestamp_ms: Some(1714997000000),
+            key_blob_s3_key: None,
+            key_id: None,
+            aws_credentials: None,
+            ciphertext_blob_base64: None,
+            query: None,
+            hl_action: None,
+            nonce: None,
+            vault_address: None,
+        }
+    }
+
+    #[test]
+    fn enforce_policy_none_permits_all() {
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        assert!(enforce_policy(None, &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_empty_permits_all() {
+        let p = Policy::default();
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_allowed_actions_permits_listed() {
+        let p = Policy {
+            allowed_actions: Some(vec![
+                "sign_binance".to_owned(),
+                "sign_okx".to_owned(),
+            ]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_allowed_actions_denies_unlisted() {
+        let p = Policy {
+            allowed_actions: Some(vec!["sign_binance".to_owned()]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_okx", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    #[test]
+    fn enforce_policy_allowed_methods_permits_listed() {
+        let p = Policy {
+            allowed_methods: Some(vec!["GET".to_owned(), "POST".to_owned()]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "GET", "/api/v1/ticker");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_allowed_methods_denies_unlisted() {
+        let p = Policy {
+            allowed_methods: Some(vec!["GET".to_owned()]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    #[test]
+    fn enforce_policy_allowed_methods_skips_eip712_no_method() {
+        // EIP-712 requests have method=None — method whitelist should
+        // not block them (EIP-712 doesn't use HTTP methods for signing).
+        let p = Policy {
+            allowed_methods: Some(vec!["GET".to_owned()]),
+            ..Policy::default()
+        };
+        let mut req = policy_test_req("sign_hyperliquid_main_order", "POST", "");
+        req.method = None;
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_path_prefix_allows_matching() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec![
+                "/api/v1/order".to_owned(),
+                "/api/v1/position".to_owned(),
+            ]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order/test");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_path_prefix_denies_non_matching() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api/v1/order".to_owned()]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/withdraw");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    #[test]
+    fn enforce_policy_denied_path_prefix_blocks() {
+        let p = Policy {
+            denied_path_prefixes: Some(vec![
+                "/api/v1/withdraw".to_owned(),
+                "/api/v1/transfer".to_owned(),
+            ]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/withdraw/apply");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    #[test]
+    fn enforce_policy_denied_path_prefix_allows_non_matching() {
+        let p = Policy {
+            denied_path_prefixes: Some(vec!["/api/v1/withdraw".to_owned()]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_combined_rules() {
+        // Real-world: "Binance only, trading endpoints only, no withdrawals"
+        let p = Policy {
+            allowed_actions: Some(vec!["sign_binance".to_owned()]),
+            allowed_methods: Some(vec!["GET".to_owned(), "POST".to_owned(), "DELETE".to_owned()]),
+            allowed_path_prefixes: Some(vec![
+                "/api/v3/order".to_owned(),
+                "/fapi/v1/order".to_owned(),
+                "/fapi/v1/position".to_owned(),
+            ]),
+            denied_path_prefixes: Some(vec![
+                "/sapi/v1/capital/withdraw".to_owned(),
+                "/sapi/v1/capital/transfer".to_owned(),
+            ]),
+            ..Policy::default()
+        };
+        // Good request: Binance + POST + order path
+        let req = policy_test_req("sign_binance", "POST", "/fapi/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+
+        // Wrong exchange
+        let req = policy_test_req("sign_okx", "POST", "/fapi/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_err());
+
+        // Wrong path
+        let req = policy_test_req("sign_binance", "POST", "/sapi/v1/capital/withdraw/apply");
+        // allowed_path_prefixes check fires first — /sapi/v1 not in allow list
+        assert!(enforce_policy(Some(&p), &req).is_err());
+    }
+
+    #[test]
+    fn enforce_policy_label_too_long_rejects() {
+        let p = Policy {
+            label: Some("x".repeat(200)),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        // Gemini OSS PR #9: label violation = policy-level rejection,
+        // not request-shape failure → POLICY_DENIED.
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    #[test]
+    fn enforce_policy_label_within_limit_passes() {
+        let p = Policy {
+            label: Some("binance-prod-trading".to_owned()),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+    }
+
+    // ─── ParsedBlob unit tests (proto.rs) ────────────────────────────
+
+    use crate::proto::ParsedBlob;
+
+    #[test]
+    fn parsed_blob_legacy_flat_secret() {
+        let blob = br#"{"key":"abc","secret":"def","passphrase":"ghi"}"#;
+        let parsed = ParsedBlob::from_plaintext(blob).unwrap();
+        assert!(parsed.policy().is_none());
+        assert!(parsed.secret_json().get("key").is_some());
+    }
+
+    #[test]
+    fn parsed_blob_policy_wrapped() {
+        let blob = br#"{
+            "policy": {
+                "allowed_actions": ["sign_binance"],
+                "label": "test-policy"
+            },
+            "secret": {
+                "key": "abc",
+                "secret": "def"
+            }
+        }"#;
+        let parsed = ParsedBlob::from_plaintext(blob).unwrap();
+        let p = parsed.policy().unwrap();
+        assert_eq!(
+            p.allowed_actions.as_ref().unwrap(),
+            &vec!["sign_binance".to_owned()]
+        );
+        assert_eq!(p.label.as_deref(), Some("test-policy"));
+        assert!(parsed.secret_json().get("key").is_some());
+    }
+
+    #[test]
+    fn parsed_blob_policy_empty_means_unrestricted() {
+        let blob = br#"{
+            "policy": {},
+            "secret": {"key":"x","secret":"y"}
+        }"#;
+        let parsed = ParsedBlob::from_plaintext(blob).unwrap();
+        let p = parsed.policy().unwrap();
+        assert!(p.allowed_actions.is_none());
+        assert!(p.allowed_methods.is_none());
+        assert!(p.allowed_path_prefixes.is_none());
+        assert!(p.denied_path_prefixes.is_none());
+    }
+
+    #[test]
+    fn parsed_blob_invalid_json_errors() {
+        let blob = b"not json at all";
+        assert!(ParsedBlob::from_plaintext(blob).is_err());
+    }
+
+    // ─── Gemini round-2 catches on UPL v0 ────────────────────────────
+
+    /// CRITICAL (Gemini): malformed policy-wrapped blob (has "policy"
+    /// key but invalid `secret` field) must NOT fall back to legacy.
+    /// Previous "try-wrapped-then-fall-back" approach would silently
+    /// bypass policy enforcement on any policy-wrapped blob that failed
+    /// to fully parse.
+    #[test]
+    fn parsed_blob_malformed_policy_wrapped_does_not_fail_open() {
+        // Blob has top-level "policy" key but "secret" field is missing.
+        // Old behavior: PolicyWrappedSecret parse fails → fall back to
+        // legacy → Ok(Legacy) with bypassed policy.
+        // New behavior: top-level "policy" detected → strict wrapped
+        // parse → error (secret missing) → no fallback.
+        let blob = br#"{"policy": {"allowed_actions": ["sign_binance"]}}"#;
+        assert!(
+            ParsedBlob::from_plaintext(blob).is_err(),
+            "malformed policy-wrapped blob must error, not fall back to legacy"
+        );
+    }
+
+    /// CRITICAL: same regression — blob with "policy" key but invalid
+    /// policy JSON inside. Must reject, not fall back.
+    #[test]
+    fn parsed_blob_invalid_policy_inside_wrapper_does_not_fail_open() {
+        // policy field is the wrong shape (string instead of object).
+        let blob = br#"{"policy": "not_an_object", "secret": {"key":"k","secret":"s"}}"#;
+        assert!(ParsedBlob::from_plaintext(blob).is_err());
+    }
+
+    /// HIGH (Gemini): empty `allowed_actions` whitelist must DENY all
+    /// (not permit all). `Some(vec![])` is an explicit "permit nothing"
+    /// constraint; `None` represents "no constraint".
+    #[test]
+    fn enforce_policy_empty_allowed_actions_denies_all() {
+        let p = Policy {
+            allowed_actions: Some(vec![]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// HIGH: empty `allowed_methods` denies all.
+    #[test]
+    fn enforce_policy_empty_allowed_methods_denies_all() {
+        let p = Policy {
+            allowed_methods: Some(vec![]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// HIGH: empty `allowed_path_prefixes` denies all.
+    #[test]
+    fn enforce_policy_empty_allowed_path_prefixes_denies_all() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec![]),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// HIGH (Gemini round-4): empty prefix in allowed_path_prefixes
+    /// must NOT silently bypass the allowlist. `path.starts_with("")`
+    /// is unconditionally true; without the empty-prefix guard a policy
+    /// of `allowed_path_prefixes: [""]` (typo, copy-paste error, or
+    /// attacker-crafted blob that survives KMS) would permit every path.
+    #[test]
+    fn enforce_policy_empty_prefix_does_not_bypass_allowlist() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["".to_owned()]),
+            ..Policy::default()
+        };
+        // With only an empty prefix, NOTHING should match.
+        for path in &["/", "/fapi/v1/order", "/anything", "/sapi/v1/capital/withdraw"] {
+            let req = policy_test_req("sign_binance", "POST", path);
+            let err = enforce_policy(Some(&p), &req).unwrap_err();
+            assert_eq!(
+                err.error.as_deref(),
+                Some(err_code::POLICY_DENIED),
+                "empty prefix must deny {}",
+                path
+            );
+        }
+    }
+
+    /// HIGH (Gemini round-4): mixed list with empty + valid entry —
+    /// the valid one must still match (empty is ignored, not poisonous).
+    #[test]
+    fn enforce_policy_empty_prefix_ignored_in_mixed_list() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["".to_owned(), "/fapi".to_owned()]),
+            ..Policy::default()
+        };
+        // `/fapi/v1/order` matches the second entry → ok.
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/fapi/v1/order")
+        )
+        .is_ok());
+        // `/sapi/v1/withdraw` matches neither (empty doesn't bypass) → denied.
+        let req = policy_test_req("sign_binance", "POST", "/sapi/v1/withdraw");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// HIGH: path prefix boundary safety. `/api` in allowlist must NOT
+    /// match `/api-internal/withdraw` (different path component).
+    #[test]
+    fn enforce_policy_path_prefix_boundary_rejects_partial_match() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api".to_owned()]),
+            ..Policy::default()
+        };
+        // Should be DENIED — `/api-internal` is not a sub-path of `/api`.
+        let req = policy_test_req("sign_binance", "POST", "/api-internal/withdraw");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// HIGH: same prefix accepts legitimate sub-paths (regression guard).
+    #[test]
+    fn enforce_policy_path_prefix_accepts_subpaths_after_boundary() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api".to_owned()]),
+            ..Policy::default()
+        };
+        // EOS, '/', and '?' are all valid prefix terminators.
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api")
+        )
+        .is_ok());
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api/v1/order")
+        )
+        .is_ok());
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api?foo=bar")
+        )
+        .is_ok());
+    }
+
+    /// Round-3 Gemini catch on OSS PR #9: when the prefix itself ends
+    /// with `/` or `?`, the boundary is already inside the prefix; the
+    /// byte AFTER prefix.len() can be any character. Previous logic
+    /// incorrectly rejected `/api/v1` when prefix was `/api/` because
+    /// the char at `prefix.len()` was `v` (not boundary).
+    #[test]
+    fn enforce_policy_path_prefix_with_trailing_slash_accepts_subpaths() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api/".to_owned()]),
+            ..Policy::default()
+        };
+        // prefix="/api/" should accept ANY path that starts with "/api/"
+        // — the trailing `/` makes the boundary unambiguous.
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api/v1/order")
+        )
+        .is_ok(), "prefix='/api/' must accept /api/v1/order");
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api/")
+        )
+        .is_ok(), "prefix='/api/' must accept exact match");
+        // But NOT match "/api" without the slash — that's a different
+        // path (would be matched by prefix "/api" without trailing /).
+        let err = enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api"),
+        )
+        .unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// Same fix for prefix ending in `?` (query-string terminator).
+    #[test]
+    fn enforce_policy_path_prefix_with_trailing_question_accepts_query() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["/api?".to_owned()]),
+            ..Policy::default()
+        };
+        // prefix="/api?" should match any query string.
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/api?foo=bar")
+        )
+        .is_ok());
+    }
+
+    /// Denylist intentionally KEEPS `starts_with` semantics (cautious
+    /// blocking — attacker can't suffix-bypass `/withdraw` with
+    /// `/withdraw-bypass`). Regression guard.
+    #[test]
+    fn enforce_policy_denylist_keeps_starts_with_semantics() {
+        let p = Policy {
+            denied_path_prefixes: Some(vec!["/withdraw".to_owned()]),
+            ..Policy::default()
+        };
+        // Both must be DENIED (no boundary safety on denylist).
+        let req1 = policy_test_req("sign_binance", "POST", "/withdraw");
+        let req2 = policy_test_req("sign_binance", "POST", "/withdraw-bypass-attempt");
+        let req3 = policy_test_req("sign_binance", "POST", "/withdrawal");
+        assert!(enforce_policy(Some(&p), &req1).is_err());
+        assert!(enforce_policy(Some(&p), &req2).is_err());
+        assert!(enforce_policy(Some(&p), &req3).is_err());
+    }
+
+    /// MEDIUM (Gemini): label uses char count, not byte len. A 128-char
+    /// UTF-8 label may be up to 512 bytes — the old byte check rejected
+    /// legitimate multi-byte labels.
+    #[test]
+    fn enforce_policy_label_uses_char_count_not_byte_len() {
+        // 128 Cyrillic chars = 256 bytes. Should ACCEPT (char count == 128).
+        let label_128_cyrillic: String = "а".repeat(128);
+        assert_eq!(label_128_cyrillic.chars().count(), 128);
+        assert_eq!(label_128_cyrillic.len(), 256);
+        let p = Policy {
+            label: Some(label_128_cyrillic),
+            ..Policy::default()
+        };
+        let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        assert!(enforce_policy(Some(&p), &req).is_ok());
+
+        // 129 chars = 258 bytes — reject (char count > 128).
+        let label_129_cyrillic: String = "а".repeat(129);
+        let p = Policy {
+            label: Some(label_129_cyrillic),
+            ..Policy::default()
+        };
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        // Same as label_too_long_rejects: policy-level rejection.
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
     }
 }
