@@ -115,7 +115,15 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<(), Sign
         }
     }
 
-    // 2. HTTP method whitelist (overrides global ALLOWED_METHODS).
+    // 2. HTTP method whitelist (FURTHER RESTRICTS the global
+    //    `ALLOWED_METHODS` — cannot widen it).
+    //
+    // Every sign handler validates `req.method` against the static
+    // `ALLOWED_METHODS` set BEFORE calling `load_and_parse_blob`, so by
+    // the time we get here, `req.method` is already a global-allowed verb.
+    // Policy then narrows the set further (e.g., a read-only key can
+    // restrict to `["GET"]` even though the exchange allows POST/DELETE).
+    // Gemini OSS PR #9 round-4 wording catch.
     //
     // Same fail-open fix as #1: empty whitelist denies all.
     if let Some(ref allowed) = p.allowed_methods {
@@ -194,6 +202,17 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<(), Sign
 /// the cautious matching (deny `/withdraw` blocks `/withdraw-anything`)
 /// so an attacker can't suffix-bypass a denylist entry.
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    // Gemini round-4 catch (HIGH): empty prefix would bypass the allowlist.
+    // `path.starts_with("")` is unconditionally true, so a policy with
+    // `allowed_path_prefixes: [""]` would silently match any request path.
+    // An empty prefix has no security meaning — treat as "matches nothing".
+    // The CLI sanity-check rejects empty prefixes at wrap time, but defense
+    // in depth: the enclave is the source of truth and must enforce this
+    // regardless of what produced the blob (legacy operator scripts,
+    // attacker-crafted ciphertext that survives KMS, etc.).
+    if prefix.is_empty() {
+        return false;
+    }
     if !path.starts_with(prefix) {
         return false;
     }
@@ -597,9 +616,16 @@ fn handle_sign_okx(req: SignRequest) -> SignResponse {
 // from the components we return.
 
 /// Common pre-flight + decrypt path shared by `order` and `cancel`.
-/// Returns the decrypted `HyperliquidSecret`, parsed action data, and
-/// optional policy on success, or a populated `SignResponse::err` on any
-/// validation/decrypt failure.
+/// Returns the decrypted `HyperliquidSecret` and parsed action data on
+/// success, or a populated `SignResponse::err` on any validation, decrypt,
+/// or policy-enforcement failure.
+///
+/// Note: the co-encrypted UPL policy is enforced INTERNALLY (inside
+/// `enforce_policy(...)`) before the secret is returned to the caller —
+/// callers do not see the policy because no decision they could make
+/// after this function returns would need it. If you ever need the
+/// policy at the call site (e.g., to log the matched action+label),
+/// thread it through here explicitly.
 ///
 /// UPL v0: extracts and enforces the co-encrypted policy before returning
 /// the secret. If the policy denies the request, returns `policy_denied`.
@@ -2170,6 +2196,50 @@ mod tests {
             ..Policy::default()
         };
         let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
+        let err = enforce_policy(Some(&p), &req).unwrap_err();
+        assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
+    }
+
+    /// HIGH (Gemini round-4): empty prefix in allowed_path_prefixes
+    /// must NOT silently bypass the allowlist. `path.starts_with("")`
+    /// is unconditionally true; without the empty-prefix guard a policy
+    /// of `allowed_path_prefixes: [""]` (typo, copy-paste error, or
+    /// attacker-crafted blob that survives KMS) would permit every path.
+    #[test]
+    fn enforce_policy_empty_prefix_does_not_bypass_allowlist() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["".to_owned()]),
+            ..Policy::default()
+        };
+        // With only an empty prefix, NOTHING should match.
+        for path in &["/", "/fapi/v1/order", "/anything", "/sapi/v1/capital/withdraw"] {
+            let req = policy_test_req("sign_binance", "POST", path);
+            let err = enforce_policy(Some(&p), &req).unwrap_err();
+            assert_eq!(
+                err.error.as_deref(),
+                Some(err_code::POLICY_DENIED),
+                "empty prefix must deny {}",
+                path
+            );
+        }
+    }
+
+    /// HIGH (Gemini round-4): mixed list with empty + valid entry —
+    /// the valid one must still match (empty is ignored, not poisonous).
+    #[test]
+    fn enforce_policy_empty_prefix_ignored_in_mixed_list() {
+        let p = Policy {
+            allowed_path_prefixes: Some(vec!["".to_owned(), "/fapi".to_owned()]),
+            ..Policy::default()
+        };
+        // `/fapi/v1/order` matches the second entry → ok.
+        assert!(enforce_policy(
+            Some(&p),
+            &policy_test_req("sign_binance", "POST", "/fapi/v1/order")
+        )
+        .is_ok());
+        // `/sapi/v1/withdraw` matches neither (empty doesn't bypass) → denied.
+        let req = policy_test_req("sign_binance", "POST", "/sapi/v1/withdraw");
         let err = enforce_policy(Some(&p), &req).unwrap_err();
         assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
     }

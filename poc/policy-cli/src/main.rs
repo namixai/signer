@@ -245,8 +245,22 @@ fn sanity_check_policy(p: &Policy) -> Result<()> {
     // Path prefixes should start with `/` — if they don't, the
     // boundary-safe matcher in the enclave still works, but the customer
     // probably meant to write an absolute path.
+    //
+    // Empty string in allowed_path_prefixes is a HARD ERROR (not a warning):
+    // an empty prefix would (or would, absent enclave-side hardening)
+    // unconditionally match every path and silently disable the allowlist.
+    // The enclave now rejects empty prefixes too, but we fail at wrap time
+    // so the operator never ships a broken policy. Gemini round-4 catch.
     if let Some(ref prefixes) = p.allowed_path_prefixes {
         for prefix in prefixes {
+            if prefix.is_empty() {
+                anyhow::bail!(
+                    "policy.allowed_path_prefixes contains an empty string. \
+                     An empty prefix would bypass the allowlist (matches any \
+                     path). Remove the empty entry or use `[]` for an \
+                     allow-nothing list."
+                );
+            }
             if !prefix.starts_with('/') {
                 eprintln!(
                     "warning: policy.allowed_path_prefixes entry '{}' does not start with '/'.",
@@ -257,6 +271,13 @@ fn sanity_check_policy(p: &Policy) -> Result<()> {
     }
     if let Some(ref prefixes) = p.denied_path_prefixes {
         for prefix in prefixes {
+            if prefix.is_empty() {
+                anyhow::bail!(
+                    "policy.denied_path_prefixes contains an empty string. \
+                     An empty denial prefix would deny every request. Remove \
+                     the empty entry or use `[]` to opt out of denials."
+                );
+            }
             if !prefix.starts_with('/') {
                 eprintln!(
                     "warning: policy.denied_path_prefixes entry '{}' does not start with '/'.",
