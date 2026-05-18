@@ -42,22 +42,33 @@ ENV LC_ALL=C
 ENV TZ=UTC
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+
+# Stub the policy-cli workspace member BEFORE the actually-built crates
+# below. policy-cli is a customer-side wrapping tool — not in the enclave
+# runtime, never compiled by `-p signer-enclave`. But cargo requires all
+# workspace members to exist with a valid Cargo.toml for the root manifest
+# to validate.
+#
+# Stubbing (vs. `COPY policy-cli ./policy-cli`) avoids busting the docker
+# layer cache (and therefore the expensive cargo build) whenever a
+# customer-only CLI source change lands. Gemini OSS PR #10 round-1.
+#
+# We stub BOTH main.rs and lib.rs to be robust against future schema
+# changes in policy-cli/Cargo.toml — if it ever switches between binary
+# and library crate (or adds both), the manifest stays valid.
+# Gemini round-2 robustness catch.
+#
+# Placement here (before COPY enclave/parent/gateway) keeps this layer's
+# cache independent of changes in the actually-built crates. Gemini OSS
+# PR #10 round-2 placement catch.
+COPY policy-cli/Cargo.toml ./policy-cli/Cargo.toml
+RUN mkdir -p policy-cli/src \
+    && echo 'fn main() {}' > policy-cli/src/main.rs \
+    && echo '' > policy-cli/src/lib.rs
+
 COPY enclave ./enclave
 COPY parent ./parent
 COPY gateway ./gateway
-# policy-cli is a workspace member used locally by customers to wrap
-# policy+secret into a KMS-encryptable blob. Not in the enclave runtime,
-# but cargo requires all workspace members to exist for the manifest
-# to validate even when building with `-p signer-enclave`.
-#
-# We copy ONLY Cargo.toml and stub the source with `fn main() {}` instead
-# of `COPY policy-cli ./policy-cli`. The enclave build never reads
-# policy-cli's source — only the workspace manifest needs the member to
-# exist with a valid Cargo.toml. Stubbing avoids busting the docker layer
-# cache (and therefore the expensive cargo build) whenever a customer-only
-# CLI source change lands. Gemini OSS PR #10 round-1 catch.
-COPY policy-cli/Cargo.toml ./policy-cli/Cargo.toml
-RUN mkdir -p policy-cli/src && echo 'fn main() {}' > policy-cli/src/main.rs
 
 RUN cargo build \
     --release \
