@@ -53,7 +53,7 @@ fi
 : "${SIGNER_EC2_HOST:?must export SIGNER_EC2_HOST (ec2-user@host or host alias)}"
 : "${S3_BUCKET:?must export S3_BUCKET (the bucket the gateway reads blobs from)}"
 SIGNER_GATEWAY_URL="${SIGNER_GATEWAY_URL:-https://signer-demo.usenami.io:8443}"
-KMS_KEY_ALIAS="${KMS_KEY_ALIAS:-alias/usenami-signer-poc}"
+KMS_KEY_ALIAS="${KMS_KEY_ALIAS:-alias/signer-poc}"
 S3_KEY_PREFIX="${S3_KEY_PREFIX:-secrets/upl-smoke}"
 
 WORK_DIR="$(mktemp -d -t upl-smoke.XXXXXX)"
