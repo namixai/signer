@@ -22,7 +22,7 @@
 # Environment:
 #   SIGNER_EC2_HOST       — ec2-user@host or IP for ssh ProxyJump
 #   SIGNER_GATEWAY_URL    — https://signer-demo.usenami.io:8443 (default)
-#   KMS_KEY_ALIAS         — alias/usenami-signer-poc (default)
+#   KMS_KEY_ALIAS         — alias/signer-poc (default)
 #   S3_BUCKET             — bucket where the enclave reads blobs from
 #   S3_KEY_PREFIX         — secrets/upl-smoke (default)
 #   POC_DIR               — path to _signer/poc (default: this script's dir/..)

@@ -51,16 +51,14 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 #
 # Stubbing (vs. `COPY policy-cli ./policy-cli`) avoids busting the docker
 # layer cache (and therefore the expensive cargo build) whenever a
-# customer-only CLI source change lands. Gemini round-1 catch on this PR.
+# customer-only CLI source change lands.
 #
 # We stub BOTH main.rs and lib.rs to be robust against future schema
 # changes in policy-cli/Cargo.toml — if it ever switches between binary
 # and library crate (or adds both), the manifest stays valid.
-# Gemini round-2 robustness catch.
 #
 # Placement here (before COPY enclave/parent/gateway) keeps this layer's
-# cache independent of changes in the actually-built crates. Gemini
-# round-2 placement catch on this PR.
+# cache independent of changes in the actually-built crates.
 COPY policy-cli/Cargo.toml ./policy-cli/Cargo.toml
 RUN mkdir -p policy-cli/src \
     && echo 'fn main() {}' > policy-cli/src/main.rs \
