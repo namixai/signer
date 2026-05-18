@@ -49,7 +49,15 @@ COPY gateway ./gateway
 # policy+secret into a KMS-encryptable blob. Not in the enclave runtime,
 # but cargo requires all workspace members to exist for the manifest
 # to validate even when building with `-p signer-enclave`.
-COPY policy-cli ./policy-cli
+#
+# We copy ONLY Cargo.toml and stub the source with `fn main() {}` instead
+# of `COPY policy-cli ./policy-cli`. The enclave build never reads
+# policy-cli's source — only the workspace manifest needs the member to
+# exist with a valid Cargo.toml. Stubbing avoids busting the docker layer
+# cache (and therefore the expensive cargo build) whenever a customer-only
+# CLI source change lands. Gemini OSS PR #10 round-1 catch.
+COPY policy-cli/Cargo.toml ./policy-cli/Cargo.toml
+RUN mkdir -p policy-cli/src && echo 'fn main() {}' > policy-cli/src/main.rs
 
 RUN cargo build \
     --release \
