@@ -45,6 +45,11 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY enclave ./enclave
 COPY parent ./parent
 COPY gateway ./gateway
+# policy-cli is a workspace member used locally by customers to wrap
+# policy+secret into a KMS-encryptable blob. Not in the enclave runtime,
+# but cargo requires all workspace members to exist for the manifest
+# to validate even when building with `-p signer-enclave`.
+COPY policy-cli ./policy-cli
 
 RUN cargo build \
     --release \
