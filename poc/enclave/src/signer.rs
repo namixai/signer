@@ -522,9 +522,19 @@ pub fn eip712_type_hash(type_string: &str) -> [u8; 32] {
 ///   chainId           = 1337  (NOT Ethereum mainnet's 1)
 ///   verifyingContract = 0x0000000000000000000000000000000000000000
 ///
-/// HIP-3 venues (xyz/km/cash/etc.) will receive their own per-venue
-/// constants when the next worker adds them — Hyperliquid documents that
-/// chainId differs per HIP-3 deployer.
+/// HIP-3 builder-deployed perps (xyz/km/cash/etc.) reuse this IDENTICAL
+/// domain — there is NO per-venue / per-deployer chainId. Hyperliquid signs
+/// ALL L1 actions (including `order`/`cancel`) with this one phantom-agent
+/// scheme: chainId 1337, name "Exchange", source "a" (mainnet) / "b"
+/// (testnet). The chainId is a hardcoded constant in the SDK's `l1_payload()`
+/// with no branching on dex/venue/deployer. A HIP-3 order differs ONLY by the
+/// asset index in the order's `a` field (builder-dex asset =
+/// 100000 + perp_dex_index*10000 + index_in_meta), computed client-side and
+/// signed verbatim — no enclave change needed to sign HIP-3 orders.
+/// Refs: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/asset-ids
+///       hyperliquid-python-sdk: hyperliquid/utils/signing.py (`l1_payload`, chainId 1337)
+/// (The separate user-signed-action path — domain "HyperliquidSignTransaction",
+/// signatureChainId 0x66eee — is for withdrawals/transfers, NOT orders.)
 pub fn hyperliquid_main_domain_separator() -> [u8; 32] {
     let type_hash = eip712_type_hash(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",

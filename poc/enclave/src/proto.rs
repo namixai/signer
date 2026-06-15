@@ -422,11 +422,13 @@ impl fmt::Debug for OkxSecret {
 /// `Some("0x<40 hex>")` if the operator is signing on behalf of a vault.
 ///
 /// `exchange` is informational and currently always `"hyperliquid_main"`;
-/// future HIP-3 venues will set their own value (e.g. `"hyperliquid_xyz"`).
+/// future HIP-3 venues would set their own value (e.g. `"hyperliquid_xyz"`).
 /// The enclave does NOT consume this field at parse time — the dispatcher
 /// in `handler.rs` picks the venue from the action name. We keep it in the
 /// blob purely so a human can tell at a glance which exchange a blob was
-/// minted for.
+/// minted for. NOTE: this label is cosmetic and does NOT affect signing — the
+/// EIP-712 domain (chainId 1337, phantom agent) is IDENTICAL for every
+/// Hyperliquid venue incl. HIP-3 builder dexes; only the asset index differs.
 ///
 /// Zeroization: same model as the HMAC secrets — explicit `Drop` walks the
 /// heap and overwrites the backing bytes via `Zeroize` on the `Vec<u8>`.
