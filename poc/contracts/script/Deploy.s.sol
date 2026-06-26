@@ -17,7 +17,7 @@ contract Deploy is Script {
         bytes memory pcr0 = vm.envOr(
             "PCR0_HEX",
             bytes(
-                hex"9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab"
+                hex"7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375"
             )
         );
         require(pcr0.length == 48, "PCR0_HEX must be 48 bytes");
