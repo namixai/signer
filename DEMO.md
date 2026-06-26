@@ -3,10 +3,9 @@
 A five-minute proof that your exchange API secrets and DEX private keys
 cannot leak from a compromised machine.
 
-No slides. The transcripts below are real terminal output from a
-production AWS Nitro Enclave on May 13, 2026, with one section (the
-on-chain verification) you can repeat yourself in under thirty seconds
-with no setup.
+No slides. The signing transcripts below are real terminal output from
+the Usenami pilot enclave, plus one section (the on-chain verification)
+you can repeat yourself in under thirty seconds with no setup.
 
 ---
 
@@ -28,8 +27,8 @@ operating system, even by AWS engineers. Your trading bot sends a
 returns the authentication headers, and your bot forwards them to the
 exchange. The signing secret never leaves the enclave.
 
-Supported exchanges as of May 2026: KuCoin Futures, Binance (spot &
-futures), Bybit V5, OKX V5, Hyperliquid mainnet.
+Supported exchanges: KuCoin Futures, Binance (spot & futures), Bybit
+V5, OKX V5, Hyperliquid mainnet, and Asterdex.
 
 ---
 
@@ -38,13 +37,15 @@ futures), Bybit V5, OKX V5, Hyperliquid mainnet.
 Four steps, each one a single command, total runtime under one minute.
 
 1. **Baseline.** What a plaintext-credentials threat model looks like.
-2. **Live signing.** A real call to the production signer, returning a
+2. **Live signing.** A real call to the pilot signer, returning a
    valid HMAC-signed header set without exposing the secret.
 3. **Adversarial probe.** A simulated attacker trying — and failing —
    to extract the secret through the public HTTP surface.
 4. **Decentralized verification.** Anyone, including someone who
-   distrusts us, can prove the enclave is running our published build
-   by reading a public smart contract on Base mainnet.
+   distrusts us, can read a public smart contract on Base mainnet to
+   confirm our published production build is the measurement we
+   registered — and can request a live attestation from the pilot
+   enclave to confirm what it is running right now.
 
 Steps 1–3 below are transcripts of what we ran. Step 4 you can repeat
 yourself, no allowlist needed, in your browser or with one command.
@@ -221,14 +222,18 @@ Technically, PCR0 is a SHA-384 hash over the complete enclave image
 single byte and PCR0 changes. AWS measures PCR0 in hardware, so we
 cannot forge it ourselves even if we wanted to.
 
-The current Usenami Signer build's PCR0 is registered in a public
-smart contract on Base mainnet:
+Usenami's production enclave build has its PCR0 registered in a public
+smart contract on Base mainnet. The closed-pilot demo endpoint above
+runs a separate pilot enclave, whose live measurement you verify by
+requesting an attestation from it (see *The Nitro attestation document*
+below) — so this on-chain record is the production build's measurement,
+verifiable independently of the demo:
 
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
   (source verified on Basescan)
 - Active PCR0:
-  `9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab`
+  `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
 - Canonical owner address:
   `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
 
@@ -237,7 +242,7 @@ smart contract on Base mainnet:
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab \
+  0x7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375 \
   --rpc-url https://mainnet.base.org
 ```
 
@@ -269,13 +274,13 @@ true
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-Translation: *PCR0 9f6f512f… is currently active, registered by
+Translation: *PCR0 7c9e8b26… is currently active, registered by
 0x21538eBF…, which is the canonical owner address Usenami publishes.*
 
 If we had replaced the enclave with malicious code after deployment,
 the PCR0 would be different and this call would return `(false,
-0x0000…)`. The correspondence between the *running enclave's
-measurement* and the *on-chain registration* is what gives a third
+0x0000…)`. The correspondence between the *production build's
+measurement* and its *on-chain registration* is what gives a third
 party the right to trust the signer without trusting Usenami's
 website, marketing, or word.
 
@@ -304,12 +309,12 @@ succeeds:
 ```bash
 nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
 # Compare the output to the PCR0 value from the on-chain registry
-# (Step 4 above): 9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab
+# (Step 4 above): 7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you
-have *byte-level confirmation that the running production enclave is
-the source code you just inspected*. If it does not match, that is a
+have *byte-level confirmation that the production build registered
+on-chain is the source code you just inspected*. If it does not match, that is a
 security finding — open an issue on the repository.
 
 In practice, achieving fully byte-deterministic Rust builds takes
@@ -382,7 +387,10 @@ A pilot integrating against the signer should:
    client nonce.
 2. Verify the signature chain against AWS's published root CA (pinned,
    not fetched).
-3. Confirm `pcrs[0]` matches the value returned by `isPCR0Active`.
+3. Confirm `pcrs[0]` is the measurement you expect — for the on-chain
+   production build, the value returned by `isPCR0Active`; for the
+   closed-pilot enclave, the attestation document is itself AWS-signed
+   proof of the live measurement.
 4. Confirm the embedded nonce equals what was sent.
 5. Use the enclave's public key from the document to set up a session
    key exchange — every subsequent response is then bound to *this
@@ -391,11 +399,11 @@ A pilot integrating against the signer should:
 
 This is the single piece that converts "we claim our enclave is safe"
 into "your client cryptographically refuses to talk to anything except
-the right enclave." The attestation endpoint is on the Phase 2
-roadmap. Until then, the trust chain has a gap between *the PCR0
-on-chain* and *the live response you just received over HTTP* — and a
-sufficiently powerful adversary controlling the network path could
-exploit that gap. We want pilots to know.
+the right enclave." The signer exposes this live: request a fresh
+attestation document with `get_attestation`, verify the AWS signature
+chain and your nonce, and read `pcrs[0]` to confirm exactly which
+enclave answered — closing the gap between a static measurement and
+*the live response you just received over HTTP*.
 
 ---
 
@@ -608,6 +616,7 @@ Repository: [`namixai/signer`](https://github.com/namixai/signer)
 
 ---
 
-*Transcripts in this document are from a live production run on
-2026-05-13. The on-chain verification step continues to return the
-same result as long as the registered PCR0 remains active.*
+*The signing transcripts in this document are real output from the
+Usenami pilot enclave. The on-chain verification step returns the
+registered production build's measurement as long as that registration
+remains active.*
