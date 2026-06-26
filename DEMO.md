@@ -478,9 +478,9 @@ gain:
 
 - The ability to refuse signing requests (denial of service).
 - The ability to mutate signing intents before they reach the enclave
-  — but the enclave applies its own validation and (in Phase 1.5+)
-  UPL policy enforcement, so a mutated intent that violates policy is
-  rejected at the enclave boundary.
+  — but the enclave applies its own validation and live UPL policy
+  enforcement, so a mutated intent that violates policy is rejected at
+  the enclave boundary.
 - Visibility into which exchange a request targets and the request
   path — *not* the API secret.
 
@@ -567,14 +567,14 @@ To stay honest:
   published as of 2026, but the theoretical risk is not zero.
 - **Multi-party key rotation ceremonies.** Out of scope for a
   five-minute demo. Documented internally and available on request.
-- **Deep UPL policy semantics.** The Phase 1.5 Usenami Policy Layer
+- **Deep UPL policy semantics.** The live Usenami Policy Layer
   enforces coarse-grained limits (allowed venues, allowed methods,
   per-window value caps). It does not currently deep-inspect every
   exchange-specific body parameter for semantic equivalence with a
   declared intent. A sophisticated insider could in principle abuse
   exchange API polymorphism (special order types, hidden parameters)
-  to take an action that the UPL rule did not anticipate. Phase 2 of
-  UPL adds per-exchange semantic models — until then, pilot users
+  to take an action that the UPL rule did not anticipate. A future UPL
+  release adds per-exchange semantic models — until then, pilot users
   should treat UPL as a coarse safety net, not a complete sandbox.
 
 ---
