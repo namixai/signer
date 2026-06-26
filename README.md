@@ -11,12 +11,12 @@ Your exchange API secrets never leave a measured AWS Nitro Enclave. Even root on
 
 ## What it does
 
-You upload an encrypted secret once. Your bot calls our SDK to sign requests. The plaintext key exists only inside the enclave's RAM for `<10ms` per request, then is zeroed.
+You upload an encrypted secret once. Your bot calls our SDK to sign requests. The plaintext key exists only inside the enclave's RAM for the duration of a single signing operation, then is zeroed.
 
 ```
 Your bot  →  Usenami SDK  →  Gateway :8443  →  [vsock]  →  Nitro Enclave
                                                             ├ KMS Decrypt (attestation-gated)
-                                                            ├ UPL policy validation (Phase 1.5)
+                                                            ├ UPL policy validation (live)
                                                             └ HMAC-SHA256 or EIP-712 sign
                                                                   ↓
 Your bot  ←  signed headers / signature  ←  Gateway
@@ -32,6 +32,16 @@ Adversarial-tested: direct KMS decrypt without attestation → AccessDenied. Wro
 
 ---
 
+## Documentation
+
+For engineers, security reviewers, and recruiters who want to dig deeper:
+
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — visual data flow, trust boundaries, and component-by-component responsibilities. Mermaid diagrams render natively on GitHub.
+- **[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)** — formal enumeration of attacker classes (host root, supply chain, compromised IAM, network MITM, insider, etc), what each can attempt, and what stops them.
+- **[`docs/CASE_STUDY_PCR0_ROTATION.md`](docs/CASE_STUDY_PCR0_ROTATION.md)** — walk-through of a real production migration: rotating the enclave hash across 6 live trading venues with zero plaintext exposure and zero downtime.
+
+---
+
 ## Supported exchanges
 
 | Exchange | Scheme | Status |
@@ -41,7 +51,7 @@ Adversarial-tested: direct KMS decrypt without attestation → AccessDenied. Wro
 | Bybit V5 | HMAC-SHA256 headers | Live |
 | OKX V5 | HMAC-SHA256 + passphrase | Live |
 | **Hyperliquid mainnet** | **EIP-712 typed-data (secp256k1)** | **Live** (first non-HMAC adapter) |
-| Asterdex (BNB chain) | EIP-712 typed-data | Coming next (W3) |
+| Asterdex (BNB chain) | EIP-712 typed-data | Live |
 | Hyperliquid HIP-3 family (xyz/km/cash/flx) | EIP-712 (same as main, different chainId) | Coming next |
 | dYdX v4 | Cosmos signing | Phase 2 |
 | Paradex | StarkEx | Phase 2 |
@@ -60,23 +70,22 @@ poc/
   policies/   # KMS key policies (PCR0-locked) + build pins
   scripts/    # build-eif.sh, deploy.sh, check-drift.sh, reproducibility-check.sh
   vendor/     # Vendored Rust crates for offline `cargo build --locked`
-  contracts/  # Foundry workspace: UsenamiAttestationRegistry.sol (Phase 1.5 on-chain trust anchor)
+  contracts/  # Foundry workspace: UsenamiAttestationRegistry.sol (on-chain trust anchor, live on Base)
 
 sdk/
-  python/     # usenami-signer Python SDK — `pip install usenami-signer`
-              # Per-exchange namespaces: signer.kucoin, signer.binance,
-              # signer.bybit, signer.okx, signer.hyperliquid_main
+  typescript/ # @usenami/signer — TypeScript SDK (npm: `npm i @usenami/signer`)
+  python/     # Python SDK (source only — not yet published to PyPI)
 ```
 
 ---
 
-## On-chain trust anchor (Phase 1.5)
+## On-chain trust anchor
 
 You don't have to trust `usenami.io` to publish a truthful enclave measurement. The current production PCR0 is registered in an immutable on-chain registry on Base mainnet:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
 - **Owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Active PCR0**: `9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab`
+- **Active PCR0**: `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
 
 ### How to verify (the correct way — read this carefully)
 
@@ -87,7 +96,7 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab \
+  0x7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375 \
   --rpc-url https://mainnet.base.org
 # → (true, 0x21538eBF6598e5866BA496A954dE8E39097bFB59)
 ```
@@ -98,7 +107,7 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-(Published here in the OSS source, on Basescan as the contract deployer, and in our [`STATUS.md`](https://github.com/namixai/usenami-platform/blob/main/_signer/STATUS.md). If any of these three sources disagree, do not trust this registry — open an issue.)
+(Published here in the OSS source and on Basescan as the contract deployer. If these two sources disagree, do not trust this registry — open an issue.)
 
 Reference snippet for SDKs:
 
@@ -128,7 +137,7 @@ aws kms get-key-policy --key-id <our-kms-key-id> --policy-name default \
 # Must equal the PCR0 from steps 1 and 2.
 ```
 
-All four sources (registry, running enclave, KMS policy, [`STATUS.md`](https://github.com/namixai/usenami-platform/blob/main/_signer/STATUS.md)) must hold the same PCR0. If any diverge, you've caught either a misconfiguration or an active attack — refuse to use the service until resolved.
+All three sources (registry, running enclave, KMS policy) must hold the same PCR0. If any diverge, you've caught either a misconfiguration or an active attack — refuse to use the service until resolved.
 
 ### Contract design notes
 
@@ -145,27 +154,19 @@ Source + tests + deploy script live in [`poc/contracts/`](./poc/contracts). 13/1
 
 ---
 
-## Quickstart (developer)
+## Quickstart
 
-```python
-from usenami_signer import Signer
+Connect from any MCP-aware agent (Claude, Gemini, Cursor…):
 
-signer = Signer(base_url="http://signer-demo.usenami.io:8443")
-
-# CEX HMAC signing
-accounts = signer.kucoin.get_accounts()
-balance  = signer.okx.get_account_config()
-
-# DEX EIP-712 signing (Hyperliquid)
-order = signer.hyperliquid_main.order(
-    asset=0,                  # BTC = 0 on mainnet
-    is_buy=True,
-    price="50000",
-    size="0.001",
-    reduce_only=False,
-    order_type={"limit": {"tif": "Gtc"}},
-)
+```bash
+claude mcp add signer npx @usenami/signer-mcp@0.3.0 \
+  -e SIGNER_GATEWAY_URL=https://signer-demo.usenami.io:8443 \
+  -e SIGNER_API_TOKEN=<your-token>
 ```
+
+Then ask your agent: *"place a 0.001 BTC limit order on Binance testnet."* Your API key never leaves the AWS Nitro enclave.
+
+For direct programmatic use, the TypeScript SDK is on npm — `npm i @usenami/signer` (see [`sdk/typescript`](./sdk/typescript)).
 
 Every signed call returns a **Verifiable Policy Proof** — a Nitro attestation receipt proving the enclave signed your specific request under your declared UPL policy.
 
@@ -199,17 +200,17 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 
 ---
 
-## Project status (2026-05-12)
+## Project status (2026-06-24)
 
-**Phase 1 Stage 2 LIVE in production.** 5 exchanges, first EIP-712 DEX adapter shipped + verified byte-for-byte against official Hyperliquid SDK.
+**Live in production.** 6 exchanges — 4 CEX (KuCoin, Binance, Bybit, OKX) plus two EIP-712 DEXes (Hyperliquid, Asterdex). PCR0 rotation collapsed to single-allow on 2026-06-24; EIP-712 DEX signing verified byte-for-byte against the official Hyperliquid SDK.
 
-Production PCR0: `9f6f512f81c3b533333fb53098e9df45aaa0fb31d4536a4b39ab690e056839814ab6a2595859885cc6327c544cf059ab`
+Production PCR0: `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
 
-Phase 1.5 (W3-W5, late May / early June):
-- **UPL** (Usenami Policy Language) — JSON policy validated in-enclave on every sign request
-- **Verifiable Policy Proof** — Nitro attestation receipt per signed request
-- **On-chain attestation registry** on Base — eliminates trust-Usenami-website assumption
-- **Eliza plugin** — first AI-agent platform integration
+Shipped:
+- **UPL** (Usenami Policy Layer) — JSON policy validated in-enclave on every sign request, including order-size and transfer-recipient enforcement (live)
+- **Verifiable Policy Proof** — Nitro attestation receipt per signed request (live)
+- **On-chain attestation registry** on Base — removes the trust-Usenami-website assumption (live)
+- **MCP server** (`@usenami/signer-mcp`) + **Eliza plugin** — sign from any MCP-aware AI agent (shipped)
 
 ---
 
