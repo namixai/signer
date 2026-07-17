@@ -135,6 +135,376 @@ pub fn sign_binance(
     Ok(hex::encode(tag))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Binance USD-M Futures order / cancel canonical-string builders.
+//
+// These build the form-urlencoded `user_query` portion (without
+// `timestamp`/`recvWindow`/`signature` — those are appended by
+// `compute_binance_headers` and the gateway). The string is built INSIDE the
+// enclave from structured `OrderRequest` / `CancelRequest` fields, so a
+// compromised gateway cannot smuggle an order shape different from what was
+// policy-checked (asterdex-T1 rule). Values that come from the caller are
+// ASCII-validated to prevent `&`/`=` smuggling.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Allowed alphabet for any caller-supplied value that lands directly in the
+/// urlencoded canonical without escaping. Symbol/qty/price/orderId are all
+/// alphanumeric + `-_.`; uppercase A-Z is fine for Binance's symbol format.
+/// `&`/`=`/space would let a malicious gateway inject extra params; reject.
+fn is_safe_binance_param_value(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Numerically compare two non-negative decimal strings without floating point.
+/// `Ok(Less|Equal|Greater)` mirrors `Ord::cmp`. Empty strings or non-digit/dot
+/// bytes are errors. Used for policy `max_qty` checks where f64 precision near
+/// the tail (`"0.00000001"` vs `"0.00000002"`) would matter.
+pub fn cmp_positive_decimals(a: &str, b: &str) -> Result<std::cmp::Ordering> {
+    fn split(s: &str) -> Result<(&str, &str)> {
+        if s.is_empty() {
+            anyhow::bail!("decimal is empty");
+        }
+        if s.bytes().any(|c| !c.is_ascii_digit() && c != b'.') {
+            anyhow::bail!("decimal has non-digit/non-dot byte");
+        }
+        // splitn(2, ...) silently caps at 2 elements; count first.
+        if s.bytes().filter(|c| *c == b'.').count() > 1 {
+            anyhow::bail!("decimal has more than one dot");
+        }
+        // Gemini #78: require at least one digit. Without this `"."` parses to
+        // ("", "") → compares Equal to 0 → a malformed qty="." would silently
+        // slip past the per-asset cap check. `.5` / `5.` / `5` / `0.5` stay valid.
+        if !s.bytes().any(|c| c.is_ascii_digit()) {
+            anyhow::bail!("decimal has no digits");
+        }
+        let (int, frac) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+        Ok((int.trim_start_matches('0'), frac.trim_end_matches('0')))
+    }
+    let (ai, af) = split(a)?;
+    let (bi, bf) = split(b)?;
+    // Integer parts: longer (after leading-zero strip) wins, else lex.
+    let int_ord = ai.len().cmp(&bi.len()).then_with(|| ai.cmp(bi));
+    if int_ord != std::cmp::Ordering::Equal {
+        return Ok(int_ord);
+    }
+    // Fractional parts: compare digit-by-digit with virtual right-zero-padding
+    // (lex == numeric once both sides are the same length). Gemini #78 (wave-2):
+    // the previous `af_padded`/`bf_padded` `String`s left order-quantity digits
+    // lingering in enclave heap on drop (`String` doesn't zeroize) AND allocated
+    // on a hot policy-check path. `af`/`bf` are ASCII digits only (split
+    // validated), so a byte-wise iterator compare with `b'0'` padding is exact
+    // and allocation-free. Both iterators yield exactly `max` bytes, so this is
+    // a pure element-wise compare equivalent to comparing the padded strings.
+    let max = af.len().max(bf.len());
+    let af_iter = af.bytes().chain(std::iter::repeat(b'0')).take(max);
+    let bf_iter = bf.bytes().chain(std::iter::repeat(b'0')).take(max);
+    Ok(af_iter.cmp(bf_iter))
+}
+
+/// Hard bound on a single decimal operand for `notional_exceeds`. Venue
+/// qty/price strings are ≤ ~20 chars in practice; 64 is generous headroom
+/// while keeping the schoolbook multiply O(64²) worst-case — a crafted
+/// megabyte-long "decimal" must not buy CPU inside the enclave.
+const MAX_NOTIONAL_OPERAND_LEN: usize = 64;
+
+/// B2 (mainnet-gate notional cap): exact `qty × price > max_notional` on
+/// non-negative decimal strings — schoolbook digit multiplication, no floating
+/// point, no precision loss at any scale. Validation rules match
+/// `cmp_positive_decimals` (ASCII digits + at most one dot + at least one
+/// digit), plus a length bound (`MAX_NOTIONAL_OPERAND_LEN`). The comparison is
+/// INCLUSIVE on the cap: `qty × price == max_notional` returns `Ok(false)`
+/// (allowed), mirroring `max_qty`.
+///
+/// Errors carry no blame attribution — the caller decides client-vs-policy by
+/// probing the policy operand separately (same pattern as `enforce_order_cap`).
+/// The product digits are derived, non-secret values (they are about to be
+/// signed into a venue-visible canonical), so plain `Vec<u8>` scratch is fine.
+pub fn notional_exceeds(qty: &str, price: &str, max_notional: &str) -> Result<bool> {
+    /// Parse into (digit vector most-significant-first, fractional scale).
+    /// Value = digits-as-integer / 10^scale. Leading integer zeros stripped.
+    fn parse(s: &str) -> Result<(Vec<u8>, usize)> {
+        if s.is_empty() {
+            anyhow::bail!("decimal is empty");
+        }
+        if s.len() > MAX_NOTIONAL_OPERAND_LEN {
+            anyhow::bail!("decimal operand too long");
+        }
+        if s.bytes().any(|c| !c.is_ascii_digit() && c != b'.') {
+            anyhow::bail!("decimal has non-digit/non-dot byte");
+        }
+        if s.bytes().filter(|c| *c == b'.').count() > 1 {
+            anyhow::bail!("decimal has more than one dot");
+        }
+        if !s.bytes().any(|c| c.is_ascii_digit()) {
+            anyhow::bail!("decimal has no digits");
+        }
+        let (int, frac) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+        let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+        // Strip leading zeros across the WHOLE vector (not just the int part:
+        // "0.05" must become [5], not [0,5]) so the digit-length integer
+        // compare below is sound. All-zero input drains to empty (= zero).
+        let nz = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
+        digits.drain(..nz);
+        Ok((digits, frac.len()))
+    }
+    /// Schoolbook multiply of two most-significant-first digit vectors.
+    fn mul(a: &[u8], b: &[u8]) -> Vec<u8> {
+        if a.is_empty() || b.is_empty() {
+            return Vec::new(); // zero
+        }
+        let mut acc = vec![0u32; a.len() + b.len()];
+        for (i, da) in a.iter().rev().enumerate() {
+            for (j, db) in b.iter().rev().enumerate() {
+                acc[i + j] += u32::from(*da) * u32::from(*db);
+            }
+        }
+        let mut carry = 0u32;
+        for cell in acc.iter_mut() {
+            let v = *cell + carry;
+            *cell = v % 10;
+            carry = v / 10;
+        }
+        debug_assert_eq!(carry, 0, "acc is sized a.len()+b.len(); no overflow");
+        let mut out: Vec<u8> = acc.iter().rev().map(|d| *d as u8).collect();
+        let nz = out.iter().position(|d| *d != 0).unwrap_or(out.len());
+        out.drain(..nz);
+        out
+    }
+    let (qd, qs) = parse(qty)?;
+    let (pd, ps) = parse(price)?;
+    let (cd, cs) = parse(max_notional)?;
+    let nd = mul(&qd, &pd);
+    let ns = qs + ps;
+    // Compare notional (nd, ns) vs cap (cd, cs) as integers after aligning
+    // scales: the smaller-scale side is multiplied by 10^diff (append zeros).
+    let (mut left, mut right) = (nd, cd);
+    match ns.cmp(&cs) {
+        std::cmp::Ordering::Less => {
+            if !left.is_empty() {
+                left.extend(std::iter::repeat_n(0, cs - ns));
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            if !right.is_empty() {
+                right.extend(std::iter::repeat_n(0, ns - cs));
+            }
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+    Ok(matches!(
+        left.len().cmp(&right.len()).then_with(|| left.cmp(&right)),
+        std::cmp::Ordering::Greater
+    ))
+}
+
+/// Build the Binance USD-M Futures `POST /fapi/v1/order` form-urlencoded
+/// query (without `timestamp`/`recvWindow`/`signature`). Field order is fixed
+/// (`symbol, side, type, quantity[, price, timeInForce][, reduceOnly]`) so the
+/// canonical-build is deterministic and reviewable. v0 supports `market` and
+/// `limit` only — `fok`/`ioc`/`post_only` are reserved in the schema but
+/// rejected here so the order-builder remains a single well-covered path.
+pub fn build_binance_order_query(req: &crate::proto::OrderRequest) -> Result<String> {
+    if !is_safe_binance_param_value(&req.symbol) {
+        anyhow::bail!("symbol has illegal characters");
+    }
+    if !is_safe_binance_param_value(&req.qty) {
+        anyhow::bail!("qty has illegal characters");
+    }
+    let side = match req.side.as_str() {
+        "buy" => "BUY",
+        "sell" => "SELL",
+        _ => anyhow::bail!("side must be 'buy' or 'sell'"),
+    };
+    let (order_type, needs_price) = match req.ord_type.as_str() {
+        "market" => ("MARKET", false),
+        "limit" => ("LIMIT", true),
+        // Reserved in OrderRequest but explicitly unsupported on Binance v0.
+        "fok" | "ioc" | "post_only" => {
+            anyhow::bail!("ord_type {} not supported in v0 (limit/market only)", req.ord_type)
+        }
+        _ => anyhow::bail!("unknown ord_type: {}", req.ord_type),
+    };
+    let mut out = String::with_capacity(96);
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "symbol={}&side={}&type={}&quantity={}",
+        req.symbol, side, order_type, req.qty
+    );
+    if needs_price {
+        let price = req
+            .price
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("limit order requires price"))?;
+        if !is_safe_binance_param_value(price) {
+            anyhow::bail!("price has illegal characters");
+        }
+        let _ = write!(out, "&price={}&timeInForce=GTC", price);
+    } else if req.price.is_some() {
+        anyhow::bail!("market order must not carry a price");
+    }
+    if req.reduce_only {
+        out.push_str("&reduceOnly=true");
+    }
+    // Idempotency (PR-B): bind the client order id INTO the signed canonical so
+    // a retried order is deduplicated by Binance instead of opening a second
+    // position. Appended last to keep the existing prefix byte-identical.
+    if let Some(coid) = req.client_order_id.as_deref() {
+        if !is_safe_binance_param_value(coid) {
+            anyhow::bail!("client_order_id has illegal characters");
+        }
+        use std::fmt::Write as _;
+        let _ = write!(out, "&newClientOrderId={}", coid);
+    }
+    Ok(out)
+}
+
+/// Build the Binance USD-M Futures `DELETE /fapi/v1/order` querystring
+/// (without `timestamp`/`recvWindow`/`signature`). Binance requires BOTH
+/// `symbol` and `orderId` — cancel-by-orderId alone is not accepted.
+pub fn build_binance_cancel_query(req: &crate::proto::CancelRequest) -> Result<String> {
+    if !is_safe_binance_param_value(&req.symbol) {
+        anyhow::bail!("symbol has illegal characters");
+    }
+    if !is_safe_binance_param_value(&req.order_id) {
+        anyhow::bail!("order_id has illegal characters");
+    }
+    Ok(format!("symbol={}&orderId={}", req.symbol, req.order_id))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// OKX v5 perp trade canonical-body builders.
+//
+// THE LANDMINE (freqtrade/ccxt note 2026-06-01T1010): OKX HMAC commits to
+// `timestamp + method + requestPath + body` where `body` is the EXACT JSON
+// byte-string that goes on the wire. ANY re-serialization downstream
+// (different key order, different whitespace, different quoting) → 401 at
+// the venue. So the enclave hand-constructs the JSON string byte-for-byte,
+// signs THOSE EXACT BYTES via `compute_okx_headers(..., body)`, and returns
+// the body to the gateway via `SignResponse.canonical_body` — the gateway
+// must forward it verbatim, no parse-and-re-stringify.
+//
+// Other landmines handled here:
+//  - sz is in CONTRACTS (not coins) — the MCP converts; we commit to the
+//    string the MCP supplies.
+//  - posSide is OMITTED → OKX defaults to net mode. We're net-mode-only in
+//    v0; explicit hedge support (long/short posSide) is a later PR.
+//  - TIF lives inside `ordType` (`market|limit|fok|ioc|post_only`), not a
+//    separate `timeInForce` field.
+//  - Cancel is `POST /api/v5/trade/cancel-order` with JSON body
+//    `{instId, ordId}` — NOT DELETE.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// OKX JSON-value sanitiser. Field values land directly between `"`s in the
+/// hand-built JSON string; we reject any char that would break JSON parsing or
+/// inject extra keys (`"`, `\`, control chars). Symbol/sz/px/ordId all live in
+/// the alnum + `-_.` alphabet so this is strict by design — alphabet-widening
+/// later is a deliberate change, not an accident.
+fn is_safe_okx_value(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Build the OKX `POST /api/v5/trade/order` JSON body that the enclave will
+/// sign. Fields are emitted in a fixed insertion order so the byte string is
+/// deterministic and reviewable: `instId,tdMode,side,ordType,sz[,px][,reduceOnly]`.
+/// `tdMode` is hardcoded to `"cross"` in v0 — `isolated` is a later PR. `posSide`
+/// is intentionally omitted → OKX defaults to net mode (we are net-mode only).
+pub fn build_okx_order_body(req: &crate::proto::OrderRequest) -> Result<String> {
+    if !is_safe_okx_value(&req.symbol) {
+        anyhow::bail!("symbol has illegal characters");
+    }
+    if !is_safe_okx_value(&req.qty) {
+        anyhow::bail!("qty has illegal characters");
+    }
+    let side = match req.side.as_str() {
+        "buy" | "sell" => req.side.as_str(),
+        _ => anyhow::bail!("side must be 'buy' or 'sell'"),
+    };
+    let (ord_type, needs_price) = match req.ord_type.as_str() {
+        "market" => ("market", false),
+        "limit" => ("limit", true),
+        // Reserved in OrderRequest, intentionally unsupported in v0.
+        "fok" | "ioc" | "post_only" => {
+            anyhow::bail!("ord_type {} not supported in v0 (limit/market only)", req.ord_type)
+        }
+        _ => anyhow::bail!("unknown ord_type: {}", req.ord_type),
+    };
+
+    // Manual JSON construction — no serde to keep byte-exactness guaranteed.
+    // Insertion order is the canonical OKX order: instId, tdMode, side, ordType,
+    // sz, [px], [reduceOnly]. Spaces are NOT inserted (OKX accepts compact JSON;
+    // freqtrade/ccxt produce compact JSON; matching keeps the HMAC stable).
+    // Capacity hint only (string grows if needed). 256 covers a 30+ char instId
+    // plus long sz/px without a realloc on the hot signing path (Gemini #79).
+    let mut out = String::with_capacity(256);
+    out.push('{');
+    out.push_str("\"instId\":\"");
+    out.push_str(&req.symbol);
+    out.push_str("\",\"tdMode\":\"cross\",\"side\":\"");
+    out.push_str(side);
+    out.push_str("\",\"ordType\":\"");
+    out.push_str(ord_type);
+    out.push_str("\",\"sz\":\"");
+    out.push_str(&req.qty);
+    out.push('"');
+    if needs_price {
+        let price = req
+            .price
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("limit order requires price"))?;
+        if !is_safe_okx_value(price) {
+            anyhow::bail!("price has illegal characters");
+        }
+        out.push_str(",\"px\":\"");
+        out.push_str(price);
+        out.push('"');
+    } else if req.price.is_some() {
+        anyhow::bail!("market order must not carry a price");
+    }
+    if req.reduce_only {
+        out.push_str(",\"reduceOnly\":true");
+    }
+    // Idempotency (PR-B): OKX `clOrdId` — bound into the signed body so a
+    // retried order dedupes at the venue. Appended after reduceOnly; keeps the
+    // existing prefix byte-identical.
+    if let Some(coid) = req.client_order_id.as_deref() {
+        if !is_safe_okx_value(coid) {
+            anyhow::bail!("client_order_id has illegal characters");
+        }
+        out.push_str(",\"clOrdId\":\"");
+        out.push_str(coid);
+        out.push('"');
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// Build the OKX `POST /api/v5/trade/cancel-order` JSON body. Both `instId`
+/// (symbol) and `ordId` (order id) are required by OKX. Insertion order:
+/// `instId, ordId` (matches the order endpoint pattern: instId always first).
+pub fn build_okx_cancel_body(req: &crate::proto::CancelRequest) -> Result<String> {
+    if !is_safe_okx_value(&req.symbol) {
+        anyhow::bail!("symbol has illegal characters");
+    }
+    if !is_safe_okx_value(&req.order_id) {
+        anyhow::bail!("order_id has illegal characters");
+    }
+    Ok(format!(
+        "{{\"instId\":\"{}\",\"ordId\":\"{}\"}}",
+        req.symbol, req.order_id
+    ))
+}
+
 /// Build the full Binance auth header set in one shot.
 ///
 /// Returns:
@@ -457,12 +827,18 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 ///
 /// - `rmp_serde::Serializer::with_struct_map()` makes structs encode as
 ///   msgpack MAPS (matching the SDK), not as arrays.
-/// - JSON map ordering: `serde_json` (without the `preserve_order`
-///   feature, which we deliberately do NOT enable) sorts object keys
-///   alphabetically. This MATCHES the Hyperliquid SDK behaviour: the
-///   SDK's order example uses keys `a,b,p,r,s,t` which are already
-///   alphabetically sorted in Python 3.7+ insertion-ordered dicts.
-///   Callers MUST construct action objects with keys alphabetically.
+/// - JSON map ordering: the workspace **enables** `serde_json`'s
+///   `preserve_order` feature, so `Value` objects are backed by `IndexMap`
+///   and preserve **insertion order** (NOT alphabetical). This is REQUIRED
+///   to match the Hyperliquid SDK byte-for-byte: HL's order-action keys are
+///   `a,b,p,s,r,t` — note `s` BEFORE `r`, which is NOT alphabetical. With
+///   insertion order we emit exactly the SDK's bytes; alphabetical sorting
+///   (a `BTreeMap`, i.e. `preserve_order` OFF) would emit `a,b,p,r,s,t` and
+///   produce a WRONG signature that HL rejects.
+///   INVARIANTS (HL signatures break silently if either is violated):
+///   (1) keep `preserve_order` on `serde_json` in the workspace `Cargo.toml` — dropping it reverts to `BTreeMap` (alphabetical);
+///   (2) callers MUST build action objects with keys in the exact HL-SDK insertion order, NOT alphabetical.
+///   Guarded by `action_hash_matches_hyperliquid_sdk_reference` (byte-exact known-answer vector) and `msgpack_preserves_insertion_order` (fast tripwire that fails the instant the feature is removed).
 /// - JSON numbers: serde_json preserves the source numeric type
 ///   (`i64`/`u64`/`f64`), and rmp-serde emits the native msgpack
 ///   integer/float form. Hyperliquid uses STRING-encoded numbers for
@@ -529,12 +905,15 @@ pub fn eip712_type_hash(type_string: &str) -> [u8; 32] {
 /// (testnet). The chainId is a hardcoded constant in the SDK's `l1_payload()`
 /// with no branching on dex/venue/deployer. A HIP-3 order differs ONLY by the
 /// asset index in the order's `a` field (builder-dex asset =
-/// 100000 + perp_dex_index*10000 + index_in_meta), computed client-side and
-/// signed verbatim — no enclave change needed to sign HIP-3 orders.
-/// Refs: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/asset-ids
-///       hyperliquid-python-sdk: hyperliquid/utils/signing.py (`l1_payload`, chainId 1337)
-/// (The separate user-signed-action path — domain "HyperliquidSignTransaction",
-/// signatureChainId 0x66eee — is for withdrawals/transfers, NOT orders.)
+/// 100000 + perp_dex_index*10000 + index_in_meta), which the client computes
+/// and the enclave signs verbatim — so no enclave change is needed to sign
+/// HIP-3 orders. Verified 2026-06-14 against primary sources:
+///   - https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/asset-ids
+///   - hyperliquid-python-sdk: hyperliquid/utils/signing.py (`l1_payload`, chainId 1337)
+///
+/// (The SEPARATE user-signed-action path — EIP-712 domain
+/// "HyperliquidSignTransaction", signatureChainId 0x66eee — is for
+/// withdrawals/transfers/approvals, NOT orders, and is also not per-deployer.)
 pub fn hyperliquid_main_domain_separator() -> [u8; 32] {
     let type_hash = eip712_type_hash(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
@@ -655,6 +1034,42 @@ pub fn parse_evm_address(s: &str) -> Result<[u8; 20]> {
     Ok(out)
 }
 
+/// Parse a decimal `uint256` string (e.g. an x402 USDC amount) into a 32-byte
+/// big-endian array. Rejects non-digits, empty input, and values exceeding
+/// 2^256-1. Pure base-10→base-256 long-multiplication so the full uint256
+/// range is representable without a bignum dependency.
+pub fn parse_u256_be_decimal(s: &str) -> Result<[u8; 32]> {
+    let s = s.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("uint256 value must be a non-empty decimal string");
+    }
+    let mut acc = [0u8; 32];
+    for ch in s.bytes() {
+        let mut carry = (ch - b'0') as u16; // acc = acc*10 + digit
+        for byte in acc.iter_mut().rev() {
+            let v = (*byte as u16) * 10 + carry;
+            *byte = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        if carry != 0 {
+            anyhow::bail!("uint256 value overflows 32 bytes");
+        }
+    }
+    Ok(acc)
+}
+
+/// Parse a `0x`-prefixed 32-byte hex string (EIP-3009 `nonce` / `bytes32`).
+pub fn parse_bytes32_hex(s: &str) -> Result<[u8; 32]> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    if stripped.len() != 64 {
+        anyhow::bail!("bytes32 must be 32 bytes (64 hex chars)");
+    }
+    let bytes = hex::decode(stripped).map_err(|_| anyhow::anyhow!("bytes32 is not valid hex"))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 /// Derive the Ethereum-style 20-byte address from a 32-byte secp256k1
 /// private key. Sanity check: the operator placed the right `private_key`
 /// next to the right `wallet_address` in the encrypted blob. Mismatch
@@ -678,6 +1093,233 @@ pub fn derive_address_from_private_key(private_key_bytes: &[u8; 32]) -> Result<[
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&hash[12..]);
     Ok(addr)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Attested-signed market data (P2): canonical-v1 (JCS) -> domain-digest ->
+// recoverable secp256k1. The enclave signs an arbitrary read-only data payload
+// with the dedicated data-signing key; buyers verify with stock web3 ecrecover.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Byte-level domain tag for attested data. MUST start with a byte != `0x19`
+/// so the digest preimage is structurally disjoint from EIP-712
+/// (`0x19 0x01 ‖ …`) — an attested-data signature can NEVER be replayed as an
+/// order / x402 / HL signature. Versioned: a schema change -> new tag + new
+/// pubkey era. (`'u'` == 0x75.)
+pub const ATTESTED_DATA_DOMAIN_V1: &[u8] = b"usenami-attested-data-v1";
+
+/// canonical-v1: RFC 8785 (JCS) serialization of a JSON value, with one project
+/// rule — **JSON numbers are forbidden**; numerics MUST be carried as decimal
+/// strings (float canonicalization is the #1 byte-divergence source for
+/// funding/OI/basis, so we eliminate floats from the signed bytes). Object keys
+/// sorted by UTF-16 code units; strings use JSON minimal escaping; no
+/// insignificant whitespace. A buyer reproduces these exact bytes with any
+/// stock JCS library over the same all-string payload.
+///
+/// **No Unicode normalization** (RFC 8785 §3.3): strings are emitted as their
+/// exact code points — producer and every buyer MUST agree on the byte form
+/// out-of-band (NFC recommended); we neither normalize nor case-fold. Object-key
+/// sort is by UTF-16 code units, so a non-BMP key (surrogate pair, e.g. an emoji)
+/// sorts AFTER every BMP key — matched bit-for-bit by a conformant buyer JCS lib.
+/// **Duplicate object keys are rejected at parse time** by
+/// [`parse_json_no_dup_keys`]; the `Value` this fn receives is therefore already
+/// dup-free (so a strict buyer parser that rejects dups can never diverge from
+/// the signed bytes).
+pub fn canonical_v1(value: &serde_json::Value) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    canonical_v1_into(value, &mut out)?;
+    Ok(out)
+}
+
+fn canonical_v1_into(value: &serde_json::Value, out: &mut Vec<u8>) -> Result<()> {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(true) => out.extend_from_slice(b"true"),
+        Value::Bool(false) => out.extend_from_slice(b"false"),
+        Value::Number(_) => anyhow::bail!(
+            "canonical-v1: JSON numbers are forbidden — encode numerics as decimal strings"
+        ),
+        Value::String(s) => jcs_string(s, out),
+        Value::Array(arr) => {
+            out.push(b'[');
+            for (i, v) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                canonical_v1_into(v, out)?;
+            }
+            out.push(b']');
+        }
+        Value::Object(map) => {
+            // RFC 8785 §3.2.3: sort object keys by UTF-16 code units.
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+            out.push(b'{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                jcs_string(k, out);
+                out.push(b':');
+                canonical_v1_into(&map[*k], out)?;
+            }
+            out.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+/// JSON string with RFC 8785 minimal escaping (escape `"` `\` and the C0
+/// control chars U+0000–U+001F; emit everything else, incl. non-ASCII, as UTF-8).
+fn jcs_string(s: &str, out: &mut Vec<u8>) {
+    out.push(b'"');
+    for c in s.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\u{08}' => out.extend_from_slice(b"\\b"),
+            '\u{09}' => out.extend_from_slice(b"\\t"),
+            '\u{0a}' => out.extend_from_slice(b"\\n"),
+            '\u{0c}' => out.extend_from_slice(b"\\f"),
+            '\u{0d}' => out.extend_from_slice(b"\\r"),
+            c if (c as u32) < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes());
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// `keccak256(ATTESTED_DATA_DOMAIN_V1 ‖ canonical_bytes)` — the 32-byte digest
+/// that is signed (and that a buyer ecrecovers against).
+pub fn attested_data_digest_v1(canonical: &[u8]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(ATTESTED_DATA_DOMAIN_V1.len() + canonical.len());
+    buf.extend_from_slice(ATTESTED_DATA_DOMAIN_V1);
+    buf.extend_from_slice(canonical);
+    keccak256(&buf)
+}
+
+/// Sign an attested-data payload with the data-signing key: canonical-v1 ->
+/// domain digest -> recoverable secp256k1 (RFC 6979 deterministic). Returns the
+/// `(r,s,v)` triple a buyer ecrecovers.
+pub fn sign_attested_data(
+    private_key_bytes: &[u8; 32],
+    value: &serde_json::Value,
+) -> Result<HlSignature> {
+    let canonical = canonical_v1(value)?;
+    let digest = attested_data_digest_v1(&canonical);
+    sign_eip712_digest(private_key_bytes, &digest)
+}
+
+/// The data-signing public key in BOTH wire forms (CTO decision b):
+/// `(compressed_secp256k1_hex, eth_address_hex)`. Stable across PCR0 cutovers
+/// (same sealed key -> same pubkey); buyers pin the address and check
+/// `address == derive(recovered_pubkey)`.
+pub fn attested_data_pubkey(private_key_bytes: &[u8; 32]) -> Result<(String, String)> {
+    let signing_key = SigningKey::from_bytes(private_key_bytes.into())
+        .map_err(|_| anyhow::anyhow!("invalid secp256k1 private key"))?;
+    let compressed = signing_key.verifying_key().to_encoded_point(true);
+    let compressed_hex = format!("0x{}", hex::encode(compressed.as_bytes()));
+    let address_hex = format!(
+        "0x{}",
+        hex::encode(derive_address_from_private_key(private_key_bytes)?)
+    );
+    Ok((compressed_hex, address_hex))
+}
+
+/// Generate a fresh random secp256k1 private key IN-ENCLAVE (attested-data
+/// provisioning, Option-1). 32 bytes from the OS CSPRNG, validated as a
+/// secp256k1 scalar — a uniformly random 32-byte value is in range with
+/// overwhelming probability; the vanishingly rare out-of-range draw is retried.
+/// The bytes never leave the enclave except sealed under KMS.
+pub fn generate_secp256k1_private_key() -> Zeroizing<[u8; 32]> {
+    use rand::RngCore;
+    loop {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut bytes[..]);
+        if SigningKey::from_bytes((&*bytes).into()).is_ok() {
+            return bytes;
+        }
+    }
+}
+
+/// Parse a JSON document while REJECTING duplicate object keys (RFC 8785 §3.1
+/// strictness). `serde_json`'s default `Value` parse silently keeps the LAST of
+/// duplicate keys, so a producer could emit `{"a":"1","a":"2"}` that our enclave
+/// canonicalizes as `a="2"` while a strict buyer JCS parser rejects it outright —
+/// a signature-verification divergence. We parse the RAW bytes here (NOT a
+/// pre-parsed `Value`, whose dups are already collapsed) so the signed canonical
+/// is provably dup-free. Fail-closed: any duplicate at any nesting level → `Err`.
+pub fn parse_json_no_dup_keys(s: &str) -> Result<serde_json::Value> {
+    use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct NoDup(serde_json::Value);
+
+    impl<'de> serde::Deserialize<'de> for NoDup {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = serde_json::Value;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a JSON value with no duplicate object keys")
+                }
+                fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::Null)
+                }
+                fn visit_bool<E>(self, b: bool) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::Bool(b))
+                }
+                fn visit_i64<E>(self, n: i64) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::from(n))
+                }
+                fn visit_u64<E>(self, n: u64) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::from(n))
+                }
+                fn visit_f64<E>(self, n: f64) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::from(n))
+                }
+                fn visit_str<E>(self, s: &str) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::String(s.to_owned()))
+                }
+                fn visit_string<E>(self, s: String) -> std::result::Result<Self::Value, E> {
+                    Ok(serde_json::Value::String(s))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut arr = Vec::new();
+                    while let Some(NoDup(v)) = seq.next_element()? {
+                        arr.push(v);
+                    }
+                    Ok(serde_json::Value::Array(arr))
+                }
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut obj = serde_json::Map::new();
+                    while let Some(k) = map.next_key::<String>()? {
+                        let NoDup(v) = map.next_value()?;
+                        if obj.insert(k.clone(), v).is_some() {
+                            return Err(de::Error::custom(format!("duplicate object key: {k}")));
+                        }
+                    }
+                    Ok(serde_json::Value::Object(obj))
+                }
+            }
+            d.deserialize_any(V).map(NoDup)
+        }
+    }
+
+    let NoDup(v) = serde_json::from_str(s).map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
+    Ok(v)
 }
 
 /// Sign a Hyperliquid action (`order` or `cancel`) and return the
@@ -801,9 +1443,232 @@ pub fn sign_asterdex(
     Ok(format!("0x{}{}{:02x}", r_clean, s_clean, sig.v))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// x402 / EIP-3009 `TransferWithAuthorization` signing (USDC-on-Base et al.)
+//
+// x402 buyer-side payment: the payer signs an EIP-712 typed-data
+// `TransferWithAuthorization` authorizing a gasless USDC transfer; a
+// facilitator later submits it on-chain (the payer needs no ETH). The
+// signing primitive is the SAME EIP-712 machinery we already use for
+// Hyperliquid / Asterdex — only the domain + struct differ.
+//
+// Domain is CALLER-SUPPLIED because it is token-specific (USDC on Base has a
+// different `verifyingContract`/`chainId` than USDC on Ethereum). For USDC
+// on Base mainnet: name="USD Coin", version="2", chainId=8453,
+// verifyingContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Left-pad a 20-byte EVM address into a 32-byte EIP-712/ABI word.
+fn abi_word_from_address(addr: &[u8; 20]) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(addr);
+    word
+}
+
+/// Encode a `u64` as a 32-byte big-endian EIP-712/ABI `uint256` word.
+fn abi_word_from_u64(n: u64) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[24..].copy_from_slice(&n.to_be_bytes());
+    word
+}
+
+/// EIP-712 domain separator for an EIP-3009 token (e.g. USDC). Token-specific
+/// — pass the token's `name`/`version`/`chainId`/`verifyingContract` exactly
+/// as the token contract reports them (mismatch ⇒ a signature the facilitator
+/// rejects on `ecrecover`).
+pub fn x402_domain_separator(
+    token_name: &str,
+    token_version: &str,
+    chain_id: u64,
+    token_address: &[u8; 20],
+) -> [u8; 32] {
+    let type_hash = eip712_type_hash(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak256(token_name.as_bytes());
+    let version_hash = keccak256(token_version.as_bytes());
+    let chain_id_word = abi_word_from_u64(chain_id);
+    let verifying_contract_word = abi_word_from_address(token_address);
+
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&version_hash);
+    buf.extend_from_slice(&chain_id_word);
+    buf.extend_from_slice(&verifying_contract_word);
+    keccak256(&buf)
+}
+
+/// EIP-712 struct hash of EIP-3009 `TransferWithAuthorization`.
+///
+/// ```text
+/// hashStruct = keccak256(
+///     typeHash
+///     || pad32(from) || pad32(to)
+///     || value (uint256, 32 bytes BE)
+///     || validAfter (uint256) || validBefore (uint256)
+///     || nonce (bytes32)
+/// )
+/// ```
+///
+/// `value` is a full 32-byte big-endian `uint256` (the wire layer parses the
+/// decimal amount string into these bytes), so arbitrary token amounts are
+/// representable, not just those ≤ u64/u128.
+pub fn x402_transfer_with_authorization_struct_hash(
+    from: &[u8; 20],
+    to: &[u8; 20],
+    value: &[u8; 32],
+    valid_after: u64,
+    valid_before: u64,
+    nonce: &[u8; 32],
+) -> [u8; 32] {
+    let type_hash = eip712_type_hash(
+        "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)",
+    );
+    let mut buf = Vec::with_capacity(7 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&abi_word_from_address(from));
+    buf.extend_from_slice(&abi_word_from_address(to));
+    buf.extend_from_slice(value);
+    buf.extend_from_slice(&abi_word_from_u64(valid_after));
+    buf.extend_from_slice(&abi_word_from_u64(valid_before));
+    buf.extend_from_slice(nonce);
+    keccak256(&buf)
+}
+
+/// Sign an x402 / EIP-3009 `TransferWithAuthorization` and return the
+/// Ethereum 65-byte signature as `0x` || r(32) || s(32) || v(1), with
+/// `v ∈ {27,28}` — the form x402's `X-Payment` authorization expects.
+///
+/// Pure composition of the existing EIP-712 primitives — no new crypto.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_x402_eip3009(
+    private_key_bytes: &[u8; 32],
+    token_name: &str,
+    token_version: &str,
+    chain_id: u64,
+    token_address: &[u8; 20],
+    from: &[u8; 20],
+    to: &[u8; 20],
+    value: &[u8; 32],
+    valid_after: u64,
+    valid_before: u64,
+    nonce: &[u8; 32],
+) -> Result<String> {
+    let domain_separator =
+        x402_domain_separator(token_name, token_version, chain_id, token_address);
+    let struct_hash = x402_transfer_with_authorization_struct_hash(
+        from, to, value, valid_after, valid_before, nonce,
+    );
+    let digest = eip712_digest(&domain_separator, &struct_hash);
+    let sig = sign_eip712_digest(private_key_bytes, &digest)?;
+
+    let r_clean = sig.r.strip_prefix("0x").unwrap_or(&sig.r);
+    let s_clean = sig.s.strip_prefix("0x").unwrap_or(&sig.s);
+    Ok(format!("0x{}{}{:02x}", r_clean, s_clean, sig.v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// x402 / EIP-3009 golden vector. Reference signature produced INDEPENDENTLY
+    /// by `cast wallet sign --data` (foundry) over the EIP-712 typed-data
+    /// `TransferWithAuthorization` for the USDC-on-Base domain. Inputs:
+    ///   pk           = 0x29fb…3209  (test key; payer addr 0x15a88A4D…810F)
+    ///   to           = 0x…dEaD
+    ///   value        = 1_000_000  (1.0 USDC, 6 decimals)
+    ///   validAfter   = 0
+    ///   validBefore  = 1_900_000_000
+    ///   nonce        = 0x00…01
+    /// A mismatch means our domain separator, struct hash, or EIP-712 digest
+    /// diverged from the canonical token-contract schema → facilitator
+    /// `ecrecover` would reject the payment.
+    #[test]
+    fn x402_eip3009_matches_cast_reference() {
+        let pk = parse_evm_private_key(
+            "0x29fb5198ba9dfd7419723d2cf6dae53c46d7df83bd89dfb20419249432f83209",
+        )
+        .unwrap();
+        let from = parse_evm_address("0x15a88A4D4975Ad355E89204107BbDD176570810F").unwrap();
+        let to = parse_evm_address("0x000000000000000000000000000000000000dEaD").unwrap();
+        let usdc_base = parse_evm_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        // value = 1_000_000 = 0x0F4240, big-endian in the low 3 bytes.
+        let mut value = [0u8; 32];
+        value[29] = 0x0f;
+        value[30] = 0x42;
+        value[31] = 0x40;
+        let mut nonce = [0u8; 32];
+        nonce[31] = 0x01;
+
+        let sig = sign_x402_eip3009(
+            &pk, "USD Coin", "2", 8453, &usdc_base, &from, &to, &value, 0, 1_900_000_000, &nonce,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sig,
+            "0x99f2da75cc23b818777f5cab89f00e7bbffc16a12323bf3391dd8fed3d874ee32033ebde363d520feafb83cfd73db5c310fb362f54655878843c4c8e25fa67d41c",
+            "x402 EIP-3009 signature must match the cast/foundry reference byte-for-byte"
+        );
+    }
+
+    /// Any change to an authorized field must change the signature (tamper /
+    /// replay guard at the digest level — a facilitator binds to these exact
+    /// values).
+    #[test]
+    fn x402_eip3009_field_change_changes_signature() {
+        let pk = parse_evm_private_key(
+            "0x29fb5198ba9dfd7419723d2cf6dae53c46d7df83bd89dfb20419249432f83209",
+        )
+        .unwrap();
+        let from = parse_evm_address("0x15a88A4D4975Ad355E89204107BbDD176570810F").unwrap();
+        let to = parse_evm_address("0x000000000000000000000000000000000000dEaD").unwrap();
+        let usdc = parse_evm_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let mut value = [0u8; 32];
+        value[31] = 0x01;
+        let nonce = [7u8; 32];
+
+        let base =
+            sign_x402_eip3009(&pk, "USD Coin", "2", 8453, &usdc, &from, &to, &value, 0, 100, &nonce)
+                .unwrap();
+        // Bump value by 1 → different authorization → different signature.
+        let mut value2 = value;
+        value2[31] = 0x02;
+        let bumped = sign_x402_eip3009(
+            &pk, "USD Coin", "2", 8453, &usdc, &from, &to, &value2, 0, 100, &nonce,
+        )
+        .unwrap();
+        assert_ne!(base, bumped, "changing `value` must change the signature");
+
+        // Different chainId (replay onto another chain) → different signature.
+        let cross_chain = sign_x402_eip3009(
+            &pk, "USD Coin", "2", 1, &usdc, &from, &to, &value, 0, 100, &nonce,
+        )
+        .unwrap();
+        assert_ne!(base, cross_chain, "changing chainId must change the signature");
+    }
+
+    #[test]
+    fn parse_u256_be_decimal_vectors() {
+        assert_eq!(parse_u256_be_decimal("0").unwrap(), [0u8; 32]);
+        // 1_000_000 = 0x0F4240
+        let mut one_usdc = [0u8; 32];
+        one_usdc[29] = 0x0f;
+        one_usdc[30] = 0x42;
+        one_usdc[31] = 0x40;
+        assert_eq!(parse_u256_be_decimal("1000000").unwrap(), one_usdc);
+        // uint256 max = 2^256-1 → all 0xff.
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        assert_eq!(parse_u256_be_decimal(max).unwrap(), [0xffu8; 32]);
+        // overflow (2^256) rejected; non-digits rejected.
+        assert!(parse_u256_be_decimal(
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936"
+        )
+        .is_err());
+        assert!(parse_u256_be_decimal("12x3").is_err());
+        assert!(parse_u256_be_decimal("").is_err());
+    }
 
     /// RFC 4231 Test Case 1 — HMAC-SHA256.
     /// Key  = 0x0b * 20
@@ -1032,6 +1897,371 @@ mod tests {
             Some("5000")
         );
         assert_eq!(headers.len(), 4);
+    }
+
+    /// Binance market-order canonical (PR #78). Vector: BTCUSDT BUY MARKET 0.001
+    /// at ts=1714997000000 → full canonical signed by `compute_binance_headers`
+    /// produces this HMAC (computed independently with openssl):
+    ///   openssl dgst -sha256 -hmac '...' over
+    ///   "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001&timestamp=1714997000000&recvWindow=5000"
+    ///   -> 6cbb8dba71cafef7614f26fd26c7fc995f23b73c4e6381030abfc92213279ade
+    /// PR-B idempotency: client_order_id is appended to the canonical as
+    /// `&newClientOrderId=…` (Binance) / `"clOrdId":"…"` (OKX) so a retried
+    /// order dedupes at the venue. Absent id → prefix byte-identical (no field).
+    #[test]
+    fn client_order_id_binds_into_canonical() {
+        let mk = |coid: Option<&str>| crate::proto::OrderRequest {
+            symbol: "BTCUSDT".to_owned(),
+            side: "buy".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "market".to_owned(),
+            price: None,
+            reduce_only: false,
+            client_order_id: coid.map(str::to_owned),
+        };
+        // Binance.
+        assert_eq!(
+            build_binance_order_query(&mk(None)).unwrap(),
+            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001"
+        );
+        assert_eq!(
+            build_binance_order_query(&mk(Some("hedge-abc123"))).unwrap(),
+            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001&newClientOrderId=hedge-abc123"
+        );
+        assert!(build_binance_order_query(&mk(Some("bad id!"))).is_err());
+        // OKX.
+        let okx = |coid: Option<&str>| crate::proto::OrderRequest {
+            symbol: "BTC-USDT-SWAP".to_owned(),
+            side: "sell".to_owned(),
+            qty: "1".to_owned(),
+            ord_type: "market".to_owned(),
+            price: None,
+            reduce_only: false,
+            client_order_id: coid.map(str::to_owned),
+        };
+        assert!(!build_okx_order_body(&okx(None)).unwrap().contains("clOrdId"));
+        assert!(build_okx_order_body(&okx(Some("hedgeABC123")))
+            .unwrap()
+            .ends_with(r#","clOrdId":"hedgeABC123"}"#));
+        assert!(build_okx_order_body(&okx(Some("bad/id"))).is_err());
+    }
+
+    #[test]
+    fn build_binance_order_query_market_matches_openssl_vector() {
+        let req = crate::proto::OrderRequest {
+            symbol: "BTCUSDT".to_owned(),
+            side: "buy".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "market".to_owned(),
+            price: None,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let canonical = build_binance_order_query(&req).unwrap();
+        assert_eq!(canonical, "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001");
+
+        let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
+        let headers =
+            compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
+        assert_eq!(
+            headers.get("signature").map(String::as_str),
+            Some("6cbb8dba71cafef7614f26fd26c7fc995f23b73c4e6381030abfc92213279ade")
+        );
+    }
+
+    /// Binance limit-order canonical: SELL LIMIT 0.001 @ 50000 + timeInForce=GTC.
+    /// HMAC over the full canonical (with ts=1714997000000) →
+    ///   bb907258493ad1fb840b3a962f3582bde39566bfdfe5a2bb66a93505631ce455
+    #[test]
+    fn build_binance_order_query_limit_matches_openssl_vector() {
+        let req = crate::proto::OrderRequest {
+            symbol: "BTCUSDT".to_owned(),
+            side: "sell".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "limit".to_owned(),
+            price: Some("50000".to_owned()),
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let canonical = build_binance_order_query(&req).unwrap();
+        assert_eq!(
+            canonical,
+            "symbol=BTCUSDT&side=SELL&type=LIMIT&quantity=0.001&price=50000&timeInForce=GTC"
+        );
+
+        let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
+        let headers =
+            compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
+        assert_eq!(
+            headers.get("signature").map(String::as_str),
+            Some("bb907258493ad1fb840b3a962f3582bde39566bfdfe5a2bb66a93505631ce455")
+        );
+    }
+
+    /// Binance cancel canonical: symbol=BTCUSDT&orderId=12345 → HMAC w/ ts →
+    ///   de82c2d15582e4331a6a60cf114c7047bdcef9b52017fffecde4361ee26f6cf9
+    #[test]
+    fn build_binance_cancel_query_matches_openssl_vector() {
+        let req = crate::proto::CancelRequest {
+            symbol: "BTCUSDT".to_owned(),
+            order_id: "12345".to_owned(),
+        };
+        let canonical = build_binance_cancel_query(&req).unwrap();
+        assert_eq!(canonical, "symbol=BTCUSDT&orderId=12345");
+
+        let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
+        let headers =
+            compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
+        assert_eq!(
+            headers.get("signature").map(String::as_str),
+            Some("de82c2d15582e4331a6a60cf114c7047bdcef9b52017fffecde4361ee26f6cf9")
+        );
+    }
+
+    /// Builder validation: rejects `&`/`=`/space smuggling + bad fields.
+    #[test]
+    fn build_binance_order_query_rejects_malformed() {
+        let base = crate::proto::OrderRequest {
+            symbol: "BTCUSDT".to_owned(),
+            side: "buy".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "market".to_owned(),
+            price: None,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        // `&` smuggling in symbol must be rejected (would inject params).
+        let mut bad = base.clone();
+        bad.symbol = "BTCUSDT&qty=999".to_owned();
+        assert!(build_binance_order_query(&bad).is_err());
+        // limit without price.
+        let mut bad = base.clone();
+        bad.ord_type = "limit".to_owned();
+        assert!(build_binance_order_query(&bad).is_err());
+        // market WITH price is wrong shape.
+        let mut bad = base.clone();
+        bad.price = Some("50000".to_owned());
+        assert!(build_binance_order_query(&bad).is_err());
+        // Unknown side.
+        let mut bad = base.clone();
+        bad.side = "long".to_owned();
+        assert!(build_binance_order_query(&bad).is_err());
+        // Unsupported ord_type in v0.
+        let mut bad = base.clone();
+        bad.ord_type = "ioc".to_owned();
+        assert!(build_binance_order_query(&bad).is_err());
+        // reduce_only flag flows through.
+        let mut ro = base.clone();
+        ro.reduce_only = true;
+        let q = build_binance_order_query(&ro).unwrap();
+        assert!(q.ends_with("&reduceOnly=true"));
+    }
+
+    /// `cmp_positive_decimals` correctness across leading-zero / fractional-pad
+    /// edges where naive lex comparison breaks.
+    #[test]
+    fn cmp_positive_decimals_vectors() {
+        use std::cmp::Ordering::*;
+        assert_eq!(cmp_positive_decimals("0.01", "0.1").unwrap(), Less);
+        assert_eq!(cmp_positive_decimals("0.1", "0.10").unwrap(), Equal);
+        assert_eq!(cmp_positive_decimals("0.00000002", "0.00000001").unwrap(), Greater);
+        assert_eq!(cmp_positive_decimals("10", "2").unwrap(), Greater);
+        assert_eq!(cmp_positive_decimals("1.5", "1.500").unwrap(), Equal);
+        assert_eq!(cmp_positive_decimals("0", "0.0").unwrap(), Equal);
+        // Invalid inputs.
+        assert!(cmp_positive_decimals("", "1").is_err());
+        assert!(cmp_positive_decimals("1.2.3", "1").is_err());
+        assert!(cmp_positive_decimals("-1", "1").is_err());
+        assert!(cmp_positive_decimals("1e5", "1").is_err());
+        // Gemini #78: dot-only / no-digit inputs must be rejected, not silently
+        // treated as 0 (would bypass per-asset cap on a malformed qty).
+        assert!(cmp_positive_decimals(".", "1").is_err());
+        assert!(cmp_positive_decimals("1", ".").is_err());
+        assert!(cmp_positive_decimals("..", "1").is_err()); // also caught by dot count
+        // `.5` / `5.` ARE valid (= 0.5, = 5.0) per the at-least-one-digit rule.
+        assert_eq!(
+            cmp_positive_decimals(".5", "0.5").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            cmp_positive_decimals("5.", "5").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    /// B2: `notional_exceeds` exactness across scale / leading-zero / boundary
+    /// edges where f64 would round and naive digit-compare would misorder.
+    #[test]
+    fn notional_exceeds_vectors() {
+        // Basic over/under/equal (cap is INCLUSIVE, like max_qty).
+        assert!(notional_exceeds("2", "3", "5").unwrap()); // 6 > 5
+        assert!(!notional_exceeds("2", "3", "6").unwrap()); // 6 == 6 → allowed
+        assert!(!notional_exceeds("2", "3", "7").unwrap()); // 6 < 7
+        // Fractional scales multiply exactly: 0.1 × 0.1 = 0.01.
+        assert!(!notional_exceeds("0.1", "0.1", "0.01").unwrap());
+        assert!(notional_exceeds("0.1", "0.1", "0.009999999999").unwrap());
+        // Leading-zero normalization: 0.05 × 100 = 5, NOT "05"-vs-"6" length-trap.
+        assert!(!notional_exceeds("0.05", "100", "6").unwrap());
+        assert!(notional_exceeds("0.05", "100", "4.99").unwrap());
+        // Realistic order: 0.012 BTC × 67450.5 = 809.406 USDT.
+        assert!(!notional_exceeds("0.012", "67450.5", "809.406").unwrap());
+        assert!(notional_exceeds("0.012", "67450.5", "809.405").unwrap());
+        // Exactness beyond f64: 0.1×0.2 must be 0.02 exactly, not 0.020000…4.
+        assert!(!notional_exceeds("0.1", "0.2", "0.02").unwrap());
+        // Zero qty / zero price → zero notional, under any cap (incl. zero cap).
+        assert!(!notional_exceeds("0", "99999", "0").unwrap());
+        assert!(!notional_exceeds("0.000", "1", "0.0").unwrap());
+        // Trailing/interior zeros don't distort scale: 1.50 × 2.0 = 3.
+        assert!(!notional_exceeds("1.50", "2.0", "3").unwrap());
+        assert!(notional_exceeds("1.50", "2.0", "2.999999").unwrap());
+        // Large-digit products stay exact (near u64 territory).
+        assert!(notional_exceeds("99999999999999", "99999999999999", "9999999999999700000000000001").unwrap());
+        assert!(!notional_exceeds("99999999999999", "99999999999999", "9999999999999800000000000001").unwrap());
+        // Invalid operands are errors (same alphabet rules as cmp).
+        assert!(notional_exceeds("", "1", "1").is_err());
+        assert!(notional_exceeds("1", ".", "1").is_err());
+        assert!(notional_exceeds("1", "1", "1.2.3").is_err());
+        assert!(notional_exceeds("1e5", "1", "1").is_err());
+        assert!(notional_exceeds("-1", "1", "1").is_err());
+        // Length bound: a 65-char operand is rejected (CPU-bound guard).
+        let long = "1".repeat(65);
+        assert!(notional_exceeds(&long, "1", "1").is_err());
+        let ok64 = "1".repeat(64);
+        assert!(notional_exceeds(&ok64, "0", "1").is_ok()); // 64 chars fine
+    }
+
+    /// OKX market-order canonical JSON body (PR #79). Field order:
+    /// instId, tdMode, side, ordType, sz. Round-trip with `compute_okx_headers`
+    /// for ts=2026-05-10T19:00:00.000Z, request_path=/api/v5/trade/order →
+    /// `OK-ACCESS-SIGN` (HMAC-SHA256 base64) must match the openssl golden
+    /// vector. Computed independently:
+    ///   printf '%s' \
+    ///     '2026-05-10T19:00:00.000ZPOST/api/v5/trade/order{"instId":"BTC-USDT-SWAP","tdMode":"cross","side":"buy","ordType":"market","sz":"0.001"}' \
+    ///     | openssl dgst -sha256 -hmac '...' -binary | base64
+    ///   -> c766MAougY9HZ0qSYERG0ALQMGz4JleQUMG2lNG84WQ=
+    #[test]
+    fn build_okx_order_body_market_matches_openssl_vector() {
+        let req = crate::proto::OrderRequest {
+            symbol: "BTC-USDT-SWAP".to_owned(),
+            side: "buy".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "market".to_owned(),
+            price: None,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let body = build_okx_order_body(&req).unwrap();
+        assert_eq!(
+            body,
+            r#"{"instId":"BTC-USDT-SWAP","tdMode":"cross","side":"buy","ordType":"market","sz":"0.001"}"#
+        );
+
+        let secret = Zeroizing::new(b"test-okx-secret-NEVER-REAL-2026-05-10".to_vec());
+        let sign = sign_okx(
+            &secret,
+            "2026-05-10T19:00:00.000Z",
+            "POST",
+            "/api/v5/trade/order",
+            &body,
+        )
+        .unwrap();
+        assert_eq!(sign, "c766MAougY9HZ0qSYERG0ALQMGz4JleQUMG2lNG84WQ=");
+    }
+
+    /// OKX limit-order canonical: SELL LIMIT 0.001 @ 50000 → openssl HMAC b64
+    /// = `TECaSsgC5Y95K5Kh3ccF7eltB53gtKigiTjN4MdONFw=`. Verifies field order
+    /// (px after sz) holds.
+    #[test]
+    fn build_okx_order_body_limit_matches_openssl_vector() {
+        let req = crate::proto::OrderRequest {
+            symbol: "BTC-USDT-SWAP".to_owned(),
+            side: "sell".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "limit".to_owned(),
+            price: Some("50000".to_owned()),
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let body = build_okx_order_body(&req).unwrap();
+        assert_eq!(
+            body,
+            r#"{"instId":"BTC-USDT-SWAP","tdMode":"cross","side":"sell","ordType":"limit","sz":"0.001","px":"50000"}"#
+        );
+
+        let secret = Zeroizing::new(b"test-okx-secret-NEVER-REAL-2026-05-10".to_vec());
+        let sign = sign_okx(
+            &secret,
+            "2026-05-10T19:00:00.000Z",
+            "POST",
+            "/api/v5/trade/order",
+            &body,
+        )
+        .unwrap();
+        assert_eq!(sign, "TECaSsgC5Y95K5Kh3ccF7eltB53gtKigiTjN4MdONFw=");
+    }
+
+    /// OKX cancel canonical: `POST /api/v5/trade/cancel-order` with
+    /// `{instId, ordId}` JSON body → openssl HMAC b64
+    /// = `ii4UIfLZReqcWkiWCC1b4Kpj5N1i5dU+I2D/Odx7e5Y=`.
+    #[test]
+    fn build_okx_cancel_body_matches_openssl_vector() {
+        let req = crate::proto::CancelRequest {
+            symbol: "BTC-USDT-SWAP".to_owned(),
+            order_id: "12345".to_owned(),
+        };
+        let body = build_okx_cancel_body(&req).unwrap();
+        assert_eq!(body, r#"{"instId":"BTC-USDT-SWAP","ordId":"12345"}"#);
+
+        let secret = Zeroizing::new(b"test-okx-secret-NEVER-REAL-2026-05-10".to_vec());
+        let sign = sign_okx(
+            &secret,
+            "2026-05-10T19:00:00.000Z",
+            "POST",
+            "/api/v5/trade/cancel-order",
+            &body,
+        )
+        .unwrap();
+        assert_eq!(sign, "ii4UIfLZReqcWkiWCC1b4Kpj5N1i5dU+I2D/Odx7e5Y=");
+    }
+
+    /// Builder validation rejects `"`/`\`/etc smuggling + bad fields and the
+    /// reduceOnly flag flows through.
+    #[test]
+    fn build_okx_order_body_rejects_malformed() {
+        let base = crate::proto::OrderRequest {
+            symbol: "BTC-USDT-SWAP".to_owned(),
+            side: "buy".to_owned(),
+            qty: "0.001".to_owned(),
+            ord_type: "market".to_owned(),
+            price: None,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        // `"` smuggling in symbol must be rejected.
+        let mut bad = base.clone();
+        bad.symbol = "BTC\",\"sz\":\"999".to_owned();
+        assert!(build_okx_order_body(&bad).is_err());
+        // limit without price.
+        let mut bad = base.clone();
+        bad.ord_type = "limit".to_owned();
+        assert!(build_okx_order_body(&bad).is_err());
+        // market WITH price is wrong shape.
+        let mut bad = base.clone();
+        bad.price = Some("50000".to_owned());
+        assert!(build_okx_order_body(&bad).is_err());
+        // Unknown side.
+        let mut bad = base.clone();
+        bad.side = "long".to_owned();
+        assert!(build_okx_order_body(&bad).is_err());
+        // Unsupported ord_type in v0.
+        let mut bad = base.clone();
+        bad.ord_type = "ioc".to_owned();
+        assert!(build_okx_order_body(&bad).is_err());
+        // reduce_only flag flows through.
+        let mut ro = base.clone();
+        ro.reduce_only = true;
+        let body = build_okx_order_body(&ro).unwrap();
+        assert!(body.ends_with(r#","reduceOnly":true}"#));
     }
 
     /// Binance with empty user_query (just timestamp+recvWindow appended).
@@ -1486,9 +2716,9 @@ mod tests {
     /// doesn't, the secp256k1 curve / pubkey serialisation is wrong.
     ///
     /// Cross-checked against eth-account in Python on 2026-05-11:
-    /// >>> from eth_account import Account
-    /// >>> Account.from_key(bytes([1]*32)).address
-    /// '0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1'
+    /// `>>> from eth_account import Account`
+    /// `>>> Account.from_key(bytes([1]*32)).address`
+    /// `'0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1'`
     const TEST_HL_WALLET: &str = "0x1a642f0e3c3af545e7acbd38b07251b3990914f1";
 
     /// keccak256 of empty string: c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
@@ -1510,6 +2740,113 @@ mod tests {
             hex::encode(hash),
             "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"
         );
+    }
+
+    // ─── Attested-signed data (P2): canonical-v1 + sign + ecrecover ───
+
+    #[test]
+    fn canonical_v1_sorts_keys_string_values_jcs() {
+        // keys sorted (funding < oi < symbol), compact, all-string values.
+        let v = serde_json::json!({"symbol": "BTCUSDT", "funding": "0.0001", "oi": "12345"});
+        assert_eq!(
+            canonical_v1(&v).unwrap(),
+            br#"{"funding":"0.0001","oi":"12345","symbol":"BTCUSDT"}"#
+        );
+        // nested objects sorted; array order preserved.
+        let v2 = serde_json::json!({"z": ["b", "a"], "a": {"y": "1", "x": "2"}});
+        assert_eq!(
+            canonical_v1(&v2).unwrap(),
+            br#"{"a":{"x":"2","y":"1"},"z":["b","a"]}"#
+        );
+        // JCS minimal string escaping: quote + backslash.
+        assert_eq!(canonical_v1(&serde_json::json!("a\"b\\c")).unwrap(), br#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn canonical_v1_rejects_json_numbers() {
+        // Floats/ints in the payload are forbidden — the marketplace must carry
+        // numerics as decimal strings (no float canonicalization in signed bytes).
+        assert!(canonical_v1(&serde_json::json!({"x": 1})).is_err());
+        assert!(canonical_v1(&serde_json::json!({"x": 1.5})).is_err());
+        assert!(canonical_v1(&serde_json::json!(["a", 2])).is_err());
+        assert!(canonical_v1(&serde_json::json!(42)).is_err());
+        // string-typed numerics are fine.
+        assert!(canonical_v1(&serde_json::json!({"x": "1.5"})).is_ok());
+    }
+
+    #[test]
+    fn generated_secp256k1_keys_are_valid_and_unique() {
+        // attested-data provisioning keygen: two draws differ, and a generated
+        // key is usable by the pubkey helper + the signing path.
+        let a = generate_secp256k1_private_key();
+        let b = generate_secp256k1_private_key();
+        assert_ne!(&a[..], &b[..], "two generated keys must differ");
+        let (compressed, addr) = attested_data_pubkey(&a).unwrap();
+        assert!(compressed.starts_with("0x") && compressed.len() == 68);
+        assert!(addr.starts_with("0x") && addr.len() == 42);
+        sign_attested_data(&a, &serde_json::json!({"k": "v"})).unwrap();
+    }
+
+    #[test]
+    fn canonical_v1_sorts_non_bmp_keys_by_utf16() {
+        // UTF-16 code-unit order (RFC 8785 §3.2.3): a non-BMP key (😀 = U+1F600,
+        // UTF-16 = high surrogate 0xD83D 0xDE00) sorts AFTER every BMP key whose
+        // first unit is < 0xD83D (here "a"=0x61, "z"=0x7A). A conformant buyer
+        // JCS lib produces the identical ordering, so the signed bytes agree.
+        let v = serde_json::json!({"😀": "emoji", "z": "zed", "a": "ay"});
+        let out = String::from_utf8(canonical_v1(&v).unwrap()).unwrap();
+        assert_eq!(out, r#"{"a":"ay","z":"zed","😀":"emoji"}"#);
+        // The non-BMP key is emitted as raw UTF-8, NOT \u-escaped (JCS minimal).
+        assert!(out.contains('😀'));
+    }
+
+    #[test]
+    fn parse_json_no_dup_keys_rejects_duplicates() {
+        // Duplicate at the top level, nested in an object, and nested in an
+        // array element — all fail closed (a strict buyer JCS parser would too).
+        assert!(parse_json_no_dup_keys(r#"{"a":"1","a":"2"}"#).is_err());
+        assert!(parse_json_no_dup_keys(r#"{"outer":{"b":"1","b":"2"}}"#).is_err());
+        assert!(parse_json_no_dup_keys(r#"[{"k":"1","k":"2"}]"#).is_err());
+        // A clean doc parses and equals the stdlib parse (key order irrelevant).
+        assert_eq!(
+            parse_json_no_dup_keys(r#"{"b":"2","a":"1"}"#).unwrap(),
+            serde_json::json!({"a": "1", "b": "2"})
+        );
+        // The SAME key at different nesting levels is NOT a duplicate.
+        assert!(parse_json_no_dup_keys(r#"{"a":"1","x":{"a":"2"}}"#).is_ok());
+    }
+
+    #[test]
+    fn sign_attested_data_ecrecover_roundtrip() {
+        use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+        let pk = parse_evm_private_key(TEST_HL_PRIVATE_KEY).unwrap();
+        let payload = serde_json::json!({"symbol": "BTCUSDT", "funding": "0.0001", "oi": "12345"});
+        let sig = sign_attested_data(&pk, &payload).unwrap();
+        // Recompute the exact digest a buyer would, then ecrecover.
+        let digest = attested_data_digest_v1(&canonical_v1(&payload).unwrap());
+        let mut rs = [0u8; 64];
+        rs[..32].copy_from_slice(&hex::decode(sig.r.trim_start_matches("0x")).unwrap());
+        rs[32..].copy_from_slice(&hex::decode(sig.s.trim_start_matches("0x")).unwrap());
+        let signature = Signature::from_slice(&rs).unwrap();
+        let recid = RecoveryId::from_byte(sig.v - 27).unwrap();
+        let recovered = VerifyingKey::recover_from_prehash(&digest, &signature, recid).unwrap();
+        let enc = recovered.to_encoded_point(false);
+        let addr = &keccak256(&enc.as_bytes()[1..])[12..];
+        assert_eq!(format!("0x{}", hex::encode(addr)), TEST_HL_WALLET);
+        // The published pubkey helper agrees on the address.
+        let (_compressed, address) = attested_data_pubkey(&pk).unwrap();
+        assert_eq!(address, TEST_HL_WALLET);
+    }
+
+    #[test]
+    fn attested_data_domain_disjoint_from_eip712() {
+        // EIP-712 digests are keccak256(0x19 0x01 ‖ …); our domain preimage
+        // starts with 0x75 ('u') != 0x19 → an attested-data digest can NEVER
+        // equal an EIP-712 order/x402/HL digest (byte-level separation; the
+        // handler also enforces key-level separation via a distinct data key).
+        assert_eq!(ATTESTED_DATA_DOMAIN_V1, b"usenami-attested-data-v1");
+        assert_eq!(ATTESTED_DATA_DOMAIN_V1[0], 0x75);
+        assert_ne!(ATTESTED_DATA_DOMAIN_V1[0], 0x19);
     }
 
     /// EIP-712 domain separator for hyperliquid_main is deterministic and
@@ -1845,6 +3182,29 @@ mod tests {
         assert_eq!(sig.r, "0x348ff44b3c53aac13989f298e0cb66050522a841a51629b027b86aa83fa964f0");
         assert_eq!(sig.s, "0x4e69694254a8e68f47a0d7854370d596aba2c88742cf478cc1e0e34389dbca29");
         assert_eq!(sig.v, 27);
+    }
+
+    /// CR047 tripwire: `msgpack_action` MUST preserve JSON insertion order
+    /// (via the `serde_json` `preserve_order` feature), not sort keys
+    /// alphabetically. Two objects with identical keys/values but different
+    /// insertion order must encode to DIFFERENT msgpack bytes. If someone
+    /// drops `preserve_order`, `serde_json` reverts to a `BTreeMap`, both
+    /// objects collapse to the same alphabetical bytes, and this assert
+    /// fires — catching the HL-signature-breaking regression immediately and
+    /// with a clear message (vs the opaque hex mismatch in the KAT test).
+    #[test]
+    fn msgpack_preserves_insertion_order() {
+        // HL uses `s` before `r` (non-alphabetical); model that here.
+        let insertion = serde_json::json!({ "s": "0.001", "r": false });
+        let alphabetical = serde_json::json!({ "r": false, "s": "0.001" });
+        let mp_insertion = msgpack_action(&insertion).unwrap();
+        let mp_alpha = msgpack_action(&alphabetical).unwrap();
+        assert_ne!(
+            mp_insertion, mp_alpha,
+            "msgpack must preserve insertion order — if these are equal, \
+             serde_json sorted keys alphabetically (preserve_order feature \
+             dropped) and Hyperliquid signatures will silently break"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

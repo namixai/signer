@@ -31,7 +31,30 @@ thiserror = "1"
 # layers that would bloat the EIF and balloon the PCR0 surface.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-rmp-serde = "1.3"  # OK with Rust 1.95 (edition2024 stable since 1.85)
+rmp-serde = "1.3"
+# Phase 0 Active Denial — TOFU policy signing (Ed25519).
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
+# Phase 0 Active Denial — envelope encryption (AES-GCM-256).
+# RustCrypto, audited, no_std-compat. DEK wrapped under KMS, secret
+# encrypted locally with AES-256-GCM inside the enclave.
+# CR046: `zeroize` feature wipes the AES-256 key schedule (expanded round keys
+# derived from the DEK) when the `Aes256Gcm` cipher drops, so secret-derived key
+# material doesn't linger in enclave RAM after each decrypt.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+rand = { version = "0.8", features = ["std_rng"] }
+
+# H5 — signed NSM attestation on /attestation.
+# aws-nitro-enclaves-nsm-api: direct /dev/nsm access for a COSE-signed
+#   Attestation document (AWS Nitro Attestation PKI). Linux-ONLY (ioctl on the
+#   NSM driver) — gated behind `cfg(target_os = "linux")` in the enclave crate,
+#   same as `tokio-vsock`. serde_bytes provides the `ByteBuf` the crate's
+#   `Request::Attestation { nonce, user_data, public_key }` fields take.
+# ciborium: pure-Rust CBOR reader the GATEWAY uses to extract PCR0 from the
+#   COSE_Sign1 payload (parse-only; signature verification is the caller's job).
+aws-nitro-enclaves-nsm-api = "0.4"
+serde_bytes = "0.11"
+ciborium = "0.2"
 
 [profile.release]
 lto = "fat"

@@ -29,13 +29,27 @@ hex.workspace = true
 k256.workspace = true
 tiny-keccak.workspace = true
 rmp-serde.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
+# Phase 0 Active Denial — TOFU policy signing.
+ed25519-dalek.workspace = true
 # Phase 3 will add: aws-nitro-enclaves-nsm-api, reqwest, aws-sigv4, webpki-roots, rsa, cms
+
+[dev-dependencies]
+rand = { version = "0.8", features = ["std_rng"] }
 
 # vsock is Linux-only; gate the dep so darwin / windows hosts can still
 # run `cargo fmt / clippy / test` against the cross-platform parts
 # (signer.rs HMAC tests, handler.rs unit tests, proto.rs serde tests).
+# The NSM driver (aws-nitro-enclaves-nsm-api) is likewise Linux-only — it
+# ioctls /dev/nsm, which exists ONLY inside a running Nitro enclave. Gated the
+# same way; `attestation.rs` carries a non-linux stub so the crate still builds
+# and tests on darwin. serde_bytes supplies the `ByteBuf` the NSM `Request`
+# fields require (only referenced on the linux path).
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock.workspace = true
+aws-nitro-enclaves-nsm-api.workspace = true
+serde_bytes.workspace = true
 
 [[bin]]
 name = "signer-enclave"

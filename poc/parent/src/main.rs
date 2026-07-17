@@ -52,6 +52,19 @@ impl fmt::Debug for AwsCredentials {
     }
 }
 
+/// Registry-refresh parameters — mirrors `enclave::proto::RegistryRefreshParams`.
+/// Produced off-box by `signer-policy-wrap registry sign` (refresh.json). That
+/// file also carries a `content_hash_hex` field which is DELIBERATELY not parsed
+/// here (no `deny_unknown_fields`): it is advisory-only, for the operator's
+/// pre-encrypt `sha256sum` integrity check — the enclave recomputes the hash from
+/// the decrypted plaintext, so it never travels on the wire (review F4).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RegistryRefreshParams {
+    nonce_hex: String,
+    version: u64,
+    signature_hex: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SignRequest {
     action: String,
@@ -71,6 +84,8 @@ struct SignRequest {
     aws_credentials: Option<AwsCredentials>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ciphertext_blob_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registry_refresh: Option<RegistryRefreshParams>,
 }
 
 impl fmt::Debug for SignRequest {
@@ -94,6 +109,8 @@ impl fmt::Debug for SignRequest {
                     .as_ref()
                     .map(|b| format!("[REDACTED {} chars]", b.len())),
             )
+            // nonce/version/signature are public refresh params, not secrets.
+            .field("registry_refresh", &self.registry_refresh)
             .finish()
     }
 }
@@ -103,7 +120,21 @@ struct SignResponse {
     signature_base64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+    /// Attested-data provisioning (Option-1): the sealed data-key envelope +
+    /// pubkey. `Some` only for the `provision-data-key` action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provision: Option<ProvisionDataKeyResponse>,
     error: Option<String>,
+}
+
+/// Mirror of the enclave `proto::ProvisionDataKeyResponse`. `envelope_b64` is the
+/// base64 of the sealed v2 envelope blob; the public key (both forms) is recorded
+/// off-box as `SIGNER_DATA_PUBKEY` / `SIGNER_DATA_ADDRESS`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProvisionDataKeyResponse {
+    envelope_b64: String,
+    pubkey_compressed: String,
+    pubkey_address: String,
 }
 
 #[derive(Parser, Debug)]
@@ -166,6 +197,37 @@ enum Cmd {
         #[arg(long)]
         blob: PathBuf,
     },
+    /// Phase 1.5 registry bootstrap, step 1: ask the enclave for a fresh
+    /// challenge nonce. Print it, then sign off-box with
+    /// `signer-policy-wrap registry sign --nonce <this>`. No AWS creds needed.
+    RegistryChallenge,
+    /// Phase 1.5 registry bootstrap, step 2: deliver the signed registry
+    /// refresh. `--blob` is the base64 KMS-ciphertext of the SIGNED entries
+    /// bytes (the `aws kms encrypt --output text --query CiphertextBlob` text),
+    /// `--refresh` is the refresh.json from `registry sign`. AWS creds from env
+    /// (the enclave KMS-decrypts the blob under the registry context).
+    RegistryRefresh {
+        /// File with the base64 KMS-ciphertext of the registry entries.
+        #[arg(long)]
+        blob: PathBuf,
+        /// refresh.json from `signer-policy-wrap registry sign`.
+        #[arg(long)]
+        refresh: PathBuf,
+    },
+    /// Attested-data provisioning (Option-1), ONE-SHOT: ask the enclave to BIRTH
+    /// the data-signing key, KMS-seal it, and return the sealed envelope + pubkey.
+    /// Requires AWS creds in the env (IMDS) carrying the EPHEMERAL scoped role
+    /// that grants `kms:GenerateDataKey` on the data key under the
+    /// `{customer_id:"attested-data", venue_id:"data-signing"}` context. Writes the
+    /// sealed envelope to `--out` and prints `SIGNER_DATA_PUBKEY` / `..._ADDRESS`.
+    ProvisionDataKey {
+        /// KMS key id/alias to GenerateDataKey under (the signer KMS key).
+        #[arg(long, default_value = "alias/signer-poc")]
+        key_id: String,
+        /// Path to write the sealed envelope blob (the gateway loads this).
+        #[arg(long, default_value = "secrets/attested-data/data-signing.enc")]
+        out: PathBuf,
+    },
 }
 
 fn build_request(cmd: Cmd) -> Result<SignRequest> {
@@ -180,7 +242,21 @@ fn build_request(cmd: Cmd) -> Result<SignRequest> {
             key_id: None,
             aws_credentials: None,
             ciphertext_blob_base64: None,
+            registry_refresh: None,
         }),
+        Cmd::RegistryChallenge => Ok(SignRequest {
+            action: "registry_challenge".to_owned(),
+            method: None,
+            path: None,
+            body: None,
+            timestamp_ms: None,
+            key_blob_s3_key: None,
+            key_id: None,
+            aws_credentials: None,
+            ciphertext_blob_base64: None,
+            registry_refresh: None,
+        }),
+        Cmd::RegistryRefresh { blob, refresh } => build_registry_refresh_request(blob, refresh),
         Cmd::Sign {
             method,
             path,
@@ -217,7 +293,30 @@ fn build_request(cmd: Cmd) -> Result<SignRequest> {
             key_id,
             blob,
         ),
+        Cmd::ProvisionDataKey { key_id, .. } => build_provision_request(key_id),
     }
+}
+
+/// Build a `provision_data_key` request: action + the KMS key id + IMDS creds.
+/// No blob — the key is BORN in the enclave. `main` writes the returned sealed
+/// envelope to `--out` after the round-trip.
+fn build_provision_request(key_id: String) -> Result<SignRequest> {
+    let creds = load_credentials_from_env().context(
+        "AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN missing in env \
+         (need the ephemeral scoped role granting kms:GenerateDataKey)",
+    )?;
+    Ok(SignRequest {
+        action: "provision_data_key".to_owned(),
+        method: None,
+        path: None,
+        body: None,
+        timestamp_ms: None,
+        key_blob_s3_key: None,
+        key_id: Some(key_id),
+        aws_credentials: Some(creds),
+        ciphertext_blob_base64: None,
+        registry_refresh: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -247,6 +346,48 @@ fn build_kucoin_request(
         key_id: Some(key_id),
         aws_credentials: Some(creds),
         ciphertext_blob_base64: Some(ciphertext_b64),
+        registry_refresh: None,
+    })
+}
+
+/// Build a `registry_refresh` request: the base64 KMS-ciphertext of the SIGNED
+/// registry entries (passed THROUGH verbatim — the enclave KMS-decrypts it under
+/// the registry context and hashes the plaintext to match the signature) plus
+/// the refresh params from `registry sign`. AWS creds come from the box env.
+fn build_registry_refresh_request(blob: PathBuf, refresh: PathBuf) -> Result<SignRequest> {
+    let creds = load_credentials_from_env()
+        .context("AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN missing in env")?;
+
+    // The blob file is the base64 ciphertext TEXT from `aws kms encrypt
+    // --output text --query CiphertextBlob` — pass it through verbatim (trimmed),
+    // do NOT re-encode. Validate it's well-formed base64 so a mangled paste
+    // fails here, not as an opaque enclave bad_request.
+    let ciphertext_b64 = std::fs::read_to_string(&blob)
+        .with_context(|| format!("read registry ciphertext blob {}", blob.display()))?
+        .trim()
+        .to_owned();
+    if ciphertext_b64.is_empty() {
+        bail!("registry blob {} is empty", blob.display());
+    }
+    B64.decode(ciphertext_b64.as_bytes())
+        .with_context(|| format!("registry blob {} is not valid base64", blob.display()))?;
+
+    let refresh_bytes = std::fs::read(&refresh)
+        .with_context(|| format!("read refresh params {}", refresh.display()))?;
+    let params: RegistryRefreshParams = serde_json::from_slice(&refresh_bytes)
+        .with_context(|| format!("parse {} as refresh params", refresh.display()))?;
+
+    Ok(SignRequest {
+        action: "registry_refresh".to_owned(),
+        method: None,
+        path: None,
+        body: None,
+        timestamp_ms: None,
+        key_blob_s3_key: None,
+        key_id: None,
+        aws_credentials: Some(creds),
+        ciphertext_blob_base64: Some(ciphertext_b64),
+        registry_refresh: Some(params),
     })
 }
 
@@ -270,16 +411,79 @@ fn load_credentials_from_env() -> Result<AwsCredentials> {
     })
 }
 
+/// Write `bytes` to a NEW file with owner-only perms (0600 on unix). Fails if the
+/// path already exists (atomic no-clobber via `create_new`) so a re-run never
+/// silently overwrites a provisioned data-key blob and orphans its published
+/// pubkey. Gemini security-medium (parent provisioning write).
+fn write_new_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| {
+        format!(
+            "create new {} (already exists? refusing to clobber a provisioned key)",
+            path.display()
+        )
+    })?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Capture the provision out-path before build_request consumes cli.cmd.
+    let provision_out = match &cli.cmd {
+        Cmd::ProvisionDataKey { out, .. } => Some(out.clone()),
+        _ => None,
+    };
     let req = build_request(cli.cmd)?;
 
     let resp = roundtrip(cli.cid, cli.port, &req).await?;
-    println!("{}", serde_json::to_string_pretty(&resp)?);
     if let Some(code) = resp.error.as_deref() {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
         bail!("enclave returned error: {code}");
     }
+
+    // Attested-data provisioning: persist the sealed envelope + surface the
+    // pubkey for the operator to record (SIGNER_DATA_PUBKEY / _ADDRESS).
+    //
+    // FAIL-CLOSED (CodeRabbit Major): a provision command MUST receive a
+    // `provision` payload — never exit 0 having written nothing. If `out` is set
+    // (it WAS a provision call) but the enclave returned no `provision` field,
+    // that's an error, not a silent success.
+    if let Some(out) = provision_out {
+        let prov = resp.provision.as_ref().context(
+            "provision-data-key: enclave returned no `provision` payload — refusing \
+             to exit 0 without a sealed key",
+        )?;
+        let blob = B64
+            .decode(&prov.envelope_b64)
+            .context("decode provision envelope_b64")?;
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        // Atomic no-clobber + owner-only perms (Gemini security-medium): refuse to
+        // overwrite an already-provisioned blob (re-provision would orphan the
+        // published pubkey) and never leave the key-bearing (sealed) blob
+        // world-readable.
+        write_new_private_file(&out, &blob)
+            .with_context(|| format!("write sealed envelope to {}", out.display()))?;
+        println!("attested-data key provisioned:");
+        println!("  sealed envelope -> {}", out.display());
+        println!("  SIGNER_DATA_PUBKEY={}", prov.pubkey_compressed);
+        println!("  SIGNER_DATA_ADDRESS={}", prov.pubkey_address);
+        return Ok(());
+    }
+
+    println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
 
@@ -334,6 +538,45 @@ mod tests {
     }
 
     #[test]
+    fn build_request_registry_challenge_ok() {
+        // Challenge needs no creds and no blob — just asks for a nonce.
+        let req = build_request(Cmd::RegistryChallenge).expect("challenge always succeeds");
+        assert_eq!(req.action, "registry_challenge");
+        assert!(req.aws_credentials.is_none());
+        assert!(req.ciphertext_blob_base64.is_none());
+        assert!(req.registry_refresh.is_none());
+        // Serializes to exactly {"action":"registry_challenge"} (skip_serializing_if).
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"action":"registry_challenge"}"#
+        );
+    }
+
+    #[test]
+    fn registry_refresh_params_roundtrip() {
+        // The shape the parent forwards must match what `registry sign` emits.
+        let json = r#"{"nonce_hex":"ab","version":7,"signature_hex":"cd"}"#;
+        let p: RegistryRefreshParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.version, 7);
+        assert_eq!(p.nonce_hex, "ab");
+        let req = SignRequest {
+            action: "registry_refresh".to_owned(),
+            method: None,
+            path: None,
+            body: None,
+            timestamp_ms: None,
+            key_blob_s3_key: None,
+            key_id: None,
+            aws_credentials: None,
+            ciphertext_blob_base64: Some("Zg==".to_owned()),
+            registry_refresh: Some(p),
+        };
+        // registry_refresh survives serialization (the enclave needs it).
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains(r#""registry_refresh":{"nonce_hex":"ab","version":7"#), "{s}");
+    }
+
+    #[test]
     fn sign_request_round_trip_json_with_blob() {
         // Construct directly (skipping env-driven build_request) so the
         // test doesn't depend on real AWS creds.
@@ -351,6 +594,7 @@ mod tests {
                 session_token: "session".to_owned(),
             }),
             ciphertext_blob_base64: Some(B64.encode(b"fake-ciphertext")),
+            registry_refresh: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let back: SignRequest = serde_json::from_str(&json).expect("deserialize");

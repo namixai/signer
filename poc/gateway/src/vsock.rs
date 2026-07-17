@@ -17,7 +17,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Hard cap on a single framed message. Must match the enclave constant.
 /// Linux-only because darwin/Windows can't run the actual `round_trip` and
@@ -64,9 +64,27 @@ impl fmt::Debug for AwsCredentials {
 /// are present — `key_blob_s3_key` and `key_id` are informational on the
 /// enclave side and we omit them on the wire (they're optional, default to
 /// None on the enclave).
-#[derive(Clone, Serialize)]
+///
+/// C21 (ZLODEY 2026-05-18, Gemini round-1 PR #30): the struct now derives
+/// Zeroize + ZeroizeOnDrop so the in-memory plaintext fields (body, query,
+/// vault_address, ciphertext_blob_base64) are wiped from heap when the
+/// struct drops. AwsCredentials was already ZeroizeOnDrop from earlier
+/// hardening. hl_action carries serde_json::Value which has no Zeroize
+/// impl in the ecosystem — we mark it `#[zeroize(skip)]` and accept the
+/// brief lifecycle leak (documented in proto.rs SECURITY NOTE for the
+/// enclave-side equivalent; same caveat applies here).
+#[derive(Clone, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct VsockRequest {
     pub action: String,
+    /// PR-B (D7): wire-protocol version. Always `1` from this gateway; the
+    /// enclave rejects `< 1` (an old gateway) rather than signing without
+    /// tenant isolation.
+    pub proto_version: u8,
+    /// PR-B (§3): the RAW bearer token, relayed UNCHANGED for the enclave to
+    /// resolve identity itself. The gateway never builds the EncryptionContext.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub opaque_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,38 +97,207 @@ pub struct VsockRequest {
     pub aws_credentials: Option<AwsCredentials>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ciphertext_blob_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_blob_s3_key: Option<String>,
     /// Phase 1 Week 4: query string for Binance/Bybit signing (no leading `?`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    // Phase 1 Stage 2 — EIP-712 (Hyperliquid family) action payload.
+    /// `/sign/binance-request` (keyless generic primitive): the allow-listed op
+    /// name + the EXACT urlencoded payload the enclave HMACs. Mirror of the
+    /// enclave `SignRequest.op` / `.payload`. Public (no key material).
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    // Phase 1 Stage 2 — EIP-712 (Hyperliquid family) action payload.
+    // serde_json::Value does not implement Zeroize; we skip and document
+    // (same caveat as the enclave-side ParsedBlob serde_json::Value note).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
     pub hl_action: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault_address: Option<String>,
+    // x402 / EIP-3009 payment-authorization params (opaque pass-through to the
+    // enclave, which deserializes into its typed `X402Request`). Public payment
+    // fields only — no key material — so `zeroize` is skipped (same caveat as
+    // `hl_action`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub x402: Option<serde_json::Value>,
+
+    /// Structured order params (opaque pass-through; enclave deserializes into
+    /// its typed `OrderRequest`). Public order shape — no key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub order: Option<serde_json::Value>,
+
+    /// Structured cancel params (opaque pass-through; enclave → `CancelRequest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub cancel: Option<serde_json::Value>,
+
+    /// H5 (`action == "attestation"`): hex of the caller nonce bound into the
+    /// NSM document, and optional hex user-data. Public (no key material).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_nonce: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_user_data: Option<String>,
+
+    /// Attested-signed-data (P2): the read-only payload to sign with the
+    /// data-signing key (for `action == "sign_data"`), carried as RAW JSON TEXT
+    /// (mirrors enclave `proto::SignRequest.data: Option<String>`, #210). The
+    /// gateway forwards the bytes VERBATIM — it never parses/re-serializes them —
+    /// so the enclave's dup-key rejection and the buyer's byte-exact canonical
+    /// recompute both see the producer's original bytes. Public market data only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub data: Option<String>,
+
+    /// AF-2: the agent's Ed25519 signature (hex) over the canonical order intent,
+    /// forwarded VERBATIM to the enclave (mirrors `SignRequest.intent_signature`).
+    /// Public authenticator — no key material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub intent_signature: Option<String>,
+
+    /// AF-2: the per-intent replay nonce for cancels (UUID). Orders reuse their
+    /// `client_order_id`; this is `None` for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub intent_nonce: Option<String>,
 }
 
 /// Vsock-side response shape.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// C21 (ZLODEY 2026-05-18, Gemini round-1 PR #30): response carries signed
+/// material (HMAC headers, EIP-712 r,s,v). Although KMS plaintext is not
+/// here, signatures are sensitive in transit on a parent VM that may be
+/// memory-dumped. Derive Zeroize + ZeroizeOnDrop so the struct's strings
+/// are wiped when the response goes out of scope at the gateway.
+///
+/// Gemini PR #30 round-2 HIGH: removed the `Debug` derive. Default derive
+/// would print signature_base64 / headers / signatures verbatim via
+/// `tracing::debug!(?resp, ...)`. Manual Debug below redacts secrets.
+///
+/// Drop is now MANUAL (replaces `ZeroizeOnDrop` derive) so we can also
+/// wipe the BTreeMap header VALUE strings — those are `#[zeroize(skip)]`
+/// because BTreeMap itself has no Zeroize impl, but we walk it manually
+/// in Drop. Gemini PR #30 round-2 MEDIUM L125.
+/// Attested-signed-data response over the vsock — mirrors the enclave's
+/// `proto::AttestedDataResponse`. signature + pubkey are PUBLIC (served to
+/// buyers) but Zeroize with the rest of VsockResponse for uniform hygiene.
+#[derive(Clone, Serialize, Deserialize, Zeroize)]
+pub struct AttestedDataVsock {
+    pub signature: HlSignatureVsock,
+    pub pubkey_compressed: String,
+    pub pubkey_address: String,
+}
+
+#[derive(Clone, Deserialize, Zeroize)]
 pub struct VsockResponse {
     pub signature_base64: String,
     #[serde(default)]
+    #[zeroize(skip)]
     pub headers: Option<BTreeMap<String, String>>,
     /// Phase 1 Stage 2: EIP-712 signature `{r,s,v}` for Hyperliquid family.
     #[serde(default)]
     pub hl_signature: Option<HlSignatureVsock>,
     pub error: Option<String>,
+    /// Path B-lite (Stage 4 pre-flight): hex SHA-256 of decrypted plaintext
+    /// for the `verify_blob` action. `None` for sign actions. Plaintext
+    /// never crosses the vsock — only the hash bytes.
+    #[serde(default)]
+    pub plaintext_sha256: Option<String>,
+    /// Path B-lite: length in bytes of the verified plaintext. Lets the
+    /// operator sanity-check obvious truncation (0 bytes ≠ valid secret).
+    #[serde(default)]
+    pub plaintext_len: Option<u64>,
+
+    /// For `sign_<venue>_order` / `sign_<venue>_cancel`: the venue-canonical
+    /// string the enclave signed (Binance form-urlencoded query without
+    /// `&signature=`, OKX exact JSON body). Forwarded byte-for-byte by the
+    /// gateway. None for header-only sign flows.
+    #[serde(default)]
+    pub canonical_body: Option<String>,
+
+    /// Attested-signed-data (P2): the data signature + the attested data-signing
+    /// pubkey (both wire forms). `Some` only for `action == "sign_data"`.
+    #[serde(default)]
+    pub attested: Option<AttestedDataVsock>,
+
+    /// H5: base64 NSM-signed COSE attestation document. `Some` only for
+    /// `action == "attestation"`. PUBLIC (PCRs + cert chain, no secret).
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub attestation_document_b64: Option<String>,
+}
+
+impl fmt::Debug for VsockResponse {
+    /// Manually-redacted Debug — Gemini PR #30 round-2 HIGH.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VsockResponse")
+            .field(
+                "signature_base64",
+                &format!("[REDACTED {} chars]", self.signature_base64.len()),
+            )
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .as_ref()
+                    .map(|m| format!("[REDACTED {} headers]", m.len())),
+            )
+            .field(
+                "hl_signature",
+                &self.hl_signature.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl Drop for VsockResponse {
+    /// Manual Drop replaces the `ZeroizeOnDrop` derive so we can also wipe
+    /// the BTreeMap header value bytes (the derive can't reach inside a
+    /// `#[zeroize(skip)]` field). Gemini PR #30 round-2.
+    fn drop(&mut self) {
+        // First wipe the BTreeMap value strings manually (HMAC headers
+        // like KuCoin v2 KC-API-KEY / KC-API-PASSPHRASE / KC-API-SIGN).
+        if let Some(map) = self.headers.as_mut() {
+            for v in map.values_mut() {
+                v.zeroize();
+            }
+        }
+        // Then call the derive's zeroize() to wipe everything else.
+        self.zeroize();
+    }
 }
 
 /// `(r, s, v)` triple as it flows over the vsock channel from the enclave.
 /// Kept structurally identical to `crate::proto::HlSignatureWire` so the
 /// gateway can pass-through without re-shaping.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// Zeroize + ZeroizeOnDrop so the r,s strings are wiped when HlSignatureVsock
+/// drops as part of VsockResponse. Gemini round-1 PR #30.
+/// Manually-redacted Debug — Gemini round-2 PR #30, same rationale as
+/// VsockResponse above.
+#[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct HlSignatureVsock {
     pub r: String,
     pub s: String,
     pub v: u8,
+}
+
+impl fmt::Debug for HlSignatureVsock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HlSignatureVsock")
+            .field("r", &"[REDACTED]")
+            .field("s", &"[REDACTED]")
+            .field("v", &self.v)
+            .finish()
+    }
 }
 
 /// Send `req` to the enclave over vsock and read back one response. This is
@@ -134,7 +321,17 @@ pub async fn round_trip(cid: u32, port: u32, req: &VsockRequest) -> Result<Vsock
         .map_err(|_| anyhow!("vsock connect timed out"))?
         .with_context(|| format!("vsock connect to (cid={cid}, port={port})"))?;
 
-    let body = serde_json::to_vec(req).context("serialize vsock request")?;
+    // C21 (ZLODEY 2026-05-18) partial mitigation: wrap the serialized vsock
+    // payload in Zeroizing so the plaintext (which contains AwsCredentials
+    // and HL action JSON) does not linger in heap memory after the send.
+    // This does NOT protect against an attacker reading the vsock socket
+    // mid-flight — full mitigation is the attestation-handshake AEAD
+    // proposed in DESIGN-C21-VSOCK-ENCRYPTION.md, deferred work. This is a
+    // narrow defense-in-depth against post-send memory residue on the
+    // parent VM (e.g., if a swap dump or core dump captures the heap).
+    let body = zeroize::Zeroizing::new(
+        serde_json::to_vec(req).context("serialize vsock request")?,
+    );
     if body.len() > MAX_MESSAGE_BYTES {
         return Err(anyhow!(
             "vsock request body exceeds {} bytes",
@@ -143,7 +340,7 @@ pub async fn round_trip(cid: u32, port: u32, req: &VsockRequest) -> Result<Vsock
     }
     let len = (body.len() as u32).to_be_bytes();
     stream.write_all(&len).await?;
-    stream.write_all(&body).await?;
+    stream.write_all(&body[..]).await?;
     stream.flush().await?;
 
     let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
@@ -152,8 +349,11 @@ pub async fn round_trip(cid: u32, port: u32, req: &VsockRequest) -> Result<Vsock
     if resp_len == 0 || resp_len > MAX_MESSAGE_BYTES {
         return Err(anyhow!("vsock response length {resp_len} out of bounds"));
     }
-    let mut resp_buf = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_buf).await?;
+    // Same Zeroizing wrapper on the response buffer — although the response
+    // does not contain credentials, it does contain signed material (HMAC,
+    // EIP-712 signature) which is sensitive in transit. Cheap defense.
+    let mut resp_buf = zeroize::Zeroizing::new(vec![0u8; resp_len]);
+    stream.read_exact(&mut resp_buf[..]).await?;
     let resp: VsockResponse =
         serde_json::from_slice(&resp_buf).context("deserialize vsock response")?;
     Ok(resp)
@@ -184,12 +384,23 @@ mod tests {
                 session_token: "tok".to_owned(),
             }),
             ciphertext_blob_base64: Some("Zm9v".to_owned()),
+            proto_version: 1,
+            opaque_token: None,
+            key_blob_s3_key: Some("secrets/kucoin.enc".to_owned()),
             query: None,
-            // Phase 1 Stage 2 — EIP-712 fields. HMAC-only test sets
-            // them to None; serde omits via `skip_serializing_if`.
+            op: None,
+            payload: None,
             hl_action: None,
             nonce: None,
             vault_address: None,
+            x402: None,
+            order: None,
+            cancel: None,
+            data: None,
+            intent_signature: None,
+            intent_nonce: None,
+            attestation_nonce: None,
+            attestation_user_data: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         assert!(s.contains("\"action\":\"sign_kucoin\""));
@@ -207,9 +418,10 @@ mod tests {
             "headers": { "KC-API-KEY": "k", "KC-API-SIGN": "s" },
             "error": null
         }"#;
-        let resp: VsockResponse = serde_json::from_str(json).expect("parse");
+        let mut resp: VsockResponse = serde_json::from_str(json).expect("parse");
         assert!(resp.error.is_none());
-        let h = resp.headers.expect("headers");
+        // C21: VsockResponse is ZeroizeOnDrop, can't partial-move. take().
+        let h = resp.headers.take().expect("headers");
         assert_eq!(h.get("KC-API-KEY").map(String::as_str), Some("k"));
     }
 
@@ -219,6 +431,101 @@ mod tests {
         let resp: VsockResponse = serde_json::from_str(json).expect("parse");
         assert_eq!(resp.error.as_deref(), Some("kms_decrypt_denied"));
         assert!(resp.headers.is_none());
+    }
+
+    #[test]
+    fn schema_drift_gateway_to_enclave_round_trip() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct EnclaveSignRequest {
+            action: String,
+            #[serde(default)]
+            method: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            body: Option<String>,
+            #[serde(default)]
+            timestamp_ms: Option<u64>,
+            #[serde(default)]
+            key_blob_s3_key: Option<String>,
+            #[serde(default)]
+            key_id: Option<String>,
+            #[serde(default)]
+            aws_credentials: Option<serde_json::Value>,
+            #[serde(default)]
+            ciphertext_blob_base64: Option<String>,
+            #[serde(default)]
+            proto_version: u8,
+            #[serde(default)]
+            opaque_token: Option<String>,
+            #[serde(default)]
+            query: Option<String>,
+            #[serde(default)]
+            op: Option<String>,
+            #[serde(default)]
+            payload: Option<String>,
+            #[serde(default)]
+            hl_action: Option<serde_json::Value>,
+            #[serde(default)]
+            nonce: Option<u64>,
+            #[serde(default)]
+            vault_address: Option<String>,
+        }
+
+        let req = VsockRequest {
+            action: "sign_binance".to_owned(),
+            method: Some("POST".to_owned()),
+            path: Some("/api/v3/order".to_owned()),
+            body: Some("symbol=BTCUSDT".to_owned()),
+            timestamp_ms: Some(1716000000000),
+            aws_credentials: Some(AwsCredentials {
+                access_key_id: "AKIA_TEST".to_owned(),
+                secret_access_key: "test_secret".to_owned(),
+                session_token: "test_token".to_owned(),
+            }),
+            ciphertext_blob_base64: Some("dGVzdA==".to_owned()),
+            proto_version: 1,
+            opaque_token: Some("tok".to_owned()),
+            key_blob_s3_key: Some("secrets/binance.enc".to_owned()),
+            query: Some("recvWindow=5000".to_owned()),
+            op: Some("account".to_owned()),
+            payload: Some("timestamp=1716000000000".to_owned()),
+            hl_action: None,
+            nonce: Some(42),
+            vault_address: Some("0xdead".to_owned()),
+            x402: None,
+            order: None,
+            cancel: None,
+            data: None,
+            intent_signature: None,
+            intent_nonce: None,
+            attestation_nonce: None,
+            attestation_user_data: None,
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize VsockRequest");
+        let enc: EnclaveSignRequest =
+            serde_json::from_str(&json).expect("deserialize as EnclaveSignRequest");
+
+        assert_eq!(enc.action, "sign_binance");
+        assert_eq!(enc.method.as_deref(), Some("POST"));
+        assert!(enc.aws_credentials.is_some());
+        assert_eq!(enc.ciphertext_blob_base64.as_deref(), Some("dGVzdA=="));
+        // PR-B: the gateway-supplied encryption_context is GONE; instead the
+        // proto_version + opaque_token must survive the round-trip so the
+        // enclave can gate the wire version and resolve identity itself.
+        assert_eq!(enc.proto_version, 1);
+        assert_eq!(enc.opaque_token.as_deref(), Some("tok"));
+        assert_eq!(
+            enc.key_blob_s3_key.as_deref(),
+            Some("secrets/binance.enc"),
+            "key_blob_s3_key must survive round-trip (ZN-207)"
+        );
+        // /sign/binance-request: op + payload must survive the round-trip so the
+        // enclave allow-lists + HMACs the exact client payload.
+        assert_eq!(enc.op.as_deref(), Some("account"));
+        assert_eq!(enc.payload.as_deref(), Some("timestamp=1716000000000"));
     }
 
     /// Manual `Debug` impl on `AwsCredentials` keeps secret + token redacted.

@@ -16,13 +16,27 @@
 // would otherwise look "unused" (because nothing in the binary path calls
 // them outside of `vsock_server`), so we silence dead_code there.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod attestation;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod dek_cache;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod envelope;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod handler;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod kms_client;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proto;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod intent_ledger;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod rate_limiter;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod registry;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod signer;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod tofu;
 #[cfg(target_os = "linux")]
 mod vsock_server;
 
