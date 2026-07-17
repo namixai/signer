@@ -155,6 +155,6 @@ a finding indefinitely because we went quiet:
 
 *A note on our posture: Usenami Signer is built so that you can **verify the core
 trust property yourself** without trusting us — see the verification walkthrough in
-[`DEMO.md`](DEMO.md) and the trust boundaries in
+[`docs/VERIFY-SIGNER-YOURSELF.md`](docs/VERIFY-SIGNER-YOURSELF.md) and the trust boundaries in
 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). We would much rather hear about a
 gap from you than have it stay hidden.*

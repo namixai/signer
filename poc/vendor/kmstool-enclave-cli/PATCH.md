@@ -73,7 +73,7 @@ Apache-2.0.
 
 ## Re-applying on SDK bump
 
-When `AWS_NITRO_SDK_C_REF` in `_signer/poc/enclave/Dockerfile` is bumped:
+When `AWS_NITRO_SDK_C_REF` in `poc/enclave/Dockerfile` is bumped:
 
 1. Pull upstream tree at the new ref locally.
 2. Diff `bin/kmstool-enclave-cli/main.c` between old ref and new ref.
