@@ -11,7 +11,7 @@
 //! handler maps it to the wire `kms_decrypt_denied` / `internal_error` codes.
 //! Plaintext NEVER reaches the log layer — only the redacted struct fields.
 //!
-//! Adversarial-mindset notes (from `_signer/06-АТАКУЕМ-СЕБЯ.md`):
+//! Adversarial-mindset notes (from the internal adversarial-review notes):
 //!   - Credentials are passed via stdin to avoid /proc/<pid>/cmdline exposure.
 //!   - The whole stdout is wrapped in `Zeroizing`; on parse failure we drop it.
 //!   - We never echo stderr back to the caller.

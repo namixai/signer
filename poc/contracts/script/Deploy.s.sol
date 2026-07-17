@@ -12,8 +12,10 @@ import {UsenamiAttestationRegistry} from "../src/UsenamiAttestationRegistry.sol"
 contract Deploy is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
-        // 48-byte production PCR0
-        // Reference: STATUS.md `**Deterministic PCR0:**`
+        // 48-byte PCR0 to register. ALWAYS pass the current value via the
+        // PCR0_HEX env var; the baked default below is only a shape example so
+        // the script compiles/dry-runs without env. (The current reproducible
+        // production PCR0 is documented in the README.)
         bytes memory pcr0 = vm.envOr(
             "PCR0_HEX",
             bytes(

@@ -1357,7 +1357,7 @@ pub fn sign_hyperliquid(
 // request body BEFORE URL-encoding for signing — we expect the canonical
 // param string fully assembled by the caller.
 //
-// See `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md` for the full recon.
+// See the internal Asterdex EIP-712 recon notes for the full recon.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Compute the EIP-712 domain separator for Asterdex v3 signing.
@@ -3285,7 +3285,7 @@ mod tests {
     }
 
     /// Golden-vector cross-check against the official eth_account Python
-    /// reference (see `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`).
+    /// reference (see the internal Asterdex EIP-712 recon notes).
     ///
     /// Inputs:
     ///   private_key = 0x1111...1111 (32 bytes)

@@ -25,7 +25,7 @@
 #   KMS_KEY_ALIAS         — alias/signer-poc (default)
 #   S3_BUCKET             — bucket where the enclave reads blobs from
 #   S3_KEY_PREFIX         — secrets/upl-smoke (default)
-#   POC_DIR               — path to _signer/poc (default: this script's dir/..)
+#   POC_DIR               — path to poc (default: this script's dir/..)
 #
 # Exit codes:
 #   0  — all four scenarios passed

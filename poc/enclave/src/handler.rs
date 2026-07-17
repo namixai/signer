@@ -356,7 +356,7 @@ enum LoadSecretError {
     BadRequest,
     KmsDenied,
     Internal,
-    /// C18 (ZLODEY 2026-05-18): operator-set `SIGNER_REQUIRE_POLICY=1`
+    /// C18 (adversarial review 2026-05-18): operator-set `SIGNER_REQUIRE_POLICY=1`
     /// and the blob is a legacy flat secret. Distinct from PolicyDenied
     /// (that's a runtime UPL rule rejection); this is "your blob shape
     /// is forbidden on this enclave instance".
@@ -373,7 +373,7 @@ enum LoadSecretError {
 /// decrypt and sign as before, but with a warn-log every time so operators
 /// see migration drift.
 ///
-/// C18 mitigation (ZLODEY threat hunt 2026-05-18).
+/// C18 mitigation (adversarial review 2026-05-18).
 ///
 /// Caching (Gemini PR #28 round-2): `std::env::var` acquires a global
 /// process-wide env lock and allocates a String on every call. Per-request
@@ -560,7 +560,7 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<S
         }
     }
 
-    // C27 (ZLODEY 2026-05-18): max_requests_per_minute is accepted in the
+    // C27 (adversarial review 2026-05-18): max_requests_per_minute is accepted in the
     // policy schema but NOT enforced. Fail-loud: reject rather than silently
     // ignoring the customer's rate-limit intent. Remove this guard once
     // stateful rate-limiting is implemented in the enclave.
@@ -568,7 +568,7 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<S
         return Err(SignResponse::err(err_code::UNIMPLEMENTED_POLICY_FIELD));
     }
 
-    // C24 (ZLODEY 2026-05-18): compute SHA-256 of canonical policy JSON.
+    // C24 (adversarial review 2026-05-18): compute SHA-256 of canonical policy JSON.
     // Same canonical form as TOFU signing: strip signer_pubkey and
     // policy_signature, then serde_json::to_vec. Field order follows
     // Rust struct declaration order (preserve_order feature active).
@@ -684,7 +684,7 @@ fn policy_authority_message(customer_id: &str, venue: &str, canonical_policy: &[
 // a tamper) or a legit request could falsely fail. The wire spec is pinned by
 // golden vectors (`af2_intent_golden_*`) and a Rust-reference differential
 // fuzzer; the agent SDK implements the same spec. See
-// `_signer/poc/docs/AF2-INTENT-CANONICAL.md`.
+// the AF-2 intent canonicalization spec.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Domain tag for the agent order-intent signature. Domain-separated from the
@@ -1102,7 +1102,7 @@ fn load_and_parse_blob(
             Ok((Some(policy), SecretJson::new(secret_json)))
         }
         ParsedBlob::Legacy(v) => {
-            // C18 (ZLODEY threat hunt 2026-05-18): a legacy flat-secret blob
+            // C18 (adversarial review 2026-05-18): a legacy flat-secret blob
             // bypasses UPL entirely (no policy → enforce_policy returns Ok).
             // An attacker with `kms:Encrypt` rights (a permission separate
             // from `kms:Decrypt` and NOT gated on PCR0 attestation) can mint
@@ -3238,7 +3238,7 @@ fn handle_provision_data_key(req: SignRequest) -> SignResponse {
 // requests, which requires per-customer state we don't maintain. The SDK
 // owns nonce generation. Enclave just signs the bytes the SDK provides.
 //
-// Reference: `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`
+// Reference: the internal Asterdex EIP-712 recon notes
 
 /// Sanity-check the customer-supplied URL-encoded params string before
 /// signing. Two load-bearing rules enforced here:
@@ -7175,7 +7175,7 @@ mod tests {
         assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
     }
 
-    // ─── C27 (ZLODEY 2026-05-18): max_requests_per_minute fail-loud ──────
+    // ─── C27 (adversarial review 2026-05-18): max_requests_per_minute fail-loud ──────
 
     #[test]
     fn enforce_policy_rejects_max_requests_per_minute() {
@@ -7201,7 +7201,7 @@ mod tests {
         assert!(enforce_policy(Some(&p), &req).is_ok());
     }
 
-    // ─── C24 (ZLODEY 2026-05-18): policy hash in response ────────────────
+    // ─── C24 (adversarial review 2026-05-18): policy hash in response ────────────────
 
     #[test]
     fn enforce_policy_returns_hash_for_policy() {
@@ -7479,7 +7479,7 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // ─── C18 (ZLODEY 2026-05-18): SIGNER_REQUIRE_POLICY flag ─────────────
+    // ─── C18 (adversarial review 2026-05-18): SIGNER_REQUIRE_POLICY flag ─────────────
     //
     // These tests cover the env-var helper directly. The full integration
     // (env=1 + legacy blob in load_and_parse_blob → PolicyRequired) cannot

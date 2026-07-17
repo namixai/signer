@@ -2,13 +2,13 @@
 
 Keyless signing for crypto exchange (CEX) and DEX order/transfer requests inside an **AWS Nitro Enclave**. The exchange API secret (or DEX private key) never leaves the attested enclave — not to the parent EC2 instance, the operator, the OS, or any other process. A client sends an order; the enclave returns only the signed request (auth headers / signature), never the key.
 
-**Status:** production, **multi-tenant, live** (testnet venue keys). Current enclave PCR0 `99fa64fc…` is registered on-chain (Base) as a public trust anchor; the MT cutover to single-allow completed 2026-06-18.
+**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `ff53e1fe…`, **reproducible from this source** (see [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
 
 ## What it does
 - **CEX request signing** — HMAC-SHA256 auth headers (KuCoin/Binance/OKX/Bybit style) and per-venue structured order/cancel signing for Binance + OKX.
 - **DEX / x402 signing** — EIP-712 / ECDSA, and `/sign-x402` for EIP-3009 `TransferWithAuthorization` (agent micropayments).
 - **Multi-tenant** — many customers' keys on one signer, cryptographically isolated per customer (see Registry control-plane).
-- **Verifiable trust** — the key blob only decrypts inside the enclave whose attested measurement (PCR0) the KMS key policy allows, and that PCR0 is published on-chain so anyone can verify it.
+- **Verifiable trust** — the key blob only decrypts inside the enclave whose attested measurement (PCR0) the KMS key policy allows, and that PCR0 is reproducible from this source so anyone can verify it (on-chain publication of the PCR0 is the next step).
 
 > **Policy-enforcement scope (be precise — hardening in progress):** per-asset **size caps** (`order_caps`) are enforced inside the enclave on the **structured Binance/OKX `order`/`cancel` path only**. The generic `/sign`, the `/sign-x402` recipient, and the EIP-712 venues (Hyperliquid, Asterdex) are **action/venue-gated but NOT yet size-capped**. Do not claim or rely on a size cap outside the structured Binance/OKX path until CR050–053 land.
 
@@ -35,7 +35,7 @@ The enclave keeps an **in-memory (RAM-only) registry** mapping each bearer token
 
 ## Trust model
 1. Key blobs are KMS-encrypted; the KMS key policy allows `Decrypt` **only** under a `kms:RecipientAttestation:ImageSha384` condition matching the enclave's PCR0 → only the exact attested code can decrypt.
-2. The PCR0 is registered on-chain (`registerPCR0` on the Base registry contract `0x38b42eED740b0fDeb211bBDf773F2238cAEec240`) → a public, verifiable record of which enclave build is authorized.
+2. The attestation registry contract is live on Base mainnet (`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`) to hold the authorized PCR0 on-chain as a public, verifiable record; registering the current PCR0 (`registerPCR0`) is the next step.
 3. The operator and host are untrusted for key material; they manage the vsock channel and relay creds but cannot extract the key (Nitro isolation + attestation-gated KMS).
 
 ## Venues (6)

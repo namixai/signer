@@ -403,7 +403,7 @@ pub struct SignResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provision: Option<ProvisionDataKeyResponse>,
     pub error: Option<String>,
-    /// C24 (ZLODEY 2026-05-18): SHA-256 of the canonical policy JSON,
+    /// C24 (adversarial review 2026-05-18): SHA-256 of the canonical policy JSON,
     /// hex-encoded. Customers verify the enclave loaded their intended
     /// policy, not a swapped permissive one. `None` for legacy blobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -918,7 +918,7 @@ impl fmt::Debug for HyperliquidSecret {
 /// Asterdex v3 (BNB-chain perp DEX) signing secret.
 ///
 /// Asterdex uses EIP-712 typed-data signing with a `Message(string msg)`
-/// envelope (see `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`). The
+/// envelope (see the internal Asterdex EIP-712 recon notes). The
 /// signing key is a plain secp256k1 PK; the `signer_address` field is
 /// the address derived from that PK, stored explicitly so the enclave
 /// can sanity-check the blob (drift here = wrong PK/address paired).
@@ -1532,7 +1532,7 @@ impl Drop for SecretJson {
 ///
 /// We keep this list short and intentionally vague. Internal stack traces,
 /// AWS error messages, and decrypt failure reasons must NEVER be echoed
-/// back to the caller (per `_signer/06-АТАКУЕМ-СЕБЯ.md`).
+/// back to the caller (per the internal adversarial-review notes).
 pub mod err_code {
     pub const BAD_REQUEST: &str = "bad_request";
     pub const PAYLOAD_TOO_LARGE: &str = "payload_too_large";
@@ -1546,7 +1546,7 @@ pub mod err_code {
     /// fired (adversarial-mindset doc: don't help attackers enumerate the
     /// policy boundary).
     pub const POLICY_DENIED: &str = "policy_denied";
-    /// C18 (ZLODEY threat hunt 2026-05-18): emitted when the enclave is
+    /// C18 (adversarial review 2026-05-18): emitted when the enclave is
     /// running with `SIGNER_REQUIRE_POLICY=1` and the decrypted blob is
     /// a legacy flat secret (no top-level `"policy"` key). Distinct from
     /// `policy_denied` so operators and SDKs can distinguish "your policy
@@ -1559,7 +1559,7 @@ pub mod err_code {
     pub const CONTEXT_REQUIRED: &str = "context_required";
     /// Phase 0 Active Denial: per-venue token-bucket exhausted.
     pub const RATE_LIMITED: &str = "rate_limited";
-    /// C27 (ZLODEY 2026-05-18): policy contains a field the enclave
+    /// C27 (adversarial review 2026-05-18): policy contains a field the enclave
     /// accepts in schema but does not yet enforce. Fail-loud prevents
     /// wire-level deception where the customer believes a constraint
     /// is active but the enclave silently ignores it.

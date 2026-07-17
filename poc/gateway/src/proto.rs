@@ -781,7 +781,7 @@ pub mod err_code {
     pub const KMS_DECRYPT_DENIED: &str = "kms_decrypt_denied";
     pub const INTERNAL_ERROR: &str = "internal_error";
     pub const ENCLAVE_UNREACHABLE: &str = "enclave_unreachable";
-    /// C22 (ZLODEY 2026-05-18): bearer token missing, malformed, or unknown.
+    /// C22 (adversarial review 2026-05-18): bearer token missing, malformed, or unknown.
     /// Returned with HTTP 401. We do not distinguish "missing" vs "wrong"
     /// to avoid an oracle that lets attackers tell whether tokens are
     /// enforced at all.

@@ -71,7 +71,7 @@ const SUPPORTED_EXCHANGES: &[&str] = &[
 /// bodies are well under 1 KiB; 32 KiB is a generous cap.
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 
-/// C30 (ZLODEY 2026-05-18): total per-request timeout at the HTTP layer
+/// C30 (adversarial review 2026-05-18): total per-request timeout at the HTTP layer
 /// (after hyper has parsed headers and dispatched into the tower stack).
 /// Body-phase slow-loris and slow-handler DoS are bounded by this.
 ///
@@ -84,7 +84,7 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024;
 /// proves /sign p99 well under 1s.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// C30.next (ZLODEY 2026-05-18): TCP-level slow-loris hardening.
+/// C30.next (adversarial review 2026-05-18): TCP-level slow-loris hardening.
 ///
 /// `header_read_timeout` bounds how long hyper will wait for the
 /// request headers to fully arrive after the TCP connection is
@@ -191,7 +191,7 @@ async fn main() -> Result<()> {
     .with_data_signing_token(std::env::var("SIGNER_DATA_SIGNING_TOKEN").ok())
     .with_limits(b3_limits);
 
-    // C22 (ZLODEY 2026-05-18): load bearer-token config and apply to /sign.
+    // C22 (adversarial review 2026-05-18): load bearer-token config and apply to /sign.
     // Healthz stays unauthenticated for Cloudflare/AWS liveness probes.
     // When SIGNER_API_TOKENS is unset, AuthState::from_env logs a loud
     // warning and the middleware passes through (backward compat).
@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
         .route("/attestation", get(handlers::get_attestation))
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
 
-    // C30 (ZLODEY 2026-05-18): slow-loris + connection-exhaustion hardening.
+    // C30 (adversarial review 2026-05-18): slow-loris + connection-exhaustion hardening.
     //
     // Stack on /sign (outermost → innermost; axum applies last .layer() first):
     //   1. RequestBodyLimitLayer — 413 for oversized bodies BEFORE acquiring
@@ -362,7 +362,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {}", cli.bind))?;
     info!(local_addr = %listener.local_addr()?, "listener ready");
 
-    // C30.next (ZLODEY 2026-05-18): manual accept loop with a custom
+    // C30.next (adversarial review 2026-05-18): manual accept loop with a custom
     // hyper-util Builder configured with `http1.header_read_timeout`.
     // `axum::serve` uses hyper-util defaults which leave the header-
     // read phase unbounded — a slow-loris attacker who opens a TCP

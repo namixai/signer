@@ -43,7 +43,7 @@
 //! }
 //! ```
 //!
-//! Policy schema (must stay aligned with `_signer/poc/enclave/src/proto.rs`
+//! Policy schema (must stay aligned with `enclave/src/proto.rs`
 //! `pub struct Policy`):
 //!   - allowed_actions:          Option<Vec<String>>
 //!   - allowed_methods:          Option<Vec<String>>
@@ -1104,7 +1104,7 @@ fn sanity_check_policy(
         }
     }
 
-    // ─── C19 (ZLODEY 2026-05-18): EIP-712 method/path skip warning ─────
+    // ─── C19 (adversarial review 2026-05-18): EIP-712 method/path skip warning ─────
     //
     // EIP-712 venues (Hyperliquid, Asterdex) sign typed-data structs, not
     // HTTP requests. They carry no method/path on the wire. The enclave's
@@ -1146,7 +1146,7 @@ fn sanity_check_policy(
         );
     }
 
-    // ─── C27 (ZLODEY 2026-05-18): fail-loud on max_requests_per_minute ──
+    // ─── C27 (adversarial review 2026-05-18): fail-loud on max_requests_per_minute ──
     //
     // Schema field is accepted but the enclave does NOT enforce it
     // (stateful rate-limiting deferred). We reject at wrap time so the
@@ -1237,7 +1237,7 @@ fn sanity_check_policy(
         }
     }
 
-    // ─── C29 (ZLODEY 2026-05-18): cross-venue PK reuse hygiene ─────────
+    // ─── C29 (adversarial review 2026-05-18): cross-venue PK reuse hygiene ─────────
     //
     // EIP-712 secrets carry a `private_key` field (secp256k1 hex). The
     // same private key valid on Hyperliquid is also valid on Asterdex

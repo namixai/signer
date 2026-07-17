@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 4-source PCR0 drift check + KMS-policy structural audit.
 #
-# PCR0 drift compares the PCR0 documented in _signer/STATUS.md against three
+# PCR0 drift compares the PCR0 documented in STATUS.md (see STATUS_MD below) against three
 # independent live sources, with NO SSH dependency (the gateway is now fronted
 # by Cloudflare and direct EC2 :22 is closed from outside):
 #
@@ -57,7 +57,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATUS_MD="$(cd "$SCRIPT_DIR/../../.." && pwd)/_signer/STATUS.md"
+# The markdown file that documents the expected PCR0 (a `**Deterministic PCR0:**`
+# line). Override with STATUS_MD=... to point at your own PCR0 record.
+STATUS_MD="${STATUS_MD:-$(cd "$SCRIPT_DIR/.." && pwd)/STATUS.md}"
 
 # --- Config (env-overridable for testing) ---
 KMS_KEY_ID="${KMS_KEY_ID:-d587cf69-c70a-4bba-be6e-a5270bc4c6db}"
