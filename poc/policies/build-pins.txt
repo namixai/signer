@@ -59,13 +59,13 @@ rust_kmstool_nsm_lib=1.92.0   # built inside kmstool-builder stage
 #   rustup run 1.92.0 cargo generate-lockfile
 #   rustup run 1.92.0 cargo vendor
 #   # Then add .cargo/config.toml with [source.crates-io] replace-with = "vendored-sources"
-#   # and copy whole tree (no .git, no target) to _signer/poc/vendor/nsm-api/
+#   # and copy whole tree (no .git, no target) to poc/vendor/nsm-api/
 #
 # Vendored 2026-05-10:
 nsm_api_upstream_tag_sha=5798fec36f49e1d199c77947f4e51f86b663750f  # annotated-tag SHA (refs/tags/v0.4.0)
 nsm_api_actual_commit_sha=4b851f3006c6fa98f23dcffb2cba03b39de9b8af # commit pointed-to by tag
 nsm_api_upstream_version=0.4.0
-nsm_api_vendored_path=_signer/poc/vendor/nsm-api/
+nsm_api_vendored_path=poc/vendor/nsm-api/
 nsm_api_vendored_crate_count=71
 nsm_api_vendored_size=83M
 nsm_api_lockfile_size=17058 bytes

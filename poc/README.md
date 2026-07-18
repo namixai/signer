@@ -1,121 +1,72 @@
-# Usenami Signer — PoC (Day 2)
+# Usenami Signer
 
-A Nitro Enclave that signs crypto-exchange API requests without ever exposing
-the raw API secret to the parent EC2 instance, the operator, or any other
-process. Day 2 ships the Rust workspace skeleton: vsock plumbing, HMAC-SHA256
-signer, wire protocol, scripts. NSM attestation + KMS Decrypt + S3 fetch
-arrive in **Phase 3** (next pass).
+Keyless signing for crypto exchange (CEX) and DEX order/transfer requests inside an **AWS Nitro Enclave**. The exchange API secret (or DEX private key) never leaves the attested enclave — not to the parent EC2 instance, the operator, the OS, or any other process. A client sends an order; the enclave returns only the signed request (auth headers / signature), never the key.
 
-## Layout
+**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `ff53e1fe…`, **reproducible from this source** (see [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
 
+## What it does
+- **CEX request signing** — HMAC-SHA256 auth headers (KuCoin/Binance/OKX/Bybit style) and per-venue structured order/cancel signing for Binance + OKX.
+- **DEX / x402 signing** — EIP-712 / ECDSA, and `/sign-x402` for EIP-3009 `TransferWithAuthorization` (agent micropayments).
+- **Multi-tenant** — many customers' keys on one signer, cryptographically isolated per customer (see Registry control-plane).
+- **Verifiable trust** — the key blob only decrypts inside the enclave whose attested measurement (PCR0) the KMS key policy allows, and that PCR0 is reproducible from this source so anyone can verify it (on-chain publication of the PCR0 is the next step).
+
+> **Policy-enforcement scope (be precise — hardening in progress):** per-asset **size caps** (`order_caps`) are enforced inside the enclave on the **structured Binance/OKX `order`/`cancel` path only**. The generic `/sign`, the `/sign-x402` recipient, and the EIP-712 venues (Hyperliquid, Asterdex) are **action/venue-gated but NOT yet size-capped**. Do not claim or rely on a size cap outside the structured Binance/OKX path until CR050–053 land.
+
+## Architecture
 ```
-poc/
-├── Cargo.toml              # workspace root, pinned deps
-├── rust-toolchain.toml     # pin Rust 1.83.0 (rustfmt + clippy)
-├── enclave/                # bin: signer-enclave (vsock listener, HMAC)
-│   ├── Cargo.toml
-│   ├── Dockerfile          # multi-stage musl + scratch
-│   └── src/
-│       ├── main.rs
-│       ├── proto.rs        # SignRequest / SignResponse types
-│       ├── signer.rs       # HMAC-SHA256 + RFC 4231 unit tests
-│       ├── handler.rs      # ping / sign dispatcher (stubbed Phase 3)
-│       └── vsock_server.rs # length-prefix framing, per-conn task
-├── parent/                 # bin: signer-client (CLI test driver)
-│   ├── Cargo.toml
-│   └── src/main.rs
-└── scripts/
-    ├── build-eif.sh
-    ├── run-enclave-debug.sh
-    ├── run-enclave-prod.sh
-    ├── start-vsock-proxies.sh
-    └── reproducibility-check.sh
+client ──HTTP(bearer)──▶ Parent EC2 ──vsock──▶ Nitro Enclave
+                         (gateway)            (signer)
 ```
+- **Parent EC2 (`gateway/`)** — HTTP API + bearer-token auth + vsock proxy. Holds NO secrets; forwards sign requests over vsock and relays AWS creds for the enclave's KMS/exchange calls. Routes are split into three tiers:
+  - `sign_router` (gated by `SIGNER_API_TOKENS`, tenant tokens) — all `/sign*`, `/hedge`, `/account/:venue`.
+  - `operator_router` (gated by `SIGNER_OPERATOR_TOKENS`, operator tokens) — `/verify-blob` only. A tenant token cannot reach operator routes and vice-versa (route_layer applied before merge — hard separation).
+  - **public (no bearer)** — `/attestation` (trust-anchor proof) + `/healthz`. Kept OFF the shared `/sign` concurrency pool so an unauthenticated flood can't starve signing; `/attestation` is edge-cached (`Cache-Control: public, max-age=60`).
+- **Nitro Enclave (`enclave/`)** — the signer: resolves the caller's identity via the in-memory registry, KMS-decrypts that customer's venue key blob under attestation, signs, returns only the signature. The key plaintext lives only transiently in enclave RAM.
+- **`parent/`** — `signer-client` CLI (vsock test driver, registry-challenge/refresh).
+- **`policy-cli/`** — off-box tool to author + Ed25519-sign registry refresh envelopes and venue policies.
 
-## Build & test (host workstation, native)
+## Multi-tenant registry (control-plane)
+The enclave keeps an **in-memory (RAM-only) registry** mapping each bearer token → `{customer_id, allowed_venues}`. It is installed via a **signed, KMS-encrypted refresh**:
+- `policy-cli registry sign` builds a 72-byte envelope `nonce(32) ‖ version_le(8) ‖ sha256(entries_json)(32)`, Ed25519-signed by a control-plane key whose **public key is baked into the EIF** (so the enclave only accepts registries signed by that key — fail-closed: bad sig → empty registry → no access).
+- `aws kms encrypt` under context `customer_id=registry-system,venue_id=registry` → `signer-client registry-challenge` (one-shot nonce) → `registry-refresh`.
+- Per-customer key blobs are KMS-encrypted under context `{customer_id, venue}`, so customer A's identity can never decrypt customer B's blob (KMS-enforced isolation), and the per-venue ACL gates which venues each customer may sign for.
+- **RAM-only**: an enclave restart wipes the registry → re-refresh required. (A `--collapse-to` KMS-policy change does NOT restart the enclave, so it does not wipe the registry.)
+- **blob ↔ owner mapping:** the registry maps `token → {customer_id, allowed_venues}` and the vault records `token + customer_id` — but **NEITHER records which real exchange account** a customer's blob holds (the venue API key inside the blob is opaque to the control plane; only the operator who wrapped it knows the real account). Keep the `token → tenant → real-exchange-account` map in the operator's private vault, never in the registry or this repo.
 
+## Trust model
+1. Key blobs are KMS-encrypted; the KMS key policy allows `Decrypt` **only** under a `kms:RecipientAttestation:ImageSha384` condition matching the enclave's PCR0 → only the exact attested code can decrypt.
+2. The attestation registry contract is live on Base mainnet (`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`) to hold the authorized PCR0 on-chain as a public, verifiable record; registering the current PCR0 (`registerPCR0`) is the next step.
+3. The operator and host are untrusted for key material; they manage the vsock channel and relay creds but cannot extract the key (Nitro isolation + attestation-gated KMS).
+
+## Venues (6)
+`binance`, `okx`, `bybit`, `kucoin`, `asterdex`, `hyperliquid_main`. Binance + OKX have dedicated structured order/cancel endpoints; all six are reachable via the generic signing path and per-customer `allowed_venues`.
+
+## HTTP endpoints (gateway)
+| Route | Auth | Purpose |
+|---|---|---|
+| `POST /sign` | tenant | generic CEX auth-header signing |
+| `POST /sign/{binance,okx}-order` / `-cancel` | tenant | per-venue structured trade signing |
+| `POST /sign-x402` | tenant | EIP-3009 TransferWithAuthorization (x402) |
+| `POST /hedge` | tenant | place_hedge |
+| `GET /account/:venue` | tenant | signed read (balances) |
+| `POST /verify-blob` | operator | anti-oracle pre-flight: confirm a blob decrypts under the current PCR0 (returns attestation, never the key) |
+| `GET /attestation` | — (public) | PCR0 + on-chain registration proof; edge-cached, exempt from the `/sign` pool |
+| `GET /healthz` | — (public) | liveness |
+
+## PCR0 lifecycle (enclave rotation / cutover)
+EIF build → capture PCR0 → **KMS dual-allow** `[old, new]` on the venue + registry keys → `registerPCR0(new)` on the Base registry contract → re-verify (`verify-all-blobs`, tenant signs) → 24h soak → **collapse** to single-allow (drops the old PCR0). Pass `REGISTRY_KMS_KEY_ID` as the KMS **key-id**, never an alias. See the operator cutover/rotation runbook.
+
+## Build & test
 ```bash
 cd poc
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo build --workspace --release
+cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all
 ```
+The reproducible enclave image (EIF → PCR0) is built on an EC2 build host (Docker + `nitro-cli`) in a pinned musl container; local native builds only confirm the source compiles + tests pass. Build the enclave image with **`SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`** — the strict/money-path build the public demo runs; its PCR0 reproduces `ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6`. See [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md) to verify the live enclave against it.
 
-The musl static build for the actual enclave image only runs on the EC2
-build host inside `clux/muslrust:1.83.0-stable`. Local native builds are
-just to confirm the source compiles and tests pass.
-
-## Smoke test on EC2 (Day 2 target)
-
-```bash
-# 1. Build the EIF and capture PCR0
-./scripts/build-eif.sh
-
-# 2. Run in debug mode (PCR0 = all-zeros, console attached)
-./scripts/run-enclave-debug.sh
-# (in another terminal) note the EnclaveCID via `nitro-cli describe-enclaves`
-
-# 3. From the parent shell, ping
-cargo build -p signer-client --release
-./target/release/signer-client --cid <ENCLAVE_CID> ping
-# expect: signature_base64 == "pong"
-
-# 4. From the parent shell, sign
-./target/release/signer-client --cid <ENCLAVE_CID> sign
-# expect: signature_base64 == 44-char base64 (HMAC of canonical KuCoin string)
-```
-
-## Wire protocol (length-prefix JSON)
-
-Every message: `[u32 BE length][JSON body]`, hard-capped at 64 KiB.
-
-Request — `ping`:
-```json
-{"action":"ping"}
-```
-Request — `sign`:
-```json
-{
-  "action":"sign",
-  "method":"POST",
-  "path":"/api/v1/orders",
-  "body":"{\"clientOid\":\"abc\"}",
-  "timestamp_ms":1714997000000,
-  "key_blob_s3_key":"secrets/test-kucoin.enc",
-  "key_id":"alias/signer-poc"
-}
-```
-Response:
-```json
-{"signature_base64":"<base64-or-pong>","error":null}
-```
-Error response (signature_base64 is `""`, `error` is one of):
-`bad_request`, `payload_too_large`, `internal_error`, `kms_decrypt_denied`.
-
-## Phase 3 TODO (next pass — NOT in this turn)
-
-- [ ] `enclave/src/nsm.rs` — fetch NSM attestation document via
-      `aws-nitro-enclaves-nsm-api` (the only `unsafe` site, encapsulated
-      by that crate).
-- [ ] `enclave/src/kms_client.rs` — sigv4-signed Decrypt over reqwest +
-      vsock-proxy:8001, attaching the attestation document so the KMS key
-      policy can bind PCR0 -> Decrypt allow.
-- [ ] `enclave/src/s3_client.rs` — sigv4-signed GetObject over
-      vsock-proxy:8002 to fetch the KMS-encrypted secret blob.
-- [ ] Replace the hardcoded `TEST_SECRET` in `handler.rs::load_secret_for`
-      with the KMS-decrypted blob (clearly marked TODO today).
-- [ ] One external known-good HMAC vector test (currently `#[ignore]` —
-      fill the EXPECTED_HEX/EXPECTED_B64 constants from openssl on the
-      EC2 build host).
-- [ ] Reproducibility check: run `./scripts/reproducibility-check.sh`,
-      confirm two clean builds yield the same PCR0.
+## MCP / clients
+- **`@usenami/signer-mcp`** (npm) — drive the signer from Claude Code or any MCP-compatible client (5 tools: list_venues, get_account, place_order, cancel_order, get_attestation).
+- **Model-agnostic** — any agent (Gemini/Grok/custom) or script can call the gateway HTTP API directly with a bearer token.
 
 ## Reference docs
-
-- `_signer/01-АРХИТЕКТУРА.md` — full architecture (parent vs enclave,
-  trust model, attestation flow).
-- `_signer/06-АТАКУЕМ-СЕБЯ.md` — adversarial-mindset doc; the secret
-  hygiene rules (no logs, generic errors, zeroize) come from here.
-- `_hub/WORKER-PROMPTS/SIGNER-POC-DAY-2-BRIEF.md` — Day 2 scope brief
-  this code implements.
+- [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md) — verify the live enclave PCR0 against a reproducible rebuild, trusting no Usenami code.
+- `enclave/src/handler.rs`, `enclave/src/registry.rs`, `gateway/src/main.rs` — the authoritative source.

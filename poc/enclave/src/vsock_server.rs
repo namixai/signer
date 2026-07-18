@@ -36,6 +36,10 @@ pub async fn serve(port: u32) -> Result<()> {
         VsockListener::bind(addr).with_context(|| format!("vsock bind on port {port}"))?;
     info!(port, cid = "ANY", "vsock listener ready");
 
+    // Initialize + log the DEK-cache config at startup (enabled/disabled WARN
+    // fires here at boot, not lazily on the first sign).
+    crate::dek_cache::init_at_startup();
+
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
@@ -102,6 +106,7 @@ async fn handle_connection(mut stream: VsockStream) -> Result<()> {
                     action_label = match req.action.as_str() {
                         "ping" => "ping",
                         "sign" => "sign",
+                        "attestation" => "attestation",
                         _ => "unknown",
                     };
                     let resp = handler::handle(req);
@@ -111,6 +116,7 @@ async fn handle_connection(mut stream: VsockStream) -> Result<()> {
                         Some(err_code::PAYLOAD_TOO_LARGE) => Some(err_code::PAYLOAD_TOO_LARGE),
                         Some(err_code::KMS_DECRYPT_DENIED) => Some(err_code::KMS_DECRYPT_DENIED),
                         Some(err_code::INTERNAL_ERROR) => Some(err_code::INTERNAL_ERROR),
+                        Some(err_code::RATE_LIMITED) => Some(err_code::RATE_LIMITED),
                         Some(_) => Some(err_code::INTERNAL_ERROR),
                         None => None,
                     };

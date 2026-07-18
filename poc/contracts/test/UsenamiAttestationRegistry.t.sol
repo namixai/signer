@@ -14,8 +14,8 @@ contract UsenamiAttestationRegistryTest is Test {
     bytes constant PCR_B = hex"222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222";
     bytes constant PCR_C = hex"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333";
 
-    // Real production PCR0 для reference
-    bytes constant PCR_PROD = hex"7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375";
+    // A production-shaped 48-byte PCR0 used by the register/rotate test.
+    bytes constant PCR_PROD = hex"ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6";
 
     function setUp() public {
         registry = new UsenamiAttestationRegistry();

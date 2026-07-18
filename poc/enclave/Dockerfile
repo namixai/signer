@@ -25,7 +25,7 @@
 #   2. sudo docker rmi signer-enclave:latest
 #   3. ./scripts/build-eif.sh           # capture PCR0 again
 #   4. PCR0 must match byte-for-byte
-# See _hub/RUNBOOKS/signer-poc-rebuild.md for full operator runbook.
+# See the operator rebuild runbook for full instructions.
 
 ###############################################################################
 # Stage 1: build our Rust enclave binary (fully static via musl).
@@ -95,7 +95,15 @@ ARG AWS_C_HTTP_REF=0600662610aa871a11aebe6ed67a11997317cbef
 ARG AWS_C_AUTH_REF=831fa583b83574db29cbae139b42e0d7a1d1ebb8
 ARG JSON_C_REF=13fede6e87d94ea9015b8d2745a235e1b02700e7
 ARG AWS_NITRO_NSM_API_REF=5798fec36f49e1d199c77947f4e51f86b663750f
-ARG AWS_NITRO_SDK_C_REF=4c88098890de1e371820b9e3c6bc535e69493119
+# Bumped 2026-05-27 from v0.4.0 tag (4c88098...) to v0.4.5 (cd61b61...).
+# v0.4.2+ exposes `aws_kms_decrypt_blocking_with_context` SDK API which our
+# vendored kmstool-enclave-cli (see vendor/kmstool-enclave-cli/) wires through
+# to a new `--encryption-context KEY=VALUE` flag. Required for Stage 4 ZN-200
+# rewrap cutover. Upstream's `bin/kmstool-enclave-cli/main.c` was never patched
+# to expose the flag (the upstream `feature/pass-encryption-context-as-cli-args`
+# branch only patches kmstool-instance / kmstool-enclave), so we maintain a
+# minimal vendored fork. See vendor/kmstool-enclave-cli/README.md.
+ARG AWS_NITRO_SDK_C_REF=cd61b6187c8b20867ba4368d1ae62c5790c0269a
 
 # Day 4 (Finding J fix): pin yum packages by exact version-release.
 # Without this, yum resolves package versions from external mutable repos
@@ -188,9 +196,23 @@ RUN cd aws-nitro-enclaves-nsm-api && \
     mv target/release/libnsm.so /usr/lib64/ && \
     mv target/release/nsm.h /usr/include/
 
+# Clone + checkout AWS SDK at the pinned ref.
 RUN git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git && \
-    cd aws-nitro-enclaves-sdk-c && git checkout ${AWS_NITRO_SDK_C_REF} && cd .. && \
-    cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
+    cd aws-nitro-enclaves-sdk-c && git checkout ${AWS_NITRO_SDK_C_REF}
+
+# Overlay our vendored kmstool-enclave-cli source onto the upstream tree
+# BEFORE the cmake build. Upstream's `bin/kmstool-enclave-cli/main.c` has no
+# `--encryption-context` flag at any tagged release; we replace it with the
+# vendored copy that adds the flag and routes to the (already-upstream-shipped)
+# `aws_kms_decrypt_blocking_with_context` SDK API. Single-file overlay keeps
+# the surface minimal — CMakeLists.txt and other files come from upstream.
+# Patch sourced from vendor/kmstool-enclave-cli/main.c; see the README in that
+# directory for upstream provenance and patch rationale.
+COPY vendor/kmstool-enclave-cli/main.c \
+    /tmp/crt-builder/aws-nitro-enclaves-sdk-c/bin/kmstool-enclave-cli/main.c
+
+# Build the SDK (with our patched kmstool-enclave-cli compiled in).
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
         -S aws-nitro-enclaves-sdk-c -B aws-nitro-enclaves-sdk-c/build && \
     cmake3 --build aws-nitro-enclaves-sdk-c/build --parallel "$(nproc)" --target install
 
@@ -207,6 +229,59 @@ FROM public.ecr.aws/amazonlinux/amazonlinux@sha256:c80c6d724a1907d0fdfe1e04f6ddf
 ENV SOURCE_DATE_EPOCH=1714900000
 ENV LC_ALL=C
 ENV TZ=UTC
+
+# Registry trust root (Phase 1.5). The control-plane Ed25519 PUBLIC key —
+# `enclave/src/registry.rs` reads it from this env (`SIGNER_REGISTRY_PUBKEY`) to
+# verify every registry refresh; absent ⇒ NoPubkey ⇒ refresh impossible ⇒ the
+# registry stays empty ⇒ nothing signs (fail-closed). Baking it here makes it
+# PCR0-determining: the registry's trust root is attested, and rotating the key
+# is a deliberate re-attestation event. The matching PRIVATE seed lives OFF-BOX
+# (vault/HSM) and is NEVER in this repo or image. Generated via
+# `signer-policy-wrap registry keygen`.
+ENV SIGNER_REGISTRY_PUBKEY=cd1ede5b3a58181236bfb98ebaf20fda530a39d5f4c14257603c046c6e66009d
+
+# Policy-authority trust root (PR-D1, mainnet floor-gate). The control-plane
+# Ed25519 PUBLIC key that MONEY-venue policies must be signed by when the enclave
+# runs the strict regime (`SIGNER_REQUIRE_POLICY=1`) — see
+# `enclave/src/handler.rs::verify_policy_authority`. It makes the withdrawal-deny
+# / caps floor un-forgeable in the Option-1 partner-import flow (the partner
+# controls the ciphertext but not this baked key). Same STORAGE model as the
+# registry key (PCR0-determining, private half OFF-BOX / vault-only, rotation =
+# re-attestation event) but a SEPARATE, DEDICATED key — never reuse the registry
+# key. Generated 2026-07-03 (key ceremony); the private seed is vault-only
+# (`SIGNER_POLICY_PRIVKEY`, manual signing ceremony, NEVER on-box/cron/auto-
+# refresh). Baking this value is PCR0-determining ⇒ a re-attestation event (ops
+# runbook C1). The gate stays INERT until a box also sets `SIGNER_REQUIRE_POLICY=1`
+# (mainnet profile) — the permissive demo box (REQUIRE_POLICY unset) is unaffected
+# even though it now carries this pubkey. Empty/absent ⇒ money-venue signing is
+# refused under the strict regime (fail-closed).
+ENV SIGNER_POLICY_PUBKEY=96d54fbe908f6b7dbc348843b06c2626be85d86ca631b406d17f62ad262548fd
+
+# Strict-regime enforcement flag (B1, mainnet floor). `enclave/src/handler.rs`
+# reads `SIGNER_REQUIRE_POLICY` via `std::env::var` INSIDE the enclave: when
+# truthy it rejects legacy (non-policy) blobs and requires money-venue policies
+# to carry a valid `policy_authority_sig` against the baked SIGNER_POLICY_PUBKEY
+# above (fail-closed). It is enforced ONLY in the attested enclave — the gateway
+# never reads it.
+#
+# ⚠️  Why this is a build ARG, not a host systemd env: a Nitro Enclave receives
+# its environment SOLELY from the baked EIF image config. `nitro-cli run-enclave`
+# does not forward host env, and the enclave reads no vsock bootstrap config, so
+# a `Environment=SIGNER_REQUIRE_POLICY=1` drop-in on `signer-enclave.service`
+# (the host launcher) can NEVER reach the enclave process — that's the whole
+# point of the attested boundary. This differs from `SIGNER_REQUIRE_AUTH`, which
+# is a *gateway* (host-process) flag and IS set via a systemd drop-in. Enabling
+# strict policy enforcement is therefore a REBUILD event: it bakes into the EIF
+# config ⇒ a distinct, PCR0-determining measurement ⇒ attestation cryptographically
+# proves "this enclave enforces policy". Flipping it also means an additive KMS
+# re-allow for the new PCR0 (keep the prior one as revert-net; zero outage).
+#
+# Default 0 = permissive (identical enforcement behavior to the flag being unset;
+# see parse_require_policy_env: only 1/true/yes/on are truthy). Build the strict
+# (mainnet/B1) EIF with `--build-arg SIGNER_REQUIRE_POLICY=1`
+# (or `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`); the demo EIF stays 0.
+ARG SIGNER_REQUIRE_POLICY=0
+ENV SIGNER_REQUIRE_POLICY=${SIGNER_REQUIRE_POLICY}
 
 # kmstool-enclave-cli + its libs (libnsm.so).
 # All other deps it needs (libc, libssl, libcrypto, libgcc_s, libpthread)

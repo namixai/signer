@@ -12,13 +12,33 @@ base64.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 zeroize.workspace = true
+# H5: parse PCR0 out of the NSM COSE_Sign1 attestation document (parse-only;
+# signature verification against the Nitro root cert is the caller's job).
+ciborium.workspace = true
+# C22 round-2 (Gemini PR #29): constant-time token comparison.
+# sha2 + subtle are already workspace transitives (k256 chain).
+sha2.workspace = true
+subtle.workspace = true
 clap = { version = "=4.5.20", features = ["derive", "env"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 # HTTP server
 axum = "0.7"
-tower-http = { version = "0.6", features = ["trace", "limit"] }
+# C30.next: hyper-util Builder lets us set http1_header_read_timeout
+# (axum::serve uses defaults that don't bound TCP-level slow-loris).
+# `tokio` for the Tokio runtime adapter (TokioIo, TokioTimer). We use
+# the HTTP/1-only `hyper::server::conn::http1::Builder` directly (not
+# the auto Builder) to avoid HTTP/2 prior-knowledge bypass of
+# header_read_timeout (round-2 self-review HIGH-2). `server-auto`
+# feature dropped on Gemini round-1 MED-1: pulls in unnecessary h2 deps.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "timeout"] }
+# C30 (adversarial review 2026-05-18): slow-loris + connection-exhaustion hardening.
+# `limit` for ConcurrencyLimitLayer, `load-shed` so overflow returns 503
+# immediately instead of queueing (which would itself be a DoS vector).
+tower = { version = "0.5", features = ["limit", "load-shed"] }
 
 # Async sync primitives
 parking_lot = "0.12"
