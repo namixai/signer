@@ -1,8 +1,12 @@
 # Continuous integration for the Usenami Signer core (Rust workspace under `poc/`).
 #
-# Scope (honest): this proves *code health* — the workspace builds, clippy is
-# clean, the test suite passes, and the dependency graph carries no known RustSec
-# advisory. It does NOT build the measured enclave image (the EIF) and therefore
+# Scope (honest): this proves *code health* — the workspace builds, clippy passes
+# (strict `-D warnings` on the editable crates; warn-only on the PCR0-frozen
+# enclave crate, whose dead_code cannot be pruned without rebuilding the attested
+# binary), the test suite passes, and no dependency ON THE ATTESTED PATH carries a
+# reachable RustSec advisory (lockfile-only / host-side advisories are triaged and
+# ignored with justification in poc/.cargo/audit.toml). It does NOT build the
+# measured enclave image (the EIF) and therefore
 # does NOT attest PCR0 — that is produced by `nitro-cli build-enclave` against a
 # pinned Docker build, which GitHub-hosted runners cannot reproduce bit-for-bit.
 # Attestation integrity is proven separately by the reproducible-build pins and
@@ -41,8 +45,15 @@ jobs:
         run: rustup show
       - name: Build (locked)
         run: cargo build --workspace --locked
-      - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Clippy is split because the enclave crate is PCR0-frozen (see header).
+      # Strict `-D warnings` on the crates we CAN edit; warn-only on signer-enclave,
+      # whose source cannot be touched to clear dead_code without rebuilding the
+      # attested binary and rotating the published PCR0 (ff53e1fe). Rationale +
+      # the exact frozen items are documented in the OSTIF feedback doc.
+      - name: Clippy — mutable crates (deny warnings)
+        run: cargo clippy --workspace --exclude signer-enclave --all-targets --locked -- -D warnings
+      - name: Clippy — enclave (warn-only, PCR0-frozen source)
+        run: cargo clippy -p signer-enclave --all-targets --locked
       - name: Test
         # --test-threads=1: the auth/config test suite sets and reads process
         # environment variables (SIGNER_REQUIRE_AUTH / ALLOW_NO_AUTH / API_TOKENS)
@@ -61,7 +72,11 @@ jobs:
 
   audit:
     # Dependency-CVE gate. cargo-audit scans poc/Cargo.lock against the RustSec
-    # advisory DB. Installed as a PREBUILT binary (no per-run source compile) via
+    # advisory DB and reads poc/.cargo/audit.toml (project-local config) for the
+    # justified ignore-list. Each ignore is a reachability decision, NOT a bump:
+    # bumping a crate would change the enclave binary and break the published PCR0.
+    # Per-advisory analysis (attested vs host-side vs lockfile-only) is in the OSTIF
+    # feedback doc. Installed as a PREBUILT binary (no per-run source compile) via
     # taiki-e/install-action — the one added action is SHA-pinned and Dependabot-
     # tracked, which is a better trade than compiling cargo-audit on every run.
     runs-on: ubuntu-latest

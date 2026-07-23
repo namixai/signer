@@ -1,0 +1,44 @@
+# cargo-audit configuration — project-local (read by `cargo audit` run from poc/).
+#
+# WHY ignores instead of bumps: the shipped, customer-trusted artifact is the
+# measured enclave (PCR0 `ff53e1fe…`), built from pinned/vendored sources. Bumping
+# any crate changes the enclave binary and therefore the PCR0 — breaking the
+# published attestation. So each advisory below is resolved by a REACHABILITY
+# decision on the attested path, not a version bump. Full per-advisory analysis:
+# _signer/OSTIF-TEE-PROJECT-FEEDBACK (private) §05.
+#
+# "Review-by" note: cargo-audit has NO native per-ignore expiry field (unlike
+# cargo-deny), so the expiry is documented here and enforced by process — every
+# ignore is re-evaluated at the next PCR0 rotation (when the vendored tree is
+# re-synced anyway) and, at the latest, reviewed by 2026-10-23 (90 days).
+
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0185 — quinn-proto: remote memory exhaustion (unbounded out-of-order
+  # stream reassembly). NOT COMPILED into any binary: quinn-proto is a lockfile-only
+  # transitive of reqwest's OFF-by-default http3/quic feature (gateway pins
+  # `reqwest = { default-features = false, features = ["rustls-tls","json"] }`).
+  # `cargo tree -i quinn-proto` resolves to nothing. The enclave has no network
+  # stack at all (vsock only). No reachable code path processes QUIC streams.
+  # Review-by: 2026-10-23 / next PCR0 rotation.
+  "RUSTSEC-2026-0185",
+
+  # RUSTSEC-2025-0134 — rustls-pemfile: unmaintained (not a CVE). Host-side ONLY:
+  # pulled via reqwest → signer-gateway (outbound HTTPS to venues). NOT on the
+  # attested enclave path (`cargo tree -p signer-enclave -i rustls-pemfile` = empty).
+  # The enclave does no TLS/PEM parsing. Review-by: 2026-10-23 / next PCR0 rotation.
+  "RUSTSEC-2025-0134",
+
+  # RUSTSEC-2021-0127 — serde_cbor: unmaintained (not a CVE). ON the attested path
+  # via aws-nitro-enclaves-nsm-api (COSE attestation-doc encoding to /dev/nsm).
+  # Input is the TRUSTED NSM hardware driver, not attacker-controlled data; there is
+  # no untrusted-CBOR parse surface in the enclave. Bumping = changing nsm-api =
+  # new PCR0; will be re-vetted at the next rotation. Review-by: 2026-10-23 / rotation.
+  "RUSTSEC-2021-0127",
+
+  # RUSTSEC-2026-0190 — anyhow: unsoundness in `Error::downcast_mut()`. On the
+  # attested path (enclave depends on anyhow), BUT the unsound API is unreachable:
+  # the enclave never calls `downcast`/`downcast_mut` (grep-verified across
+  # enclave/src). Fix requires an anyhow bump = new PCR0. Review-by: 2026-10-23 / rotation.
+  "RUSTSEC-2026-0190",
+]
