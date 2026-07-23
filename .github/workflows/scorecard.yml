@@ -1,0 +1,49 @@
+# OpenSSF Scorecard — automated self-review of the repository's security posture
+# (branch protection, CI-tests, pinned dependencies, SAST, token permissions, …).
+# Results are uploaded to the code-scanning dashboard and, with publish_results,
+# to the public OpenSSF API so the score is externally verifiable.
+#
+# This satisfies OSTIF best-practices guide §04 ("Do Self Guided Security
+# Reviews → OpenSSF Security Scorecard"). The first run establishes an honest
+# baseline number; we do not claim a score we have not measured.
+name: scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "0 8 * * 1" # weekly, Monday 08:00 UTC
+  push:
+    branches: [main]
+
+# Top-level least privilege; the analysis job elevates only what it needs.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload SARIF to code-scanning
+      id-token: write        # publish_results → OpenSSF API (OIDC)
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run analysis
+        uses: ossf/scorecard-action@ff5dd8929f96a8a4dc67d13f32b8c75057829621 # v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@3b0bd1d116c0bde30213346b22d4f634d96a2fb0 # v3
+        with:
+          sarif_file: results.sarif

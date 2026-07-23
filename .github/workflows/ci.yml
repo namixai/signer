@@ -1,0 +1,75 @@
+# Continuous integration for the Usenami Signer core (Rust workspace under `poc/`).
+#
+# Scope (honest): this proves *code health* — the workspace builds, clippy is
+# clean, the test suite passes, and the dependency graph carries no known RustSec
+# advisory. It does NOT build the measured enclave image (the EIF) and therefore
+# does NOT attest PCR0 — that is produced by `nitro-cli build-enclave` against a
+# pinned Docker build, which GitHub-hosted runners cannot reproduce bit-for-bit.
+# Attestation integrity is proven separately by the reproducible-build pins and
+# the published PCR0 (see docs/VERIFY-SIGNER-YOURSELF.md), not by this workflow.
+#
+# All third-party actions are pinned by full commit SHA (OpenSSF Scorecard
+# "Pinned-Dependencies"); the version tag is kept in a trailing comment and is
+# what Dependabot bumps.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly re-run so a newly-published RustSec advisory turns the audit job red
+    # even with no code change. Monday 07:00 UTC.
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: poc
+
+jobs:
+  build-test-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # rustup is preinstalled on ubuntu runners and honours poc/rust-toolchain.toml
+      # (channel 1.95.0 + clippy/rustfmt components + the musl target). No toolchain
+      # action needed — one fewer third-party dependency to trust.
+      - name: Materialize pinned toolchain
+        run: rustup show
+      - name: Build (locked)
+        run: cargo build --workspace --locked
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        # --test-threads=1: the auth/config test suite sets and reads process
+        # environment variables (SIGNER_REQUIRE_AUTH / ALLOW_NO_AUTH / API_TOKENS)
+        # to prove fail-closed invariants. Those tests serialize env access with a
+        # per-binary mutex, which does NOT protect against cargo's cross-binary
+        # parallel harness — so the suite must run single-threaded to be
+        # deterministic. Verified: clean-env single-threaded = 550 passed / 0 failed.
+        #
+        # This is the honest interim. The idiomatic fix (annotate only the
+        # env-dependent tests with serial_test's `#[serial]` and let the rest run
+        # parallel) is a change to gateway *source* + a new dependency, so it is
+        # tracked as a follow-up for the Signer core lane, not bundled into this
+        # CI-hardening PR. Suite runtime today is ~2s, so serialization is not yet
+        # a practical bottleneck.
+        run: cargo test --workspace --locked -- --test-threads=1
+
+  audit:
+    # Dependency-CVE gate. cargo-audit scans poc/Cargo.lock against the RustSec
+    # advisory DB. Installed as a PREBUILT binary (no per-run source compile) via
+    # taiki-e/install-action — the one added action is SHA-pinned and Dependabot-
+    # tracked, which is a better trade than compiling cargo-audit on every run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit --deny warnings

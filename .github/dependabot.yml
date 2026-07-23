@@ -1,0 +1,41 @@
+# Dependabot — automated dependency-update and security PRs.
+# Satisfies OSTIF best-practices guide §05 ("Up to Date Security → automate
+# updates / dependabot-core").
+#
+# ⚠️ Vendoring caveat (TEE / reproducible-build friction, documented honestly):
+# the *measured* enclave is built from crates VENDORED under `poc/vendor/`
+# (nsm-api and the patched kmstool) so its PCR0 is deterministic. Dependabot
+# reads Cargo.toml / Cargo.lock and cannot see or bump those vendored trees — a
+# cargo bump it proposes does NOT change what the enclave actually compiles until
+# the vendored source is re-synced by hand. So Dependabot here is an *early-warning
+# and github-actions* tool; the vendored crypto/attestation deps are re-vetted
+# manually at each PCR0 rotation, and cargo-audit in ci.yml scans the resolved
+# lockfile for known advisories. This split is called out in the OSTIF feedback.
+version: 2
+updates:
+  # Rust workspace. `directory` points at the manifest root (poc/).
+  - package-ecosystem: cargo
+    directory: /poc
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+      - rust
+
+  # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the SHA and the
+  # trailing version comment together).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - github-actions

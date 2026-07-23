@@ -1,0 +1,70 @@
+# Software Bill of Materials (CycloneDX) for the Signer core.
+# Satisfies OSTIF best-practices guide §06 ("Knowledgebase → Create SBOM").
+#
+# ⚠️ Target matters (TEE friction, verified): the measured enclave compiles for
+# `x86_64-unknown-linux-musl`, and the security-critical deps `tokio-vsock` and
+# `aws-nitro-enclaves-nsm-api` (the attestation path) are gated behind
+# `cfg(target_os = "linux")`. An SBOM generated for the *host* platform silently
+# OMITS them. We therefore generate for the enclave target explicitly, so the
+# SBOM reflects what is actually inside the attested image. Confirmed on the
+# enclave crate: host-target SBOM = 98 components (no nsm-api / no tokio-vsock);
+# enclave musl-target SBOM = 122 components WITH both.
+#
+# What this workflow produces: one CycloneDX 1.5 JSON per workspace crate
+# (`poc/<crate>/signer-<crate>.cdx.json`), for the enclave target. They are
+# uploaded as a build artifact and, on a published release, attached to the
+# release. The committed `sbom.cdx.json` at the repo root is the enclave baseline
+# (refreshed from this workflow's enclave output); this workflow does not rewrite
+# that committed file.
+name: sbom
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Top-level least privilege; the job elevates to contents:write only to attach
+# release assets.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: poc
+
+jobs:
+  cyclonedx:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release upload (release event only)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Materialize pinned toolchain
+        run: rustup show
+      - name: Install cargo-cyclonedx (prebuilt)
+        # PREBUILT binary — no per-run source compile. SHA-pinned + Dependabot-tracked.
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate SBOM (enclave target)
+        # --target x86_64-unknown-linux-musl → includes the linux-only
+        # attestation/vsock deps that are actually in the measured enclave.
+        # Default naming yields distinct files: poc/<crate>/signer-<crate>.cdx.json
+        run: cargo cyclonedx --format json --spec-version 1.5 --target x86_64-unknown-linux-musl
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-cyclonedx
+          path: poc/**/*.cdx.json
+          retention-days: 30
+      - name: Attach SBOM to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            enclave/signer-enclave.cdx.json \
+            gateway/signer-gateway.cdx.json \
+            parent/signer-client.cdx.json \
+            policy-cli/signer-policy-cli.cdx.json \
+            --clobber
