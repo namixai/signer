@@ -897,7 +897,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13acbb8371917fc971be86fc8057c41a64b521c184808a698c02acc242dbf637"
 dependencies = [
  "displaydoc",
- "litemap 0.7.4",
+ "litemap 0.7.5",
  "tinystr 0.7.6",
  "writeable 0.5.5",
  "zerovec 0.10.4",
@@ -1147,9 +1147,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "litemap"
-version = "0.7.4"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ee93343901ab17bd981295f2cf0026d4ad018c7c31ba84549a4ddbb47a45104"
+checksum = "23fb14cb19457329c82206317a5663005a4d404783dc74f4252769b0d5f42856"
 
 [[package]]
 name = "litemap"
@@ -1908,7 +1908,7 @@ dependencies = [
  "icu_properties 1.5.0",
  "icu_provider 1.5.0",
  "idna_adapter",
- "litemap 0.7.4",
+ "litemap 0.8.2",
  "parking_lot",
  "reqwest",
  "serde",
