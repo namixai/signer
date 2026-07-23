@@ -29,7 +29,7 @@
       "components": [
         {
           "type": "application",
-          "bom-ref": "pkg:cargo/signer-enclave@0.1.0",
+          "bom-ref": "pkg:cargo/signer-enclave@0.1.0#src/main.rs",
           "name": "signer-enclave",
           "version": "0.1.0",
           "purl": "pkg:cargo/signer-enclave@0.1.0#src/main.rs"

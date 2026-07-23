@@ -38,6 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false # don't leave the token in .git/config for build steps
       # rustup is preinstalled on ubuntu runners and honours poc/rust-toolchain.toml
       # (channel 1.95.0 + clippy/rustfmt components + the musl target). No toolchain
       # action needed — one fewer third-party dependency to trust.
@@ -82,6 +84,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install cargo-audit (prebuilt)
         uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
         with:

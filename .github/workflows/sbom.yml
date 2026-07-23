@@ -39,6 +39,11 @@ jobs:
       contents: write # gh release upload (release event only)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Isolate the job's contents:write token from SBOM generation — the
+          # release upload below authenticates via GH_TOKEN, not the persisted
+          # git credential, so nothing between here and it needs write scope.
+          persist-credentials: false
       - name: Materialize pinned toolchain
         run: rustup show
       - name: Install cargo-cyclonedx (prebuilt)

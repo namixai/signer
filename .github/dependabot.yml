@@ -25,6 +25,12 @@ updates:
     labels:
       - dependencies
       - rust
+    ignore:
+      # Vendored under poc/vendor/ for deterministic PCR0. A Dependabot bump here
+      # updates Cargo.toml/Cargo.lock but NOT the compiled enclave (the build uses
+      # the vendored tree) → a misleading, no-op-on-the-artifact PR. These crypto/
+      # attestation deps are re-vetted by hand at each PCR0 rotation instead.
+      - dependency-name: "aws-nitro-enclaves-nsm-api"
 
   # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the SHA and the
   # trailing version comment together).
@@ -39,3 +45,8 @@ updates:
     labels:
       - dependencies
       - github-actions
+    # One grouped PR for all action bumps instead of one-per-action (less PR noise).
+    groups:
+      github-actions:
+        patterns:
+          - "*"
