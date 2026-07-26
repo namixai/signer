@@ -75,8 +75,10 @@ jobs:
   audit:
     # Dependency-CVE gate. cargo-audit scans poc/Cargo.lock against the RustSec
     # advisory DB and reads poc/.cargo/audit.toml (project-local config) for the
-    # justified ignore-list. Each ignore is a reachability decision, NOT a bump:
-    # bumping a crate would change the enclave binary and break the published PCR0.
+    # justified ignore-list. Each ignore is a reachability decision. Remediation is
+    # NOT uniform: a bump that TOUCHES THE ATTESTED PATH needs PCR0 analysis (it changes
+    # the measured enclave), whereas a host-side / lockfile-only fix IS applicable as
+    # long as it does not change the measured image.
     # Per-advisory analysis (attested vs host-side vs lockfile-only) is in the OSTIF
     # feedback doc. Installed as a PREBUILT binary (no per-run source compile) via
     # taiki-e/install-action — the one added action is SHA-pinned and Dependabot-
