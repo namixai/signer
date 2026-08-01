@@ -69,7 +69,7 @@ python3 -m venv v && . v/bin/activate && pip install cbor2 cryptography certvali
 # the download, or this doc, blindly.
 curl -sO https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
 unzip -o AWS_NitroEnclaves_Root-G1.zip     # → root.pem
-sha256sum root.pem
+sha256sum root.pem 2>/dev/null || shasum -a 256 root.pem
 ```
 
 This verifier was run against the live demo endpoint as written. Certificate-path
