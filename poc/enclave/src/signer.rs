@@ -1248,6 +1248,28 @@ pub fn generate_secp256k1_private_key() -> Zeroizing<[u8; 32]> {
     }
 }
 
+/// Generate a fresh 32-byte AES-GCM data-encryption key IN-ENCLAVE (ROT-7).
+///
+/// Deliberately NOT `generate_secp256k1_private_key`: that one rejects draws
+/// outside the curve order and retries, which is correct for a scalar and
+/// WRONG for a symmetric key — it would make the DEK non-uniform over the
+/// 2^256 space. The excluded set is negligible in size, but a key that is
+/// "uniform except for a rejection rule borrowed from another primitive" is
+/// the kind of detail that is indefensible in an audit and free to avoid.
+///
+/// Same CSPRNG that births the signing key, so no new trust assumption; the
+/// bytes never leave the enclave except wrapped under KMS.
+/// Returns a fixed array, not a `Vec`: no heap allocation for key material, so
+/// the DEK cannot be left behind by a realloc and `Zeroizing` provably wipes
+/// the one and only copy (Gemini review on #347). Matches the shape of
+/// `generate_secp256k1_private_key` above.
+pub fn generate_dek() -> Zeroizing<[u8; 32]> {
+    use rand::RngCore;
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut bytes[..]);
+    bytes
+}
+
 /// Parse a JSON document while REJECTING duplicate object keys (RFC 8785 §3.1
 /// strictness). `serde_json`'s default `Value` parse silently keeps the LAST of
 /// duplicate keys, so a producer could emit `{"a":"1","a":"2"}` that our enclave
@@ -1357,7 +1379,7 @@ pub fn sign_hyperliquid(
 // request body BEFORE URL-encoding for signing — we expect the canonical
 // param string fully assembled by the caller.
 //
-// See the internal Asterdex EIP-712 recon notes for the full recon.
+// See `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md` for the full recon.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Compute the EIP-712 domain separator for Asterdex v3 signing.
@@ -3285,7 +3307,7 @@ mod tests {
     }
 
     /// Golden-vector cross-check against the official eth_account Python
-    /// reference (see the internal Asterdex EIP-712 recon notes).
+    /// reference (see `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`).
     ///
     /// Inputs:
     ///   private_key = 0x1111...1111 (32 bytes)

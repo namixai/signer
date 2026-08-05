@@ -157,8 +157,11 @@ fn handle_registry_refresh(req: SignRequest) -> SignResponse {
             SignResponse::ok(version.to_string())
         }
         Err(e) => {
+            // ROT-6: the log line keeps the FULL detail (including max_known);
+            // the wire gets the step-level code only. Operator-only path — see
+            // the rationale on `err_code::REGISTRY_*`.
             tracing::warn!(event = "registry_refresh_rejected", error = %e);
-            SignResponse::err(err_code::BAD_REQUEST)
+            SignResponse::err(e.wire_code())
         }
     }
 }
@@ -356,7 +359,7 @@ enum LoadSecretError {
     BadRequest,
     KmsDenied,
     Internal,
-    /// C18 (adversarial review 2026-05-18): operator-set `SIGNER_REQUIRE_POLICY=1`
+    /// C18 (ZLODEY 2026-05-18): operator-set `SIGNER_REQUIRE_POLICY=1`
     /// and the blob is a legacy flat secret. Distinct from PolicyDenied
     /// (that's a runtime UPL rule rejection); this is "your blob shape
     /// is forbidden on this enclave instance".
@@ -373,7 +376,7 @@ enum LoadSecretError {
 /// decrypt and sign as before, but with a warn-log every time so operators
 /// see migration drift.
 ///
-/// C18 mitigation (adversarial review 2026-05-18).
+/// C18 mitigation (ZLODEY threat hunt 2026-05-18).
 ///
 /// Caching (Gemini PR #28 round-2): `std::env::var` acquires a global
 /// process-wide env lock and allocates a String on every call. Per-request
@@ -560,7 +563,7 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<S
         }
     }
 
-    // C27 (adversarial review 2026-05-18): max_requests_per_minute is accepted in the
+    // C27 (ZLODEY 2026-05-18): max_requests_per_minute is accepted in the
     // policy schema but NOT enforced. Fail-loud: reject rather than silently
     // ignoring the customer's rate-limit intent. Remove this guard once
     // stateful rate-limiting is implemented in the enclave.
@@ -568,7 +571,7 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<S
         return Err(SignResponse::err(err_code::UNIMPLEMENTED_POLICY_FIELD));
     }
 
-    // C24 (adversarial review 2026-05-18): compute SHA-256 of canonical policy JSON.
+    // C24 (ZLODEY 2026-05-18): compute SHA-256 of canonical policy JSON.
     // Same canonical form as TOFU signing: strip signer_pubkey and
     // policy_signature, then serde_json::to_vec. Field order follows
     // Rust struct declaration order (preserve_order feature active).
@@ -642,6 +645,67 @@ fn is_money_venue(venue: &str) -> bool {
     )
 }
 
+/// The venues whose orders identify the asset by INTEGER INDEX (`orders[].a`)
+/// rather than by symbol. Their caps therefore live in `hl_order_caps`; the
+/// symbol-keyed `order_caps` is structurally incapable of binding one of their
+/// orders (see the doc comment on `Policy::hl_order_caps`).
+fn is_hl_venue(venue: &str) -> bool {
+    matches!(venue, "hyperliquid_main" | "hyperliquid_testnet")
+}
+
+/// Does this policy carry a cap that can actually BIND an order on `venue`?
+///
+/// The distinction is not cosmetic, and getting it wrong is worse than having
+/// no check at all. The first cut of ROT-3 looked at `order_caps` for every
+/// money venue. For Hyperliquid that is the wrong field in BOTH directions:
+///
+///   * a correctly capped HL key (`hl_order_caps` set, `order_caps` absent)
+///     read as "uncapped" and was refused — a working key broken;
+///   * an HL key carrying a decorative `order_caps` entry for any symbol,
+///     with `hl_order_caps: None`, read as "capped" and loaded — while
+///     `enforce_hl_caps` lets an order of ANY size through when
+///     `hl_order_caps` is absent. The existing test
+///     `cr053_hl_no_policy_or_no_caps_allows_any_size` asserts exactly that
+///     with size 999999.
+///
+/// The second is the one that matters: it produces a FALSE guarantee, and the
+/// guarantee is one we state publicly. Found by Gemini and CodeRabbit
+/// independently on #355; the CTO withheld the cutover over it. It does not
+/// fire today only because HL is hard-denied — and ROT-1 (unblocking HL) is
+/// the very next rotation, so shipping it would have switched HL on top of a
+/// claim that was not true.
+///
+/// EMPTY VECTOR COUNTS AS ABSENT — and the reason is operator error, not
+/// permissiveness. At enforcement an empty list is the STRICTEST outcome, not
+/// the loosest: `caps.iter().find(...)` yields `None` for every symbol and the
+/// order is denied. So `Some(vec![])` is not a hole. It is, however, far more
+/// likely to be a ceremony that meant to fill caps and did not, and catching
+/// that loudly at load is precisely this gate's job.
+fn rot3_binding_cap_present(venue: &str, policy: &Policy) -> bool {
+    fn non_empty<T>(caps: &Option<Vec<T>>) -> bool {
+        matches!(caps, Some(c) if !c.is_empty())
+    }
+    if is_hl_venue(venue) {
+        non_empty(&policy.hl_order_caps)
+    } else {
+        non_empty(&policy.order_caps)
+    }
+}
+
+/// ROT-3 predicate: may this money-venue key sign at all?
+///
+/// Pure and total on purpose — the decision it encodes is a claim we make
+/// publicly ("the enclave enforces the cap"), and a claim that can only be
+/// exercised through a KMS decrypt is a claim nobody can test. Extracted so the
+/// rule is asserted directly, and so weakening it turns a test red instead of
+/// quietly widening what the enclave will sign.
+///
+/// `strict` is `policy_required()` threaded in rather than read here, so the
+/// predicate has no hidden dependency on process-global env state.
+fn rot3_uncapped_money_key_rejected(strict: bool, venue: &str, policy: &Policy) -> bool {
+    strict && is_money_venue(venue) && !rot3_binding_cap_present(venue, policy)
+}
+
 /// Bytes the policy-authority signs: the domain tag, then LENGTH-PREFIXED
 /// `customer_id` and `venue` (so `{cust:"a",venue:"bc"}` cannot collide with
 /// `{cust:"ab",venue:"c"}`), then the canonical policy JSON. Binding the tenant
@@ -684,7 +748,7 @@ fn policy_authority_message(customer_id: &str, venue: &str, canonical_policy: &[
 // a tamper) or a legit request could falsely fail. The wire spec is pinned by
 // golden vectors (`af2_intent_golden_*`) and a Rust-reference differential
 // fuzzer; the agent SDK implements the same spec. See
-// the AF-2 intent canonicalization spec.
+// `_signer/poc/docs/AF2-INTENT-CANONICAL.md`.
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Domain tag for the agent order-intent signature. Domain-separated from the
@@ -1072,6 +1136,40 @@ fn load_and_parse_blob(
             // existing TOFU behavior untouched.
             if policy_required() && is_money_venue(venue) {
                 verify_policy_authority(&policy, &identity.customer_id, venue)?;
+                // ROT-3: an UNCAPPED money key is refused HERE, at load, before a
+                // single signature is produced.
+                //
+                // Why this is not redundant with the ceremony. The ceremony
+                // refuses to ISSUE an uncapped mainnet blob (P1-1), which binds
+                // only what we ourselves mint. The enclave never saw that promise:
+                // hand it any correctly-sealed blob whose policy omits
+                // `order_caps` and, until now, it signed. That is the half of the
+                // claim we could not stand behind — "the enclave enforces the
+                // cap" was true of the issuing side only.
+                //
+                // Why caps specifically. For Binance the HMAC covers the QUERY
+                // STRING alone — not the method, not the path. So a path deny-list
+                // is an input to policy evaluation, never a signed fact: a
+                // compromised gateway can re-point a signed query at another
+                // route. `order_caps` is different — it is checked against the
+                // parsed order the enclave is about to authorise, so it bounds the
+                // damage no matter which path the bytes end up on. Without caps
+                // there is no enforceable bound at all, only an advisory one.
+                //
+                // Deliberately NOT gated on "does this policy allow orders":
+                // `allowed_actions` is subject to the same unsigned-path problem,
+                // so treating a key as read-only because its policy says so would
+                // rebuild the guarantee on the thing that does not hold. Money
+                // venue + strict mode ⇒ caps, no exceptions.
+                if rot3_uncapped_money_key_rejected(true, venue, &policy) {
+                    tracing::error!(
+                        event = "uncapped_money_key_rejected",
+                        venue = %venue,
+                        customer_id = %identity.customer_id,
+                        "SIGNER_REQUIRE_POLICY=1 — money-venue policy without order_caps"
+                    );
+                    return Err(LoadSecretError::PolicyRequired);
+                }
                 return Ok((Some(policy), SecretJson::new(secret_json)));
             }
             if policy.signer_pubkey.is_some() || policy.policy_signature.is_some() {
@@ -1102,7 +1200,7 @@ fn load_and_parse_blob(
             Ok((Some(policy), SecretJson::new(secret_json)))
         }
         ParsedBlob::Legacy(v) => {
-            // C18 (adversarial review 2026-05-18): a legacy flat-secret blob
+            // C18 (ZLODEY threat hunt 2026-05-18): a legacy flat-secret blob
             // bypasses UPL entirely (no policy → enforce_policy returns Ok).
             // An attacker with `kms:Encrypt` rights (a permission separate
             // from `kms:Decrypt` and NOT gated on PCR0 attestation) can mint
@@ -2049,6 +2147,21 @@ fn generic_capped_op_allowed(venue: &str, method: &str, path: &str, query: &str,
         "binance" => match (method, path_only) {
             ("GET", "/fapi/v2/account") => empty,
             ("GET", "/fapi/v1/openOrders") => empty || single_filter("symbol"),
+            // ROT-4: the SPOT twins of the two futures reads above, with the
+            // SAME shapes — `/api/v3/account` takes no filter, `/api/v3/openOrders`
+            // takes at most a single `symbol`. Reads only: spot order placement
+            // and cancellation are deliberately absent here and stay on the
+            // structured, cap-checked path. Adding them to this generic allow-list
+            // would hand a capped key an order route that skips `order_caps`,
+            // which is the exact hole `capped_key_generic_order_blocked` exists
+            // to keep shut.
+            //
+            // Mirrored, not invented: `empty` is what the futures account read
+            // uses and it is correct because the timestamp/signature are appended
+            // AFTER this gate, so a legitimate read really does arrive with an
+            // empty query here.
+            ("GET", "/api/v3/account") => empty,
+            ("GET", "/api/v3/openOrders") => empty || single_filter("symbol"),
             // gate-2: signed read of own filled-trade history (audit). `symbol` is
             // REQUIRED; the rest are read-only filters / pagination. params_subset_of
             // rejects unknown/dup keys + non-token values (no order-field smuggle).
@@ -3120,7 +3233,7 @@ fn handle_sign_data(req: SignRequest, identity: &crate::registry::ResolvedIdenti
     };
     let (pubkey_compressed, pubkey_address) = match crate::signer::attested_data_pubkey(&pk) {
         Ok(p) => p,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return SignResponse::err(err_code::PROVISION_KEY_DERIVATION_FAILED),
     };
     SignResponse::ok_attested_data(crate::proto::AttestedDataResponse {
         signature,
@@ -3171,7 +3284,7 @@ fn handle_provision_data_key(req: SignRequest) -> SignResponse {
     //    a Zeroizing Vec — the only off-enclave copy is then the SEALED ciphertext.
     let mut priv_hex = Zeroizing::new([0u8; 64]);
     if hex::encode_to_slice(pk.as_slice(), &mut priv_hex[..]).is_err() {
-        return SignResponse::err(err_code::INTERNAL_ERROR);
+        return SignResponse::err(err_code::PROVISION_KEY_DERIVATION_FAILED);
     }
     // Capacity MUST exceed the assembled size (≤ ~173 B: 45 prefix + 64 hex + 20
     // mid + 42 address + 2 close) so the `extend_from_slice` calls NEVER
@@ -3185,29 +3298,41 @@ fn handle_provision_data_key(req: SignRequest) -> SignResponse {
     plaintext.extend_from_slice(pubkey_address.as_bytes());
     plaintext.extend_from_slice(br#""}"#);
 
-    // 3. KMS GenerateDataKey under the data-signing context (needs the scoped
-    //    provisioning role; prod decrypt-only role → AccessDenied).
-    let genkey = match crate::kms_client::generate_data_key(creds, key_id, Some(&ctx)) {
-        Ok(g) => g,
+    // 3. Birth the DEK HERE and have KMS only WRAP it, under the data-signing
+    //    context (needs the scoped provisioning role; prod decrypt-only role →
+    //    AccessDenied).
+    //
+    //    ROT-7: this used to call GenerateDataKey, which silently cannot carry
+    //    an EncryptionContext — the Nitro SDK ships no context-aware variant at
+    //    any version, so the context we passed was dropped on the floor and the
+    //    call died in kmstool's argument parser. A DEK wrapped without context
+    //    is unopenable by the read path below, which decrypts WITH it. Using
+    //    the same in-enclave CSPRNG that already births the signing key keeps
+    //    the DEK from ever leaving the enclave at all.
+    let dek = crate::signer::generate_dek();
+    let wrapped = match crate::kms_client::wrap_dek_with_context(creds, key_id, &dek[..], Some(&ctx)) {
+        Ok(w) => w,
         Err(crate::kms_client::GenKeyError::AccessDenied) => {
             return SignResponse::err(err_code::KMS_DECRYPT_DENIED)
         }
         Err(crate::kms_client::GenKeyError::Internal) => {
-            return SignResponse::err(err_code::INTERNAL_ERROR)
+            // ROT-6: distinct from a KMS DENIAL above. This is "the wrap did not
+            // work" — the exact bucket that cost a day when it read
+            // `internal_error`.
+            return SignResponse::err(err_code::PROVISION_WRAP_FAILED)
         }
     };
 
     // 4. AES-GCM-seal under the DEK + sealed AAD → v2 envelope (the prod path
     //    KMS-decrypts wrapped_dek then GCM-decrypts under the identical AAD).
-    let envelope =
-        match crate::envelope::seal_with_dek(&genkey.plaintext, &genkey.wrapped, &plaintext, &aad) {
-            Ok(e) => e,
-            Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
-        };
+    let envelope = match crate::envelope::seal_with_dek(&dek[..], &wrapped, &plaintext, &aad) {
+        Ok(e) => e,
+        Err(_) => return SignResponse::err(err_code::PROVISION_SEAL_FAILED),
+    };
 
     let blob = match serde_json::to_vec(&envelope) {
         Ok(b) => b,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return SignResponse::err(err_code::PROVISION_SEAL_FAILED),
     };
 
     tracing::info!(event = "provision_data_key_ok", address = %pubkey_address);
@@ -3238,7 +3363,7 @@ fn handle_provision_data_key(req: SignRequest) -> SignResponse {
 // requests, which requires per-customer state we don't maintain. The SDK
 // owns nonce generation. Enclave just signs the bytes the SDK provides.
 //
-// Reference: the internal Asterdex EIP-712 recon notes
+// Reference: `_signer/ASTERDEX-EIP712-RECON-2026-05-13.md`
 
 /// Sanity-check the customer-supplied URL-encoded params string before
 /// signing. Two load-bearing rules enforced here:
@@ -5597,6 +5722,237 @@ mod tests {
         );
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // ROT-3 / ROT-4 / ROT-6 — rotation package, 2026-08-02
+    // ══════════════════════════════════════════════════════════════════════
+
+    fn symbol_cap() -> crate::proto::OrderAssetCap {
+        crate::proto::OrderAssetCap {
+            symbol: "BTCUSDT".to_owned(),
+            max_qty: "1".to_owned(),
+            max_notional: None,
+        }
+    }
+    fn index_cap() -> crate::proto::HlOrderCap {
+        crate::proto::HlOrderCap { asset: 0, max_size: "1".to_owned(), max_notional: None }
+    }
+    /// Venue-AWARE, deliberately. The previous helper set only `order_caps` and
+    /// would have kept `rot3_covers_every_money_venue` green through the HL bug
+    /// — a test that passes by inertia is worse than no test (Gemini #355).
+    fn capped_policy(venue: &str) -> Policy {
+        if is_hl_venue(venue) {
+            Policy { hl_order_caps: Some(vec![index_cap()]), ..Policy::default() }
+        } else {
+            Policy { order_caps: Some(vec![symbol_cap()]), ..Policy::default() }
+        }
+    }
+    fn uncapped_policy() -> Policy {
+        Policy { order_caps: None, hl_order_caps: None, ..Policy::default() }
+    }
+    /// The dangerous shape: caps present, but in the field that CANNOT bind an
+    /// order on this venue.
+    fn wrong_field_policy(venue: &str) -> Policy {
+        if is_hl_venue(venue) {
+            Policy { order_caps: Some(vec![symbol_cap()]), hl_order_caps: None, ..Policy::default() }
+        } else {
+            Policy { hl_order_caps: Some(vec![index_cap()]), order_caps: None, ..Policy::default() }
+        }
+    }
+
+    /// ROT-3, the rule itself: strict + money venue + no caps ⇒ refuse.
+    ///
+    /// FALSIFICATION: drop any of the three conjuncts in
+    /// `rot3_uncapped_money_key_rejected` and this goes red — dropping
+    /// `order_caps.is_none()` makes it refuse a CAPPED key (first assert),
+    /// dropping `is_money_venue` makes it refuse a non-money venue (third),
+    /// dropping `strict` makes it refuse in permissive mode (fourth).
+    #[test]
+    fn rot3_uncapped_money_key_is_refused() {
+        assert!(
+            !rot3_uncapped_money_key_rejected(true, "binance", &capped_policy("binance")),
+            "a CAPPED money key must still be allowed"
+        );
+        assert!(
+            rot3_uncapped_money_key_rejected(true, "binance", &uncapped_policy()),
+            "an UNCAPPED money key must be refused — this is the whole point"
+        );
+        assert!(
+            !rot3_uncapped_money_key_rejected(true, "data-signing", &uncapped_policy()),
+            "non-money venues are out of scope; data-signing has no orders to cap"
+        );
+        assert!(
+            !rot3_uncapped_money_key_rejected(false, "binance", &uncapped_policy()),
+            "permissive mode must stay untouched — this rule is strict-mode only"
+        );
+    }
+
+    /// Every money venue, not just the one we happened to test with. A venue
+    /// added to `is_money_venue` later must inherit the rule automatically.
+    #[test]
+    fn rot3_covers_every_money_venue() {
+        for v in [
+            "binance", "binance_futures", "okx", "bybit", "kucoin", "asterdex",
+            "hyperliquid_main", "hyperliquid_testnet",
+        ] {
+            assert!(
+                rot3_uncapped_money_key_rejected(true, v, &uncapped_policy()),
+                "money venue {v} must refuse an uncapped key"
+            );
+            assert!(
+                !rot3_uncapped_money_key_rejected(true, v, &capped_policy(v)),
+                "money venue {v} must still accept a key capped IN ITS OWN FIELD"
+            );
+            assert!(
+                rot3_uncapped_money_key_rejected(true, v, &wrong_field_policy(v)),
+                "money venue {v} must refuse caps written in the field that cannot bind it"
+            );
+        }
+    }
+
+    /// 🔴 THE REGRESSION THIS FIX EXISTS FOR (Gemini + CodeRabbit, #355).
+    ///
+    /// HL orders key the asset by integer index, so `order_caps` (symbol-keyed)
+    /// cannot bind one. Both directions are asserted, and the SECOND is the
+    /// dangerous one — it is a FALSE guarantee, not a broken key.
+    ///
+    /// FALSIFICATION: revert `rot3_binding_cap_present` to reading `order_caps`
+    /// for every venue and both HL asserts go red.
+    #[test]
+    fn rot3_hl_caps_live_in_the_hl_field() {
+        for v in ["hyperliquid_main", "hyperliquid_testnet"] {
+            assert!(
+                !rot3_uncapped_money_key_rejected(true, v, &capped_policy(v)),
+                "{v}: hl_order_caps IS the cap — a correctly capped HL key must load"
+            );
+            assert!(
+                rot3_uncapped_money_key_rejected(true, v, &wrong_field_policy(v)),
+                "{v}: order_caps cannot bind an HL order — accepting it would be a FALSE \
+                 guarantee (enforce_hl_caps lets ANY size through with hl_order_caps: None, \
+                 see cr053_hl_no_policy_or_no_caps_allows_any_size)"
+            );
+        }
+    }
+
+    /// Symmetric: an HMAC venue is not capped by an HL index cap either.
+    #[test]
+    fn rot3_hmac_venues_are_not_capped_by_hl_field() {
+        for v in ["binance", "okx", "bybit", "kucoin", "asterdex"] {
+            assert!(
+                rot3_uncapped_money_key_rejected(true, v, &wrong_field_policy(v)),
+                "{v}: hl_order_caps is index-keyed and cannot bind a symbol venue"
+            );
+            assert!(!rot3_uncapped_money_key_rejected(true, v, &capped_policy(v)));
+        }
+    }
+
+    /// An EMPTY cap vector counts as absent. Not because it is permissive — at
+    /// enforcement it is the strictest outcome (every symbol unlisted ⇒ denied)
+    /// — but because it is far more likely a ceremony that meant to fill caps
+    /// and did not. Catching that at load is this gate's job.
+    ///
+    /// FALSIFICATION: drop `&& !c.is_empty()` from `non_empty` and this goes red.
+    #[test]
+    fn rot3_empty_cap_vector_counts_as_uncapped() {
+        let empty_sym = Policy { order_caps: Some(vec![]), ..Policy::default() };
+        let empty_hl = Policy { hl_order_caps: Some(vec![]), ..Policy::default() };
+        assert!(rot3_uncapped_money_key_rejected(true, "binance", &empty_sym));
+        assert!(rot3_uncapped_money_key_rejected(true, "hyperliquid_main", &empty_hl));
+    }
+
+    /// ROT-4: the two SPOT reads are allowed for a capped key, with the same
+    /// filter shapes as their futures twins.
+    #[test]
+    fn rot4_spot_reads_allowed_for_capped_key() {
+        assert!(generic_capped_op_allowed("binance", "GET", "/api/v3/account", "", ""));
+        assert!(generic_capped_op_allowed("binance", "GET", "/api/v3/openOrders", "", ""));
+        assert!(generic_capped_op_allowed(
+            "binance", "GET", "/api/v3/openOrders", "symbol=BTCUSDT", ""
+        ));
+    }
+
+    /// ROT-4 boundary: reads ONLY. Spot order placement and cancellation must
+    /// NOT ride this generic path — they belong on the structured, cap-checked
+    /// one. FALSIFICATION: add `("POST", "/api/v3/order")` to the match arm and
+    /// this test goes red.
+    #[test]
+    fn rot4_spot_order_and_cancel_stay_denied() {
+        assert!(!generic_capped_op_allowed(
+            "binance", "POST", "/api/v3/order",
+            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=1000", ""
+        ));
+        assert!(!generic_capped_op_allowed("binance", "DELETE", "/api/v3/order", "symbol=BTCUSDT", ""));
+        assert!(!generic_capped_op_allowed("binance", "DELETE", "/api/v3/openOrders", "symbol=BTCUSDT", ""));
+    }
+
+    /// ROT-4 must not reopen the smuggling hole the futures reads already close:
+    /// order fields appended to a spot read query, a body on a GET, and the
+    /// two-query-sources case.
+    #[test]
+    fn rot4_spot_reads_reject_smuggled_order_params() {
+        assert!(!generic_capped_op_allowed(
+            "binance", "GET", "/api/v3/account", "symbol=BTCUSDT&side=BUY&quantity=1", ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "binance", "GET", "/api/v3/openOrders", "symbol=BTCUSDT&side=SELL", ""
+        ));
+        assert!(
+            !generic_capped_op_allowed("binance", "GET", "/api/v3/account", "", "{\"qty\":1}"),
+            "no sanctioned read carries a body"
+        );
+        assert!(
+            !generic_capped_op_allowed("binance", "GET", "/api/v3/openOrders?symbol=A", "symbol=B", ""),
+            "query in two places must never validate"
+        );
+    }
+
+    /// ROT-6: every RegistryError maps to a step-level code, and the four
+    /// buckets are actually distinct. FALSIFICATION: collapse any two arms of
+    /// `wire_code` and the distinctness assert goes red.
+    #[test]
+    fn rot6_registry_errors_map_to_distinct_step_codes() {
+        use crate::proto::err_code;
+        use crate::registry::RegistryError as E;
+        let cases = [
+            (E::NoPendingNonce, err_code::REGISTRY_NONCE_REJECTED),
+            (E::NonceMismatch, err_code::REGISTRY_NONCE_REJECTED),
+            (E::BadNonceHex, err_code::REGISTRY_NONCE_REJECTED),
+            (E::NoPubkey, err_code::REGISTRY_SIGNATURE_REJECTED),
+            (E::BadPubkey, err_code::REGISTRY_SIGNATURE_REJECTED),
+            (E::BadSignature, err_code::REGISTRY_SIGNATURE_REJECTED),
+            (E::SignatureInvalid, err_code::REGISTRY_SIGNATURE_REJECTED),
+            (E::ContentHashMismatch, err_code::REGISTRY_SIGNATURE_REJECTED),
+            (E::MalformedEntries, err_code::REGISTRY_ENTRIES_REJECTED),
+            (E::Empty, err_code::REGISTRY_ENTRIES_REJECTED),
+            (E::UnsafeId, err_code::REGISTRY_ENTRIES_REJECTED),
+            (E::ReservedVenue, err_code::REGISTRY_ENTRIES_REJECTED),
+            (E::NonMonotonicVersion { got: 2, max_known: 103 }, err_code::REGISTRY_VERSION_REJECTED),
+        ];
+        for (err, want) in &cases {
+            assert_eq!(err.wire_code(), *want, "wrong code for {err:?}");
+        }
+        let mut codes: Vec<&str> = cases.iter().map(|(_, c)| *c).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), 4, "the four buckets must stay distinct");
+        // None of them is the old catch-all: that regression is the entire point.
+        assert!(cases.iter().all(|(_, c)| *c != err_code::BAD_REQUEST));
+    }
+
+    /// ROT-6: the version code must NOT leak `max_known`. A rejected refresh
+    /// must not become a read primitive for the installed version.
+    #[test]
+    fn rot6_version_code_leaks_no_value() {
+        use crate::registry::RegistryError as E;
+        let code = E::NonMonotonicVersion { got: 2, max_known: 103 }.wire_code();
+        assert!(!code.contains("103"), "wire code must not carry max_known");
+        assert!(!code.contains('2'), "wire code must not carry the attempted version");
+        assert_eq!(
+            code,
+            E::NonMonotonicVersion { got: 9, max_known: 7 }.wire_code(),
+            "the code must be value-independent"
+        );
+    }
+
     #[test]
     fn cr051_binance_safe_reads_and_cancel_allowed() {
         assert!(generic_capped_op_allowed("binance", "GET", "/fapi/v2/account", "", ""));
@@ -7175,7 +7531,7 @@ mod tests {
         assert_eq!(err.error.as_deref(), Some(err_code::POLICY_DENIED));
     }
 
-    // ─── C27 (adversarial review 2026-05-18): max_requests_per_minute fail-loud ──────
+    // ─── C27 (ZLODEY 2026-05-18): max_requests_per_minute fail-loud ──────
 
     #[test]
     fn enforce_policy_rejects_max_requests_per_minute() {
@@ -7201,7 +7557,7 @@ mod tests {
         assert!(enforce_policy(Some(&p), &req).is_ok());
     }
 
-    // ─── C24 (adversarial review 2026-05-18): policy hash in response ────────────────
+    // ─── C24 (ZLODEY 2026-05-18): policy hash in response ────────────────
 
     #[test]
     fn enforce_policy_returns_hash_for_policy() {
@@ -7479,7 +7835,7 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // ─── C18 (adversarial review 2026-05-18): SIGNER_REQUIRE_POLICY flag ─────────────
+    // ─── C18 (ZLODEY 2026-05-18): SIGNER_REQUIRE_POLICY flag ─────────────
     //
     // These tests cover the env-var helper directly. The full integration
     // (env=1 + legacy blob in load_and_parse_blob → PolicyRequired) cannot

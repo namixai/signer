@@ -193,6 +193,43 @@ pub enum RegistryError {
     ReservedVenue,
 }
 
+impl RegistryError {
+    /// ROT-6 (narrow): map to the wire code the ceremony operator sees.
+    ///
+    /// The mapping lives HERE, on the enum, so adding a variant is a compile
+    /// error until it is classified — the previous shape collapsed everything
+    /// to `bad_request` at the call site, where a new variant would have
+    /// silently joined the pile.
+    ///
+    /// Grouped by STEP, not one-per-variant, and never carrying a value: an
+    /// operator's next action is the same for every member of a group ("your
+    /// nonce is stale — re-issue the challenge", "you signed with the wrong
+    /// key", "your entries file is malformed", "raise the version"), so finer
+    /// codes would grow the surface without shortening a single diagnosis.
+    /// `NonMonotonicVersion` deliberately does NOT export `max_known` — that
+    /// number stays the one fact reconstructed from the operator's own signed
+    /// artefacts, and putting it on the wire would make a rejected refresh a
+    /// read primitive for the installed version.
+    pub fn wire_code(&self) -> &'static str {
+        use crate::proto::err_code;
+        match self {
+            RegistryError::NoPendingNonce
+            | RegistryError::NonceMismatch
+            | RegistryError::BadNonceHex => err_code::REGISTRY_NONCE_REJECTED,
+            RegistryError::NoPubkey
+            | RegistryError::BadPubkey
+            | RegistryError::BadSignature
+            | RegistryError::SignatureInvalid
+            | RegistryError::ContentHashMismatch => err_code::REGISTRY_SIGNATURE_REJECTED,
+            RegistryError::MalformedEntries
+            | RegistryError::Empty
+            | RegistryError::UnsafeId
+            | RegistryError::ReservedVenue => err_code::REGISTRY_ENTRIES_REJECTED,
+            RegistryError::NonMonotonicVersion { .. } => err_code::REGISTRY_VERSION_REJECTED,
+        }
+    }
+}
+
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

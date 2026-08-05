@@ -112,8 +112,14 @@ pub fn decrypt_with_dek(
 /// stored verbatim so the prod path KMS-decrypts it back. A fresh random 12-byte
 /// nonce is drawn per call. Used by attested-data provisioning (Option-1); the
 /// sealed blob is byte-compatible with `parse_envelope` + `decrypt_with_dek`.
+/// `dek` is `&[u8]` rather than `&Zeroizing<Vec<u8>>` so the caller can hand us
+/// a stack array — the provisioning path now generates the DEK as
+/// `Zeroizing<[u8; 32]>` and must not be forced into a heap allocation just to
+/// satisfy this signature (Gemini review on #347). The length check below is
+/// unchanged and is what actually guards the invariant. Only the provisioning
+/// path calls this; the read path uses `decrypt_with_dek`, untouched.
 pub fn seal_with_dek(
-    dek: &Zeroizing<Vec<u8>>,
+    dek: &[u8],
     wrapped_dek: &[u8],
     plaintext: &[u8],
     aad: &[u8],
@@ -121,8 +127,7 @@ pub fn seal_with_dek(
     if dek.len() != DEK_LEN {
         return Err(EnvelopeError::BadDekLength(dek.len()));
     }
-    let cipher =
-        Aes256Gcm::new_from_slice(dek.as_slice()).map_err(|_| EnvelopeError::AesGcmEncrypt)?;
+    let cipher = Aes256Gcm::new_from_slice(dek).map_err(|_| EnvelopeError::AesGcmEncrypt)?;
     let nonce = Aes256Gcm::generate_nonce(OsRng); // 12 bytes from the CSPRNG
     let ciphertext = cipher
         .encrypt(&nonce, Payload { msg: plaintext, aad })
