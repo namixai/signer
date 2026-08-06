@@ -2,7 +2,7 @@
 
 Keyless signing for crypto exchange (CEX) and DEX order/transfer requests inside an **AWS Nitro Enclave**. The exchange API secret (or DEX private key) never leaves the attested enclave — not to the parent EC2 instance, the operator, the OS, or any other process. A client sends an order; the enclave returns only the signed request (auth headers / signature), never the key.
 
-**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `ff53e1fe…`, **reproducible from this source** (see [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
+**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `c16632ed…` (the public demo enclave is a separate image and still measures `ff53e1fe…`), **reproducible from this source** (see [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
 
 ## What it does
 - **CEX request signing** — HMAC-SHA256 auth headers (KuCoin/Binance/OKX/Bybit style) and per-venue structured order/cancel signing for Binance + OKX.

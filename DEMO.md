@@ -277,8 +277,12 @@ true
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-Translation: *PCR0 7c9e8b26… is currently active, registered by
-0x21538eBF…, which is the canonical owner address Usenami publishes.*
+Translation: *the registry reports PCR0 7c9e8b26… as active, registered by
+0x21538eBF…, the canonical owner address Usenami publishes.*
+
+⚠️ "Active **in the registry**" is not "running". As of 2026-08-06 this entry is
+stale: it does not correspond to the enclave now serving. The registry proves who
+registered a value, not that the value is live — for that, read `/attestation`.
 
 If we had replaced the enclave with malicious code after deployment,
 the PCR0 would be different and this call would return `(false,
