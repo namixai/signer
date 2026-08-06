@@ -61,7 +61,7 @@ EIF build → capture PCR0 → **KMS dual-allow** `[old, new]` on the venue + re
 cd poc
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all
 ```
-The reproducible enclave image (EIF → PCR0) is built on an EC2 build host (Docker + `nitro-cli`) in a pinned musl container; local native builds only confirm the source compiles + tests pass. Build the enclave image with **`SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`** — the strict/money-path build the public demo runs; its PCR0 reproduces `ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6`. See [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md) to verify the live enclave against it.
+The reproducible enclave image (EIF → PCR0) is built on an EC2 build host (Docker + `nitro-cli`) in a pinned musl container; local native builds only confirm the source compiles + tests pass. Build the enclave image with **`SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`** — the strict/money-path build the public demo runs; its PCR0 reproduces `c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8`. See [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md) to verify the live enclave against it.
 
 ## MCP / clients
 - **`@usenami/signer-mcp`** (npm) — drive the signer from Claude Code or any MCP-compatible client (5 tools: list_venues, get_account, place_order, cancel_order, get_attestation).

@@ -102,9 +102,15 @@ BASE          = os.environ.get("SIGNER_URL", "https://signer-demo.usenami.io:844
 # The PCR0 we currently publish for the demo enclave (see "Where the expected PCR0
 # comes from", below). To trust NO ONE, override this with your OWN rebuild's PCR0
 # from Part 2 — that is the whole point.
+# NOTE: this default is a PUBLISHED CONSTANT and published constants go stale.
+# It was ff53e1fe… until 2026-08-05 and
+# is now the value below. If your run reports a mismatch, check the live
+# /attestation document BEFORE concluding anything — a stale default here looks
+# identical to a dishonest service, which is precisely the confusion this file
+# exists to prevent. Override with EXPECTED_PCR0=<hex> to pin your own.
 EXPECTED_PCR0 = os.environ.get(
     "EXPECTED_PCR0",
-    "ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6",
+    "c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8",
 ).lower()
 ROOT_PEM      = open("root.pem", "rb").read()
 # The AWS Nitro root hash you PINNED out-of-band (default = the value shown above).

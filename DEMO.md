@@ -232,12 +232,15 @@ verifiable independently of the demo:
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
   (source verified on Basescan)
-- Active PCR0:
+- Registered PCR0 — ⚠️ **STALE, not the running enclave** (measured 2026-08-06:
+  `isPCR0Active` returns true for this value and false for the one actually
+  serving). Treat the on-chain check as **not satisfiable** until a fresh
+  registration lands, and verify against `/attestation` instead:
   `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
 - Canonical owner address:
   `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
 
-**Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required):**
+**Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required)** — ⚠️ **but read what a `true` here means today.** The command below queries the STALE registered value, so it returns `true` and proves only that this value is registered. It says nothing about the enclave now serving. Two stale sources agreeing looks exactly like verification; the check that actually binds is `/attestation` against the AWS Nitro root.
 
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
@@ -308,8 +311,10 @@ succeeds:
 
 ```bash
 nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
-# Compare the output to the PCR0 value from the on-chain registry
-# (Step 4 above): 7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375
+# Compare the output to the LIVE /attestation document, not to a number printed
+# in this file and not to the on-chain registry entry — both can lag the running
+# enclave, and as of 2026-08-06 the registry entry does (see Step 4).
+# Expected for the strict build: c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you
