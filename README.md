@@ -207,14 +207,39 @@ Every signed call returns a **Verifiable Policy Proof** — a Nitro attestation 
 
 ## Reproducible build
 
-The enclave EIF (Enclave Image File) is **deterministically buildable**:
+The enclave EIF (Enclave Image File) is **deterministically buildable** — a clean
+clone of this repository rebuilds the measurement the production endpoint attests to.
 
 ```bash
 cd poc
-./scripts/build-eif.sh   # builds inside Docker with locked deps + timestamps
+SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
+# → PCR0 c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
 ```
 
-Current locked PCR0: see `poc/policies/build-pins.txt`.
+> ### The flag is part of the measurement, not a runtime switch
+>
+> `SIGNER_REQUIRE_POLICY` is **baked into the image**, so it changes PCR0. Omitting
+> it is not "the same build without a setting" — it is a different enclave:
+>
+> | build | PCR0 |
+> |---|---|
+> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `c16632ed…` — **this is production** |
+> | `./scripts/build-eif.sh` (permissive default) | `18b6ece4…` — not deployed anywhere |
+>
+> Both values are measured, not asserted. If your build lands on `18b6ece4…` you
+> have reproduced the permissive image correctly and simply used the wrong command;
+> if it lands on neither, that is the interesting case and we would like to hear
+> about it.
+>
+> This README previously showed the flagless command next to a production PCR0, so
+> anyone following it byte-for-byte got a mismatch and had every reason to conclude
+> the claim was false. Corrected rather than quietly amended.
+
+**The authority is `/attestation`, not this file.** It returns an NSM-signed COSE
+document carrying the measurement the running enclave actually reports, verifiable
+against the AWS Nitro root. A value printed in a README goes stale silently; compare
+your build against the live document, and use the number here only to know what to
+expect.
 
 KMS key policy refuses to release encrypted secrets unless the requesting enclave's PCR0 measurement matches the value pinned in `poc/policies/kms-policy-day3-attestation.json`. **Change one byte of the source code → new PCR0 → KMS denies → all existing customer secrets become unusable until the new measurement is added to the policy.** This is the security boundary.
 
@@ -261,8 +286,12 @@ Requires:
 
 ```bash
 cd poc
-./scripts/build-eif.sh
+SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh   # strict = the production measurement
 ```
+
+The flag is baked into the image and therefore part of PCR0 — see
+[Reproducible build](#reproducible-build) for both measured values and why the
+flagless form is a different enclave rather than the same one unconfigured.
 
 For development without an actual Nitro Enclave (local-only signing), see `poc/enclave/README.md`.
 

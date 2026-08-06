@@ -1,4 +1,41 @@
-# Signer PoC — reproducible build pins
+# Signer PoC — reproducible build pins (DEPENDENCY PINS ONLY)
+#
+###############################################################################
+# THIS FILE IS NOT A SOURCE OF PCR0. READ THIS BEFORE THE REST.
+###############################################################################
+# What it IS: the list of dependency pins — base-image digests, git commit SHAs,
+# toolchain versions, vendored crates, yum packages. That part is current and
+# load-bearing: it is why two clean builds agree at all.
+#
+# What it is NOT, as of 2026-08-06: a record of the CURRENT measurement. The
+# PCR0 values further down are from May 2026 and are RETIRED. So is the
+# conclusion attached to them.
+#
+# Specifically, the "Finding J" section below ends with:
+#
+#     OPERATOR IMPLICATION: each rebuild produces new PCR0.
+#
+# That was true when it was written and is FALSE NOW. It has since been
+# disproved by measurement: a clean clone of the public repository, built with
+#
+#     cd poc && SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
+#
+# reproduces the production measurement
+#
+#     c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
+#
+# byte-for-byte, on a machine that had never built this tree. The May history is
+# kept below deliberately — it is the honest record of how the determinism was
+# won, and deleting it would hide that it took several attempts — but it must
+# not be read as the current state.
+#
+# ⚠️ The measurement also depends on SIGNER_REQUIRE_POLICY, which is BAKED INTO
+# THE IMAGE. The flagless default build is a DIFFERENT enclave and measures
+# 18b6ece4… . See "Reproducible build" in the top-level README.
+#
+# The authority for what is running is /attestation — an NSM-signed COSE
+# document — not this file and not the README.
+###############################################################################
 #
 # Captured: 2026-05-07
 # Purpose: every dependency and base image is pinned to an immutable
@@ -93,7 +130,15 @@ yum_golang=golang-1.25.9-1.amzn2.0.1   # "go" → "golang" via yum's name resolu
 yum_ninja_build=ninja-build-1.7.2-2.amzn2.0.1
 
 ###############################################################################
-# Reproducibility verification protocol
+# Reproducibility verification protocol  —  ⚠️ HISTORICAL (May 2026)
+#
+# Superseded 2026-08-06. The PCR0 values and the "not fully closed" conclusion
+# below describe the state in May and were disproved by a clean-clone rebuild;
+# see the header. Kept as the record of how determinism was reached.
+#
+# The step this protocol is missing is the one that now matters most: it runs
+# `scripts/build-eif.sh` with no flags, which builds the PERMISSIVE image. That
+# is a different measurement from production by construction.
 ###############################################################################
 # 1. From a clean clone, run scripts/build-eif.sh
 # 2. Capture PCR0 from `nitro-cli describe-eif`
@@ -112,5 +157,9 @@ yum_ninja_build=ninja-build-1.7.2-2.amzn2.0.1
 # - Hypothesis: remaining non-determinism in (a) git-cloned + cmake-built C libs (aws-lc, s2n-tls, 7 aws-c-*, json-c, aws-nitro-enclaves-sdk-c) OR (b) nitro-cli EIF format (AWS-side build-time nonce/timestamp).
 # - Phase 2 path: vendor C libs (1 week effort, uncertain) OR pin PCR1+PCR2 instead of PCR0 (less strict, possibly reproducible).
 #
-# OPERATOR IMPLICATION: each rebuild produces new PCR0. Operator must re-lock
-# KMS policy after every rebuild via runbook _hub/RUNBOOKS/signer-poc-rebuild.md.
+# OPERATOR IMPLICATION (MAY 2026, NO LONGER TRUE): each rebuild produces new
+# PCR0, so the operator must re-lock the KMS policy after every rebuild.
+#
+# Superseded: rebuilds are reproducible, and the KMS policy is re-locked on a
+# deliberate ROTATION, not on every build. (The operator runbook referenced here
+# lives in the private tree and is not part of this repository.)

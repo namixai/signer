@@ -2,7 +2,7 @@
 
 Keyless signing for crypto exchange (CEX) and DEX order/transfer requests inside an **AWS Nitro Enclave**. The exchange API secret (or DEX private key) never leaves the attested enclave — not to the parent EC2 instance, the operator, the OS, or any other process. A client sends an order; the enclave returns only the signed request (auth headers / signature), never the key.
 
-**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `ff53e1fe…`, **reproducible from this source** (see [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
+**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `c16632ed…` (the public demo enclave is a separate image and still measures `ff53e1fe…`), **reproducible from this source** (see [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
 
 ## What it does
 - **CEX request signing** — HMAC-SHA256 auth headers (KuCoin/Binance/OKX/Bybit style) and per-venue structured order/cancel signing for Binance + OKX.
@@ -61,7 +61,7 @@ EIF build → capture PCR0 → **KMS dual-allow** `[old, new]` on the venue + re
 cd poc
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --all
 ```
-The reproducible enclave image (EIF → PCR0) is built on an EC2 build host (Docker + `nitro-cli`) in a pinned musl container; local native builds only confirm the source compiles + tests pass. Build the enclave image with **`SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`** — the strict/money-path build the public demo runs; its PCR0 reproduces `ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6`. See [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md) to verify the live enclave against it.
+The reproducible enclave image (EIF → PCR0) is built on an EC2 build host (Docker + `nitro-cli`) in a pinned musl container; local native builds only confirm the source compiles + tests pass. Build the enclave image with **`SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`** — the strict/money-path build the **mainnet/production** enclave runs; its PCR0 reproduces `c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8`. The **public demo** endpoint is a separate image and measures `ff53e1fe…`. See [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md) to verify the live enclave against it.
 
 ## MCP / clients
 - **`@usenami/signer-mcp`** (npm) — drive the signer from Claude Code or any MCP-compatible client (5 tools: list_venues, get_account, place_order, cancel_order, get_attestation).

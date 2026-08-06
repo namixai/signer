@@ -98,20 +98,26 @@ def check(cond, msg):
     if not cond:
         raise SystemExit(f"ATTESTATION VERIFY FAILED: {msg}")
 
-BASE          = os.environ.get("SIGNER_URL", "https://signer-demo.usenami.io:8443")
-# The PCR0 we currently publish for the demo enclave (see "Where the expected PCR0
-# comes from", below). To trust NO ONE, override this with your OWN rebuild's PCR0
-# from Part 2 — that is the whole point.
+# 🔴 THIS DEFAULT IS PAIRED WITH THE DEFAULT `SIGNER_URL` ABOVE. Change one and you
+# MUST change the other. They describe two different enclaves:
+#
+#   SIGNER_URL=https://signer-demo.usenami.io:8443  ->  ff53e1fe…  (the DEMO enclave;
+#                                                        both defaults here)
+#   the mainnet/production enclave                  ->  c16632ed…  (override BOTH)
+#
+# The two were never linked, which is why this file could drift: a reader who
+# repointed the URL kept an expectation belonging to the other enclave and got a
+# mismatch that looks exactly like a dishonest service. If yours mismatches,
+# check WHICH enclave you queried before concluding anything, and confirm against
+# the live /attestation document rather than against this constant.
+#
+# `.strip()` before `.lower()`: a value pasted from a terminal or a CI variable
+# routinely carries a trailing newline, and an invisible character is the worst
+# possible reason for a verification to fail.
 EXPECTED_PCR0 = os.environ.get(
     "EXPECTED_PCR0",
     "ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6",
-).lower()
-ROOT_PEM      = open("root.pem", "rb").read()
-# The AWS Nitro root hash you PINNED out-of-band (default = the value shown above).
-ROOT_SHA256   = os.environ.get(
-    "NITRO_ROOT_SHA256",
-    "6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0",
-).lower()
+).strip().lower()
 
 # 0) Pin the AWS Nitro root before trusting anything.
 check(hashlib.sha256(ROOT_PEM).hexdigest() == ROOT_SHA256, "Nitro root cert hash mismatch")
@@ -185,8 +191,13 @@ check; a non-AWS chain fails the pinned-root path validation.
 
 ### Where the expected PCR0 comes from
 
-The value baked in above — `ff53e1fe…f6c6` — is the PCR0 the **public demo** enclave
-currently attests. It has two independent sources, in increasing order of trust:
+The value baked in above — `ff53e1fe…f6c6` — is the PCR0 the **public demo**
+enclave currently attests, and it is paired with this file's default
+`SIGNER_URL`. The **mainnet/production** enclave is a different image and
+measures `c16632ed…`; if you point `SIGNER_URL` there, override `EXPECTED_PCR0`
+to match, or the comparison is meaningless.
+
+The demo measurement has two independent sources, in increasing order of trust:
 
 - **This document** (at the commit you are reading) publishes it — a published
   reference, but only as trustworthy as this repo.

@@ -232,12 +232,15 @@ verifiable independently of the demo:
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
   (source verified on Basescan)
-- Active PCR0:
+- Registered PCR0 — ⚠️ **STALE, not the running enclave** (measured 2026-08-06:
+  `isPCR0Active` returns true for this value and false for the one actually
+  serving). Treat the on-chain check as **not satisfiable** until a fresh
+  registration lands, and verify against `/attestation` instead:
   `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
 - Canonical owner address:
   `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
 
-**Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required):**
+**Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required)** — ⚠️ **but read what a `true` here means today.** The command below queries the STALE registered value, so it returns `true` and proves only that this value is registered. It says nothing about the enclave now serving. Two stale sources agreeing looks exactly like verification; the check that actually binds is `/attestation` against the AWS Nitro root.
 
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
@@ -274,15 +277,25 @@ true
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-Translation: *PCR0 7c9e8b26… is currently active, registered by
-0x21538eBF…, which is the canonical owner address Usenami publishes.*
+Translation: *the registry reports PCR0 7c9e8b26… as active, registered by
+0x21538eBF…, the canonical owner address Usenami publishes.*
 
-If we had replaced the enclave with malicious code after deployment,
-the PCR0 would be different and this call would return `(false,
-0x0000…)`. The correspondence between the *production build's
-measurement* and its *on-chain registration* is what gives a third
-party the right to trust the signer without trusting Usenami's
-website, marketing, or word.
+⚠️ "Active **in the registry**" is not "running". As of 2026-08-06 this entry is
+stale: it does not correspond to the enclave now serving. The registry proves who
+registered a value, not that the value is live — for that, read `/attestation`.
+
+**What this call does and does not prove.** It proves that *someone we
+control registered this value*. It does **not** prove that value is
+running: swap the enclave and leave the registry untouched, and this
+call keeps returning `true` for the old measurement — the chain has no
+way to notice. That is not hypothetical; it is the state today.
+
+So the registry is one half of a pair, and the half that moves is the
+other one: `/attestation` reports what the enclave *actually* measures,
+signed by NSM and verifiable against the AWS Nitro root. A third party
+gets the right to trust this signer without trusting Usenami's website
+or word when **both** agree — the live measurement, and a registration
+of that same measurement by the published owner address.
 
 ### Reproducible builds — the PCR0 only matters if you can rebuild
 
@@ -308,8 +321,13 @@ succeeds:
 
 ```bash
 nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
-# Compare the output to the PCR0 value from the on-chain registry
-# (Step 4 above): 7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375
+# Compare the output to the LIVE /attestation document, not to a number printed
+# in this file and not to the on-chain registry entry — both can lag the running
+# enclave, and as of 2026-08-06 the registry entry does (see Step 4).
+# Expected for the strict build, which is the MAINNET/PRODUCTION enclave:
+#   c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
+# The public DEMO endpoint used elsewhere in this walkthrough is a different
+# image and measures ff53e1fe… — compare like with like.
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you
