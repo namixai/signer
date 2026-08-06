@@ -22,6 +22,14 @@
 #define DECRYPT_CMD "decrypt"
 #define GENKEY_CMD  "genkey"
 #define GENRANDOM_CMD  "genrandom"
+/* ROT-7: `encrypt` wraps an enclave-generated DEK under the KMS key WITH an
+ * EncryptionContext. It exists because `genkey` CANNOT carry a context: the
+ * SDK ships no `aws_kms_generate_data_key_blocking_with_context` and no
+ * `..._from_request` transport for GenerateDataKey — verified against upstream
+ * `main`, not just our pinned v0.4.5. `aws_kms_encrypt_blocking_with_context`
+ * DOES exist upstream, so this route needs no SDK patch at all and keeps the
+ * "SDK built unchanged from upstream" property this vendor tree protects. */
+#define ENCRYPT_CMD "encrypt"
 
 #define AES_256_ARG "AES-256"
 #define AES_128_ARG "AES-128"
@@ -73,6 +81,12 @@ struct app_ctx {
 
     /* GenRandom parameters */
     uint32_t length;
+
+    /* ENCRYPT parameter (ROT-7): base64 plaintext to wrap. Held as a plain
+     * `aws_string` like every other arg; the DEK it carries is short-lived and
+     * the process exits immediately after printing the ciphertext. The
+     * PLAINTEXT never leaves this process — only `CIPHERTEXT:` is printed. */
+    const struct aws_string *plaintext_b64;
 };
 
 /*
@@ -84,6 +98,7 @@ static void print_commands(int exit_code) {
     fprintf(stderr, "    decrypt: Decrypt a given ciphertext blob.\n");
     fprintf(stderr, "    genkey: Generate a datakey from KMS encrypted with the given key id.\n");
     fprintf(stderr, "    genrandom: Generate a random byte string from KMS.\n");
+    fprintf(stderr, "    encrypt: Encrypt a plaintext under the given key id, with EncryptionContext.\n");
     exit(exit_code);
 }
 
@@ -122,6 +137,33 @@ static void s_usage_genkey(int exit_code) {
     fprintf(stderr, "    --aws-session-token SESSION_TOKEN: Session token associated with the access key ID\n");
     fprintf(stderr, "    --key-id KEY_ID: key id\n");
     fprintf(stderr, "    --key-spec KEY_SPEC: The key spec used to create the key (AES-256 or AES-128).\n");
+    fprintf(stderr, "\n NOTE: genkey does NOT accept --encryption-context and never will: the SDK\n");
+    fprintf(stderr, "       exposes no context-aware GenerateDataKey. Passing it is a hard error on\n");
+    fprintf(stderr, "       purpose — silently dropping it would produce a data key wrapped WITHOUT\n");
+    fprintf(stderr, "       context, which the context-pinned read path can never unwrap. Use the\n");
+    fprintf(stderr, "       `encrypt` subcommand to wrap an enclave-generated DEK with a context.\n");
+    exit(exit_code);
+}
+
+/*
+ * Function to print out the arguments for encrypt (ROT-7)
+ */
+static void s_usage_encrypt(int exit_code) {
+    fprintf(stderr, "usage: kmstool_enclave_cli encrypt [options]\n");
+    fprintf(stderr, "\n Options: \n\n");
+    fprintf(stderr, "    --help: Displays this message and exits\n");
+    fprintf(stderr, "    --region REGION: AWS region to use for KMS. Default: 'us-east-1'\n");
+    fprintf(stderr, "    --proxy-port PORT: Connect to KMS proxy on PORT. Default: 8000\n");
+    fprintf(stderr, "    --aws-access-key-id ACCESS_KEY_ID: AWS access key ID\n");
+    fprintf(stderr, "    --aws-secret-access-key SECRET_ACCESS_KEY: AWS secret access key\n");
+    fprintf(stderr, "    --aws-session-token SESSION_TOKEN: Session token associated with the access key ID\n");
+    fprintf(stderr, "    --key-id KEY_ID: key id to encrypt under\n");
+    fprintf(stderr, "    --plaintext PLAINTEXT: base64-encoded plaintext to encrypt\n");
+    fprintf(stderr, "    --encryption-context NAME=VALUE: key-value pair to add to the request's "
+                    "EncryptionContext. Repeat the flag once per pair. REQUIRED — see below.\n");
+    fprintf(stderr, "\n NOTE: at least one --encryption-context pair is REQUIRED. A context-less\n");
+    fprintf(stderr, "       wrap would be silently unusable by the context-pinned read path, so\n");
+    fprintf(stderr, "       this subcommand fails closed rather than defaulting to no context.\n");
     exit(exit_code);
 }
 
@@ -154,6 +196,10 @@ static struct aws_cli_option s_long_options[] = {
     {"encryption-algorithm", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'a'},
     {"encryption-context", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'e'},
     {"length", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'l'},
+    /* ROT-7: `encrypt` input. Short code 'P' (capital) — 'p' is already
+     * --key-spec and the codes are a single flat namespace shared by all
+     * subcommands. */
+    {"plaintext", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'P'},
     {"help", AWS_CLI_OPTIONS_NO_ARGUMENT, NULL, 'h'},
     {NULL, 0, NULL, 0},
 };
@@ -225,12 +271,14 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
     ctx->key_spec = -1;
     ctx->encryption_algorithm = NULL;
     ctx->length = -1;
+    ctx->plaintext_b64 = NULL;
 
     aws_cli_optind = 2;
     while (true) {
         int option_index = 0;
 
-        int c = aws_cli_getopt_long(argc, argv, "r:x:k:s:t:c:K:p:a:e:l:h", s_long_options, &option_index);
+        /* ROT-7: `P:` added for --plaintext (encrypt). */
+        int c = aws_cli_getopt_long(argc, argv, "r:x:k:s:t:c:K:p:a:e:l:P:h", s_long_options, &option_index);
         if (c == -1) {
             break;
         }
@@ -260,6 +308,8 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
                     s_usage_genkey(1);
                 else if (strncmp(subcommand, GENRANDOM_CMD, MAX_SUB_COMMAND_LENGTH) == 0)
                     s_usage_genrandom(1);
+                else if (strncmp(subcommand, ENCRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0)
+                    s_usage_encrypt(1);
                 break;
             default:
                 if (strncmp(subcommand, DECRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
@@ -302,6 +352,26 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
                             fprintf(stderr, "Unknown option: %s\n", aws_cli_optarg);
                             s_usage_genkey(1);
                     }
+                } else if (strncmp(subcommand, ENCRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
+                    /* ROT-7. Mirrors the decrypt branch: this is the ONLY other
+                     * subcommand that carries an EncryptionContext, and unlike
+                     * decrypt the context here is mandatory (checked after the
+                     * parse loop, so a missing flag and a malformed one give the
+                     * same fail-closed result). */
+                    switch(c) {
+                        case 'K':
+                            ctx->key_id = aws_string_new_from_c_str(ctx->allocator, aws_cli_optarg);
+                            break;
+                        case 'P':
+                            ctx->plaintext_b64 = aws_string_new_from_c_str(ctx->allocator, aws_cli_optarg);
+                            break;
+                        case 'e':
+                            s_parse_encryption_context_arg(ctx->allocator, &ctx->encryption_context, aws_cli_optarg);
+                            break;
+                        default:
+                            fprintf(stderr, "Unknown option: %s\n", aws_cli_optarg);
+                            s_usage_encrypt(1);
+                    }
                 } else if (strncmp(subcommand, GENRANDOM_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
                     switch(c) {
                         case 'l':
@@ -340,7 +410,29 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
         ctx->region = aws_string_new_from_c_str(ctx->allocator, DEFAULT_REGION);
     }
 
-    if (strncmp(subcommand, DECRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
+    if (strncmp(subcommand, ENCRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
+        /* ROT-7. Key id is mandatory here (unlike decrypt, where symmetric
+         * ciphertext carries it). */
+        if (ctx->key_id == NULL) {
+            fprintf(stderr, "--key-id must be set\n");
+            exit(1);
+        }
+        if (ctx->plaintext_b64 == NULL) {
+            fprintf(stderr, "--plaintext must be set\n");
+            exit(1);
+        }
+        /* FAIL CLOSED on an empty context. This is the whole reason the
+         * subcommand exists: a wrap without context produces a ciphertext the
+         * context-pinned read path can never open, and the failure would only
+         * surface at the first real signature — long after provisioning
+         * "succeeded". Defaulting to no-context here would rebuild exactly the
+         * silent-invalid-key trap that genkey's hard-fail saved us from. */
+        if (aws_hash_table_get_entry_count(&ctx->encryption_context) == 0) {
+            fprintf(stderr, "--encryption-context must be set at least once\n");
+            exit(1);
+        }
+
+    } else if (strncmp(subcommand, DECRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
         /* Check if ciphertext is set */
         if (ctx->ciphertext_b64 == NULL) {
             fprintf(stderr, "--ciphertext must be set\n");
@@ -624,6 +716,125 @@ cleanup:
 }
 
 /*
+ * ROT-7: encrypt a plaintext under the KMS key WITH an EncryptionContext.
+ *
+ * Structure is a deliberate mirror of `decrypt()` above — same zero-init,
+ * same single-entry `cleanup:` label, same context-to-JSON handling — because
+ * that function has been through three review rounds (Gemini #68 r1/r2,
+ * CodeRabbit r3) that found real leaks in the upstream `fail_on` pattern.
+ * Diverging from its shape here would re-open the same class of bug.
+ *
+ * Unlike decrypt, the context is NOT optional: `s_parse_options` already
+ * refused an empty one, so by the time we get here the hash table is non-empty
+ * and the `with_context` call is unconditional. There is deliberately no
+ * no-context fallback path.
+ *
+ * @param[in]  app_ctx: Struct that has all of the necessary arguments
+ * @param[out] ciphertext_b64: Byte buffer where the KMS ciphertext will be stored
+ */
+static int encrypt_data(struct app_ctx *app_ctx, struct aws_byte_buf *ciphertext_b64) {
+    ssize_t rc = 0;
+
+    struct aws_credentials *credentials = NULL;
+    struct aws_nitro_enclaves_kms_client *client = NULL;
+
+    struct aws_byte_buf plaintext = { 0 };
+    struct aws_byte_buf ciphertext = { 0 };
+    struct aws_string *encryption_context_str = NULL;
+    struct json_object *encryption_context_json = NULL;
+
+    init_kms_client(app_ctx, &credentials, &client);
+
+    /* Decode the base64 plaintext into bytes. */
+    size_t plaintext_len;
+    /* `from_string`, not `from_c_str`: it takes the length from the
+     * `aws_string` instead of scanning for a NUL, so no cast and no strlen
+     * (Gemini review on #347). `decrypt()` above still uses the older
+     * `from_c_str` form — pre-existing, same result for a base64 argv value,
+     * and not this PR's to change. */
+    struct aws_byte_cursor plaintext_cur = aws_byte_cursor_from_string(app_ctx->plaintext_b64);
+    rc = aws_base64_compute_decoded_len(&plaintext_cur, &plaintext_len);
+    if (rc != AWS_OP_SUCCESS) {
+        fprintf(stderr, "Plaintext not a base64 string\n");
+        goto cleanup;
+    }
+    rc = aws_byte_buf_init(&plaintext, app_ctx->allocator, plaintext_len);
+    if (rc != AWS_OP_SUCCESS) {
+        fprintf(stderr, "Memory allocation error\n");
+        goto cleanup;
+    }
+    rc = aws_base64_decode(&plaintext_cur, &plaintext);
+    if (rc != AWS_OP_SUCCESS) {
+        fprintf(stderr, "Plaintext not a base64 string\n");
+        goto cleanup;
+    }
+
+    /* Build the EncryptionContext JSON. Same ownership dance as decrypt():
+     * copy `json_str` BEFORE `json_object_put` invalidates it, then NULL the
+     * local so the cleanup label cannot double-free. */
+    encryption_context_json = s_encryption_context_to_json(&app_ctx->encryption_context);
+    if (encryption_context_json == NULL) {
+        fprintf(stderr, "Could not build EncryptionContext JSON\n");
+        rc = AWS_OP_ERR;
+        goto cleanup;
+    }
+    const char *json_str = json_object_to_json_string_ext(encryption_context_json, JSON_C_TO_STRING_PLAIN);
+    if (json_str == NULL) {
+        fprintf(stderr, "Could not serialize EncryptionContext JSON\n");
+        rc = AWS_OP_ERR;
+        goto cleanup;
+    }
+    encryption_context_str = aws_string_new_from_c_str(app_ctx->allocator, json_str);
+    json_object_put(encryption_context_json);
+    encryption_context_json = NULL;
+    if (encryption_context_str == NULL) {
+        fprintf(stderr, "Could not copy EncryptionContext JSON\n");
+        rc = AWS_OP_ERR;
+        goto cleanup;
+    }
+
+    rc = aws_kms_encrypt_blocking_with_context(
+        client, app_ctx->key_id, &plaintext, encryption_context_str, &ciphertext);
+    if (rc != AWS_OP_SUCCESS) {
+        fprintf(stderr, "Could not encrypt plaintext\n");
+        goto cleanup;
+    }
+
+    rc = encode_b64(app_ctx, &ciphertext, ciphertext_b64);
+    if (rc != AWS_OP_SUCCESS) {
+        fprintf(stderr, "Could not encode ciphertext\n");
+        goto cleanup;
+    }
+
+cleanup:
+    /* Single-entry cleanup label — see decrypt() for why every error path
+     * flows here instead of using upstream's `fail_on`. `plaintext` holds the
+     * DEK, so wipe it explicitly rather than only freeing it. */
+    if (encryption_context_json != NULL) {
+        json_object_put(encryption_context_json);
+    }
+    if (encryption_context_str != NULL) {
+        aws_string_destroy(encryption_context_str);
+    }
+    /* `clean_up_secure` = secure_zero + clean_up in one call. The name used in
+     * the first cut of this function does NOT exist in aws-c-common at our
+     * pinned ref, and the EIF build caught it as an undefined reference at LINK
+     * time — the Rust side compiles clean and could never have surfaced it.
+     * Replacement verified twice: against the pinned upstream header, and
+     * against the symbols the already-built binary actually exports. Safe on a
+     * zero-initialized buffer: secure_zero guards on `buf->buffer` non-NULL. */
+    aws_byte_buf_clean_up_secure(&plaintext);
+    aws_byte_buf_clean_up(&ciphertext);
+    if (client != NULL) {
+        aws_nitro_enclaves_kms_client_destroy(client);
+    }
+    if (credentials != NULL) {
+        aws_credentials_release(credentials);
+    }
+    return rc;
+}
+
+/*
  * Function to generate a data key from KMS with attestation.
  *
  * @param[in]  app_ctx: Struct that has all of the necessary arguments
@@ -822,6 +1033,22 @@ int main(int argc, char **argv) {
         }
         aws_byte_buf_clean_up(&ciphertext_b64);
         aws_byte_buf_clean_up(&plaintext_b64);
+        if (rc != AWS_OP_SUCCESS) goto cleanup_hash_table;
+    } else if (strncmp(subcommand, ENCRYPT_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
+        /* ROT-7. Prints ONLY the ciphertext: the plaintext came in from the
+         * caller, so echoing it back would put the DEK on stdout for no
+         * reason. Contrast genkey, which must print both because KMS is the
+         * one that generated the key. */
+        struct aws_byte_buf ciphertext_b64 = { 0 };
+
+        rc = encrypt_data(&app_ctx, &ciphertext_b64);
+        if (rc == AWS_OP_SUCCESS) {
+            fprintf(stdout, "CIPHERTEXT: %s\n", (const char *)ciphertext_b64.buffer);
+        } else {
+            fprintf(stderr, "Could not encrypt\n");
+            exit_rc = 1;
+        }
+        aws_byte_buf_clean_up(&ciphertext_b64);
         if (rc != AWS_OP_SUCCESS) goto cleanup_hash_table;
     } else if (strncmp(subcommand, GENRANDOM_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
         struct aws_byte_buf plaintext_b64 = { 0 };

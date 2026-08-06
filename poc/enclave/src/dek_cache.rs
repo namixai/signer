@@ -3,7 +3,7 @@
 //! ## What this removes
 //! Today every sign on an envelope-v2 blob shells out to `kmstool_enclave_cli`
 //! to KMS-Decrypt the wrapped DEK (≈140 ms box-internal, and it serializes
-//! concurrency — see the internal latency-benchmark notes).
+//! concurrency — see `_hub/INBOX/2026-06-05T1215Z_signer_latency-benchmark-phase2-FINAL.md`).
 //! This cache holds the **decrypted DEK** in enclave RAM for a short TTL so the
 //! 2nd…Nth sign on the same blob skips kmstool and unwraps the envelope
 //! locally (AES-256-GCM, microseconds).
@@ -65,7 +65,7 @@
 //! (empty cache). **To stop signing immediately during an incident, terminate
 //! the enclave (`nitro-cli terminate-enclave`) — do not rely on KMS revocation
 //! alone.** A startup WARN log states this when the cache is enabled, and the
-//! operator runbook documents it.
+//! operator runbook (`_hub/RUNBOOKS/signer-dek-cache-ops.md`) documents it.
 //! `flush()` is the in-process lever; a host-triggered `flush_dek_cache` vsock
 //! command is a documented future option (kept out of v1 to avoid widening the
 //! host→enclave command surface without its own review). The default TTL is the

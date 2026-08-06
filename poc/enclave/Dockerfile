@@ -25,7 +25,7 @@
 #   2. sudo docker rmi signer-enclave:latest
 #   3. ./scripts/build-eif.sh           # capture PCR0 again
 #   4. PCR0 must match byte-for-byte
-# See the operator rebuild runbook for full instructions.
+# See _hub/RUNBOOKS/signer-poc-rebuild.md for full operator runbook.
 
 ###############################################################################
 # Stage 1: build our Rust enclave binary (fully static via musl).
