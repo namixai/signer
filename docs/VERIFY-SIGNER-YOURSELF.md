@@ -69,7 +69,11 @@ python3 -m venv v && . v/bin/activate && pip install cbor2 cryptography certvali
 # the download, or this doc, blindly.
 curl -sO https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
 unzip -o AWS_NitroEnclaves_Root-G1.zip     # → root.pem
-sha256sum root.pem 2>/dev/null || shasum -a 256 root.pem
+# Linux ships sha256sum, macOS ships shasum. Picked by AVAILABILITY, not by failure:
+# `sha256sum … || shasum …` would swallow a real error (a missing root.pem) and then
+# report the SECOND tool's failure instead of the first one's cause — the wrong trade
+# in a document whose whole purpose is not to mislead you.
+if command -v sha256sum >/dev/null 2>&1; then sha256sum root.pem; else shasum -a 256 root.pem; fi
 ```
 
 This verifier was run against the live demo endpoint as written. Certificate-path
