@@ -50,11 +50,21 @@ For engineers, security reviewers, and recruiters who want to dig deeper:
 | Binance | HMAC-SHA256 query param | Live |
 | Bybit V5 | HMAC-SHA256 headers | Live |
 | OKX V5 | HMAC-SHA256 + passphrase | Live |
-| **Hyperliquid mainnet** | **EIP-712 typed-data (secp256k1)** | **Live** (first non-HMAC adapter) |
-| Asterdex (BNB chain) | EIP-712 typed-data | Live |
+| Asterdex (BNB chain) | EIP-712 typed-data (secp256k1) | Live (first non-HMAC adapter) |
+| Hyperliquid **testnet** | EIP-712 typed-data (secp256k1) | Live |
+| Hyperliquid **mainnet** | EIP-712 typed-data (secp256k1) | **Denied in-enclave** — see below |
 | Hyperliquid HIP-3 family (xyz/km/cash/flx) | EIP-712 (same as main, different chainId) | Coming next |
 | dYdX v4 | Cosmos signing | Phase 2 |
 | Paradex | StarkEx | Phase 2 |
+
+> **On Hyperliquid mainnet.** The enclave refuses `sign_hyperliquid_main_order` and
+> `sign_hyperliquid_main_cancel` before it loads or decrypts any key material — it is
+> **denied inside the enclave, not merely unconfigured**. A caller receives a policy
+> denial, and no signature exists to submit. Hyperliquid **testnet** signs through the
+> same EIP-712 code path; the only difference is the phantom-agent source byte.
+> This row read `Live` from 2026-06-26 until 2026-08-05, which was wrong for the whole
+> of that period — the deny landed the same day. Corrected rather than quietly edited.
+
 
 Adding a new exchange with same crypto scheme ≈ ~50 lines per venue.
 
@@ -81,11 +91,34 @@ sdk/
 
 ## On-chain trust anchor
 
-You don't have to trust `usenami.io` to publish a truthful enclave measurement. The current production PCR0 is registered in an immutable on-chain registry on Base mainnet:
+> ## ⚠️ THE ON-CHAIN ANCHOR IS STALE — READ THIS BEFORE USING IT
+>
+> Measured against Base on 2026-08-05:
+>
+> | PCR0 | `isPCR0Active` |
+> |---|---|
+> | `7c9e8b26…` (registered, no longer running) | **true** |
+> | `c16632ed…` (**currently running**) | **false** |
+> | `ff53e1fe…` (previously running) | **false** |
+>
+> The registry marks an old measurement active and does not know the one actually
+> serving. The dangerous failure mode is not the obvious one: a careful verifier
+> compares the LIVE attestation against the chain, gets `false`, and correctly refuses.
+> A careless one compares this README's number against the chain, sees them agree, and
+> concludes it verified something — **two stale sources agreeing looks exactly like
+> verification.**
+>
+> Until a fresh registration lands, treat the on-chain check as **not satisfiable** and
+> rely on `/attestation` verified against the AWS Nitro root. Published rather than
+> quietly re-pointed, because the point of this section is that you should not have to
+> take our word for it.
+
+An immutable registry on Base exists for exactly this purpose, subject to the staleness
+above:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
 - **Owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Active PCR0**: `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
+- **Registered PCR0 (STALE — not the running enclave)**: `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
 
 ### How to verify (the correct way — read this carefully)
 
@@ -200,11 +233,15 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 
 ---
 
-## Project status (2026-06-24)
+## Project status (2026-08-05)
 
-**Live in production.** 6 exchanges — 4 CEX (KuCoin, Binance, Bybit, OKX) plus two EIP-712 DEXes (Hyperliquid, Asterdex). PCR0 rotation collapsed to single-allow on 2026-06-24; EIP-712 DEX signing verified byte-for-byte against the official Hyperliquid SDK.
+**Live in production.** 5 venues signing on mainnet — 4 CEX (KuCoin, Binance, Bybit, OKX) plus the Asterdex EIP-712 DEX. Hyperliquid **mainnet is denied inside the enclave** (below); Hyperliquid **testnet** signs. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
 
-Production PCR0: `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
+Production PCR0: `c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8`
+
+Check it yourself rather than taking this file's word for it — `/attestation` returns an
+NSM-signed COSE document carrying the running measurement, and it is the authority here.
+A value printed in a README goes stale silently; the one this repository published did.
 
 Shipped:
 - **UPL** (Usenami Policy Layer) — JSON policy validated in-enclave on every sign request, including order-size and transfer-recipient enforcement (live)
