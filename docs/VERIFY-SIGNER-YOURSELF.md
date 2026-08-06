@@ -195,7 +195,9 @@ The value baked in above — `ff53e1fe…f6c6` — is the PCR0 the **public demo
 enclave currently attests, and it is paired with this file's default
 `SIGNER_URL`. The **mainnet/production** enclave is a different image and
 measures `c16632ed…`; if you point `SIGNER_URL` there, override `EXPECTED_PCR0`
-to match, or the comparison is meaningless. It has two independent sources, in increasing order of trust:
+to match, or the comparison is meaningless.
+
+The demo measurement has two independent sources, in increasing order of trust:
 
 - **This document** (at the commit you are reading) publishes it — a published
   reference, but only as trustworthy as this repo.

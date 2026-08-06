@@ -284,12 +284,18 @@ Translation: *the registry reports PCR0 7c9e8b26… as active, registered by
 stale: it does not correspond to the enclave now serving. The registry proves who
 registered a value, not that the value is live — for that, read `/attestation`.
 
-If we had replaced the enclave with malicious code after deployment,
-the PCR0 would be different and this call would return `(false,
-0x0000…)`. The correspondence between the *production build's
-measurement* and its *on-chain registration* is what gives a third
-party the right to trust the signer without trusting Usenami's
-website, marketing, or word.
+**What this call does and does not prove.** It proves that *someone we
+control registered this value*. It does **not** prove that value is
+running: swap the enclave and leave the registry untouched, and this
+call keeps returning `true` for the old measurement — the chain has no
+way to notice. That is not hypothetical; it is the state today.
+
+So the registry is one half of a pair, and the half that moves is the
+other one: `/attestation` reports what the enclave *actually* measures,
+signed by NSM and verifiable against the AWS Nitro root. A third party
+gets the right to trust this signer without trusting Usenami's website
+or word when **both** agree — the live measurement, and a registration
+of that same measurement by the published owner address.
 
 ### Reproducible builds — the PCR0 only matters if you can rebuild
 
@@ -318,7 +324,10 @@ nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
 # Compare the output to the LIVE /attestation document, not to a number printed
 # in this file and not to the on-chain registry entry — both can lag the running
 # enclave, and as of 2026-08-06 the registry entry does (see Step 4).
-# Expected for the strict build: c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
+# Expected for the strict build, which is the MAINNET/PRODUCTION enclave:
+#   c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
+# The public DEMO endpoint used elsewhere in this walkthrough is a different
+# image and measures ff53e1fe… — compare like with like.
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you
