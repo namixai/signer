@@ -34,7 +34,7 @@ axum = "0.7"
 # feature dropped on Gemini round-1 MED-1: pulls in unnecessary h2 deps.
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
-tower-http = { version = "0.6", features = ["trace", "limit", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "limit", "timeout"] }
 # C30 (adversarial review 2026-05-18): slow-loris + connection-exhaustion hardening.
 # `limit` for ConcurrencyLimitLayer, `load-shed` so overflow returns 503
 # immediately instead of queueing (which would itself be a DoS vector).
