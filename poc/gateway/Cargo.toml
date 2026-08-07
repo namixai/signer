@@ -59,7 +59,7 @@ http = "1"
 # Pin away from `idna_adapter >= 1.2.2` and friends — those require
 # Cargo's edition2024 feature, unavailable on Rust 1.83.
 idna_adapter = "=1.2.1"
-litemap = "=0.7.4"
+litemap = "=0.8.2"
 zerofrom = "=0.1.5"
 icu_collections = "=1.5.0"
 icu_locid = "=1.5.0"
