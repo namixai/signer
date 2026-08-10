@@ -37,7 +37,7 @@ jobs:
   build-test-clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # don't leave the token in .git/config for build steps
       # rustup is preinstalled on ubuntu runners and honours poc/rust-toolchain.toml
@@ -85,11 +85,11 @@ jobs:
     # tracked, which is a better trade than compiling cargo-audit on every run.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install cargo-audit (prebuilt)
-        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
           tool: cargo-audit
       - name: cargo audit
