@@ -52,18 +52,29 @@ For engineers, security reviewers, and recruiters who want to dig deeper:
 | OKX V5 | HMAC-SHA256 + passphrase | Live |
 | Asterdex (BNB chain) | EIP-712 typed-data (secp256k1) | Live (first non-HMAC adapter) |
 | Hyperliquid **testnet** | EIP-712 typed-data (secp256k1) | Live |
-| Hyperliquid **mainnet** | EIP-712 typed-data (secp256k1) | **Denied in-enclave** — see below |
+| Hyperliquid **mainnet** | EIP-712 typed-data (secp256k1) | **No key provisioned** — see below |
 | Hyperliquid HIP-3 family (xyz/km/cash/flx) | EIP-712 (same as main, different chainId) | Coming next |
 | dYdX v4 | Cosmos signing | Phase 2 |
 | Paradex | StarkEx | Phase 2 |
 
-> **On Hyperliquid mainnet.** The enclave refuses `sign_hyperliquid_main_order` and
-> `sign_hyperliquid_main_cancel` before it loads or decrypts any key material — it is
-> **denied inside the enclave, not merely unconfigured**. A caller receives a policy
-> denial, and no signature exists to submit. Hyperliquid **testnet** signs through the
-> same EIP-712 code path; the only difference is the phantom-agent source byte.
+> **On Hyperliquid mainnet — the guarantee CHANGED on 2026-08-10, read this.**
+> Until then the enclave refused `sign_hyperliquid_main_order` and
+> `sign_hyperliquid_main_cancel` before touching any key material: denied inside the
+> enclave, not merely unconfigured. **That in-enclave deny was removed** in the
+> rotation deployed on 2026-08-10, so the code path no longer refuses by construction.
+>
+> What stops a mainnet signature today is weaker and worth stating plainly: **no
+> Hyperliquid mainnet key exists** — none is provisioned, so there is nothing to
+> decrypt and nothing to sign with. That is an operational fact, not an enclave-enforced
+> property, and it can change the day a key is created. Do not rely on this row as a
+> safety guarantee; rely on the policy you attest.
+>
+> Hyperliquid **testnet** signs through the same EIP-712 code path; the only difference
+> is the phantom-agent source byte.
+>
 > This row read `Live` from 2026-06-26 until 2026-08-05, which was wrong for the whole
-> of that period — the deny landed the same day. Corrected rather than quietly edited.
+> of that period. Corrected rather than quietly edited — and corrected again here, in
+> the other direction, rather than leaving a stale claim that flattered us.
 
 
 Adding a new exchange with same crypto scheme ≈ ~50 lines per venue.
@@ -93,7 +104,7 @@ sdk/
 
 > ## ⚠️ THE ON-CHAIN ANCHOR IS STALE — READ THIS BEFORE USING IT
 >
-> Measured against Base on 2026-08-05:
+> Measured against Base on 2026-08-11, after the rotation:
 >
 > | PCR0 | `isPCR0Active` |
 > |---|---|
@@ -258,9 +269,9 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 
 ---
 
-## Project status (2026-08-05)
+## Project status (2026-08-11)
 
-**Live in production.** 5 venues signing on mainnet — 4 CEX (KuCoin, Binance, Bybit, OKX) plus the Asterdex EIP-712 DEX. Hyperliquid **mainnet is denied inside the enclave** (below); Hyperliquid **testnet** signs. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
+**Live in production.** 5 venues signing on mainnet — 4 CEX (KuCoin, Binance, Bybit, OKX) plus the Asterdex EIP-712 DEX. Hyperliquid **mainnet has no key provisioned** — the in-enclave deny was removed on 2026-08-10 (below); Hyperliquid **testnet** signs. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
 
 Production PCR0: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
 

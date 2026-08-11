@@ -223,11 +223,11 @@ single byte and PCR0 changes. AWS measures PCR0 in hardware, so we
 cannot forge it ourselves even if we wanted to.
 
 Usenami's production enclave build has its PCR0 registered in a public
-smart contract on Base mainnet. The closed-pilot demo endpoint above
-runs a separate pilot enclave, whose live measurement you verify by
-requesting an attestation from it (see *The Nitro attestation document*
-below) — so this on-chain record is the production build's measurement,
-verifiable independently of the demo:
+smart contract on Base mainnet. Since the 2026-08-10 rotation the demo
+endpoint above runs the SAME image as production and attests the SAME
+measurement, so one number covers both — you verify it live by requesting
+an attestation from the endpoint (see *The Nitro attestation document*
+below). Note that the on-chain record itself is currently behind:
 
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
