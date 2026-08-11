@@ -1,9 +1,9 @@
-//! C22 mitigation: bearer token authentication
+//! C22 mitigation (ZLODEY threat hunt 2026-05-18): bearer token authentication
 //! middleware for the `/sign` endpoint.
 //!
 //! Threat: gateway had ZERO authentication. If the EC2 origin IP
-//! (`<origin-ip>:8443`) was discovered by an attacker — via reverse DNS,
-//! CT logs for the public demo hostname, or EC2 IP range scans — they could
+//! (`54.224.183.120:8443`) was discovered by an attacker — via reverse DNS,
+//! CT logs for `signer-demo.usenami.io`, or EC2 IP range scans — they could
 //! curl `/sign` directly, bypassing Cloudflare entirely. Once Cloudflare is
 //! bypassed there is no rate limit, no WAF, no DDoS shielding, no auth — the
 //! enclave will sign whatever the (decryptable) blobs allow.
@@ -14,7 +14,7 @@
 //!
 //! Defense-in-depth: this is layered *with* the EC2 Security Group rule that
 //! restricts inbound 8443 to the AWS-managed Cloudflare prefix list
-//! (`<cloudflare-managed-prefix-list-id>`). Even if a Cloudflare IP
+//! (`pl-03089356febfc669f`, deployed 2026-05-18). Even if a Cloudflare IP
 //! impersonator slips past the SG, they still face the bearer check here.
 //!
 //! Why bearer tokens, not mTLS or signed envelopes:
@@ -541,9 +541,17 @@ mod tests {
         let operator = AuthState::operator_from_env().expect("operator auth");
 
         assert_eq!(tenant.lookup("tenant-tok"), Some("cust-a"));
-        assert_eq!(tenant.lookup("operator-tok"), None, "operator token must NOT pass tenant auth");
+        assert_eq!(
+            tenant.lookup("operator-tok"),
+            None,
+            "operator token must NOT pass tenant auth"
+        );
         assert_eq!(operator.lookup("operator-tok"), Some("ops"));
-        assert_eq!(operator.lookup("tenant-tok"), None, "tenant token must NOT pass operator auth");
+        assert_eq!(
+            operator.lookup("tenant-tok"),
+            None,
+            "tenant token must NOT pass operator auth"
+        );
 
         // LOW#2: disjoint sets do not overlap.
         assert!(!tenant.shares_token_with(&operator));
@@ -584,12 +592,18 @@ mod tests {
         // main() refuses to boot on this. Detection is order-independent.
         let _g = EnvGuard::set_many(&[
             ("SIGNER_ALLOW_NO_AUTH", None),
-            ("SIGNER_API_TOKENS", Some("shared-tok:cust-a,tenant-only:cust-b")),
+            (
+                "SIGNER_API_TOKENS",
+                Some("shared-tok:cust-a,tenant-only:cust-b"),
+            ),
             ("SIGNER_OPERATOR_TOKENS", Some("shared-tok:ops")),
         ]);
         let tenant = AuthState::from_env().expect("tenant auth");
         let operator = AuthState::operator_from_env().expect("operator auth");
-        assert!(tenant.shares_token_with(&operator), "must detect the shared token");
+        assert!(
+            tenant.shares_token_with(&operator),
+            "must detect the shared token"
+        );
         assert!(operator.shares_token_with(&tenant));
     }
 
@@ -599,22 +613,34 @@ mod tests {
         // SIGNER_ALLOW_NO_AUTH → refuse to boot, not silent no-auth.
         let _g = EnvGuard::set_many(&[("SIGNER_ALLOW_NO_AUTH", None), ("SIGNER_API_TOKENS", None)]);
         let err = AuthState::from_env().expect_err("unset tokens must fail closed");
-        assert!(matches!(err, AuthConfigError::AuthRequired), "got {:?}", err);
+        assert!(
+            matches!(err, AuthConfigError::AuthRequired),
+            "got {:?}",
+            err
+        );
     }
 
     #[test]
     fn empty_env_without_flag_fails_closed() {
-        let _g =
-            EnvGuard::set_many(&[("SIGNER_ALLOW_NO_AUTH", None), ("SIGNER_API_TOKENS", Some("   "))]);
+        let _g = EnvGuard::set_many(&[
+            ("SIGNER_ALLOW_NO_AUTH", None),
+            ("SIGNER_API_TOKENS", Some("   ")),
+        ]);
         let err = AuthState::from_env().expect_err("empty tokens must fail closed");
-        assert!(matches!(err, AuthConfigError::AuthRequired), "got {:?}", err);
+        assert!(
+            matches!(err, AuthConfigError::AuthRequired),
+            "got {:?}",
+            err
+        );
     }
 
     #[test]
     fn unset_env_with_allow_no_auth_flag_runs_open() {
         // Explicit opt-in to legacy no-auth mode (dev only).
-        let _g =
-            EnvGuard::set_many(&[("SIGNER_ALLOW_NO_AUTH", Some("1")), ("SIGNER_API_TOKENS", None)]);
+        let _g = EnvGuard::set_many(&[
+            ("SIGNER_ALLOW_NO_AUTH", Some("1")),
+            ("SIGNER_API_TOKENS", None),
+        ]);
         let auth = AuthState::from_env().expect("flag set → no-auth allowed");
         assert!(!auth.enforcing());
     }
@@ -670,7 +696,11 @@ mod tests {
             Some("no-colon-1,no-colon-2,:empty-token,empty-cust:"),
         );
         let err = AuthState::from_env().expect_err("should fail with NoValidEntries");
-        assert!(matches!(err, AuthConfigError::NoValidEntries), "got {:?}", err);
+        assert!(
+            matches!(err, AuthConfigError::NoValidEntries),
+            "got {:?}",
+            err
+        );
     }
 
     /// Gemini PR #29 round-2 parser-fragility catch: customer label
@@ -752,12 +782,9 @@ mod tests {
         assert_eq!(tenant_auth.lookup("tenant-tok"), Some("fund-a"));
         assert_eq!(operator_auth.lookup("tenant-tok"), None);
 
-        let app = Router::new()
-            .route("/verify-blob", post(stub))
-            .route_layer(axum::middleware::from_fn_with_state(
-                operator_auth,
-                require_bearer,
-            ));
+        let app = Router::new().route("/verify-blob", post(stub)).route_layer(
+            axum::middleware::from_fn_with_state(operator_auth, require_bearer),
+        );
 
         let call = |bearer: Option<&str>| {
             let mut b = Request::builder().method("POST").uri("/verify-blob");
@@ -780,9 +807,6 @@ mod tests {
             "an operator token must reach /verify-blob"
         );
         // (3) No credential → rejected.
-        assert_eq!(
-            call(None).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
-        );
+        assert_eq!(call(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 }

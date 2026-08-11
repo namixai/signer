@@ -325,9 +325,9 @@ nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
 # in this file and not to the on-chain registry entry — both can lag the running
 # enclave, and as of 2026-08-06 the registry entry does (see Step 4).
 # Expected for the strict build, which is the MAINNET/PRODUCTION enclave:
-#   c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
-# The public DEMO endpoint used elsewhere in this walkthrough is a different
-# image and measures ff53e1fe… — compare like with like.
+#   32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
+# Since the 2026-08-10 rotation the public DEMO endpoint runs the SAME image as
+# production and attests the SAME measurement — one published number covers both.
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you

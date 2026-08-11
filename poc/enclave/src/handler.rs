@@ -186,9 +186,11 @@ fn venue_for_action(action: &str) -> Option<&'static str> {
         "sign_kucoin" => Some("kucoin"),
         "sign_bybit" => Some("bybit"),
         "sign_hyperliquid_main_order" | "sign_hyperliquid_main_cancel" => Some("hyperliquid_main"),
-        // HL TESTNET (source="b", no real funds) — a SEPARATE venue from mainnet
-        // (which is hard-denied). Its own blob/key (the sealed demo agent wallet)
-        // + its own tenant grant `allowed_venues:["hyperliquid_testnet"]`.
+        // HL TESTNET (source="b", no real funds) — a SEPARATE venue from
+        // mainnet, with its own blob/key (the sealed demo agent wallet) and its
+        // own tenant grant `allowed_venues:["hyperliquid_testnet"]`. The two
+        // are distinct venues for ACL, KMS context and floor purposes; mainnet
+        // additionally carries the unconditional floor (`floor_is_unconditional`).
         "sign_hyperliquid_testnet_order" | "sign_hyperliquid_testnet_cancel" => {
             Some("hyperliquid_testnet")
         }
@@ -266,8 +268,8 @@ fn load_secret_for(
     let aad = identity.sealed_aad(venue, KEY_VERSION);
 
     if crate::envelope::is_envelope(&raw_blob) {
-        let env = crate::envelope::parse_envelope(&raw_blob)
-            .map_err(|_| LoadSecretError::BadRequest)?;
+        let env =
+            crate::envelope::parse_envelope(&raw_blob).map_err(|_| LoadSecretError::BadRequest)?;
 
         // The wrapped DEK is KMS *ciphertext* (not secret material), so it does
         // not need Zeroizing — keeping it plain avoids a needless wipe pass.
@@ -457,7 +459,10 @@ fn parse_require_policy_env() -> bool {
 ///
 /// `None` policy = unrestricted (legacy blob backward compat).
 #[allow(clippy::result_large_err)] // SignResponse is our wire type; boxing adds indirection for no gain.
-fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<String>, SignResponse> {
+fn enforce_policy(
+    policy: Option<&Policy>,
+    req: &SignRequest,
+) -> Result<Option<String>, SignResponse> {
     let Some(p) = policy else {
         return Ok(None); // Legacy blob — no policy, no hash.
     };
@@ -488,6 +493,46 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<S
         if !allowed.iter().any(|a| a == &req.action) {
             // explainable-denials: typed subclass of POLICY_DENIED (no value leaked).
             return Err(SignResponse::err(err_code::ACTION_NOT_ALLOWED));
+        }
+    }
+
+    // ROT-1 round-3: AF-2 is NOT wired on the Hyperliquid path — neither
+    // `enforce_agent_intent_order` nor `_cancel` is called from
+    // `load_hyperliquid_request`. A policy that carries `intent_pubkey` and is
+    // used on an HL venue therefore states a protection the enclave does not
+    // apply, and the AF-2 floor above makes that worse rather than better: it
+    // demands `order_caps`, which is the SYMBOL-keyed field that cannot bind an
+    // index-keyed HL order at all — so satisfying the floor means adding a
+    // decorative cap, and the result is a policy that looks AF-2-protected,
+    // passes every gate, and gets no intent verification whatsoever. That is
+    // the same false-guarantee shape as the decorative-`order_caps` bug ROT-3
+    // fixed (see `rot3_binding_cap_present`), and a false guarantee is worse
+    // than a missing one because it is the one an operator relies on.
+    //
+    // Refused fail-closed until AF-2 covers HL. Wiring it is not a small change
+    // and does not belong here: the AF-2 canonical serialisation
+    // (`docs/AF2-INTENT-CANONICAL.md`) is defined over the STRUCTURED
+    // `OrderRequest`/`CancelRequest`, while an HL action is free-form JSON keyed
+    // by asset index — a new signed canonical, matched byte-for-byte by the
+    // agent SDK, is its own ticket. Both mint paths refuse the same shape
+    // (policy-cli and the in-enclave `provision_agent_key`), so this is defence
+    // in depth rather than the only gate.
+    //
+    // Placed AFTER the action whitelist on purpose: a request for an action the
+    // policy does not allow must keep returning the typed `action_not_allowed`
+    // (explainable-denials, #227/#230) rather than being reclassified by a
+    // policy-shape rule that would have refused it anyway.
+    if p.intent_pubkey.is_some() {
+        if let Some(venue) = venue_for_action(&req.action) {
+            if is_hl_venue(venue) {
+                tracing::error!(
+                    event = "intent_pubkey_unsupported_on_hl",
+                    venue = %venue,
+                    action = %req.action,
+                    "policy claims AF-2 but the HL path does not verify agent intent"
+                );
+                return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+            }
         }
     }
 
@@ -524,7 +569,10 @@ fn enforce_policy(policy: Option<&Policy>, req: &SignRequest) -> Result<Option<S
     // `/api` from accidentally matching `/api-internal/withdraw`.
     if let Some(ref prefixes) = p.allowed_path_prefixes {
         if let Some(ref path) = req.path {
-            if !prefixes.iter().any(|prefix| path_matches_prefix(path, prefix)) {
+            if !prefixes
+                .iter()
+                .any(|prefix| path_matches_prefix(path, prefix))
+            {
                 return Err(SignResponse::err(err_code::ACTION_NOT_ALLOWED));
             }
         }
@@ -653,6 +701,37 @@ fn is_hl_venue(venue: &str) -> bool {
     matches!(venue, "hyperliquid_main" | "hyperliquid_testnet")
 }
 
+/// ROT-1 round-3: venues whose blob floor may NOT be relaxed by the build flag.
+///
+/// What this fixes. Until ROT-1, `hyperliquid_main` was hard-denied — a deny
+/// that no environment variable could soften. ROT-1 replaced it with the money
+/// floor (authority-signed policy + binding caps), which is stricter per
+/// request but reads `SIGNER_REQUIRE_POLICY`, and that flag DEFAULTS TO
+/// PERMISSIVE at build time (`scripts/build-eif.sh`). So an EIF built with the
+/// documented default command carried a mainnet path where a legacy blob — no
+/// policy at all — signed a Hyperliquid order of any size: an unconditional
+/// guarantee had quietly become a conditional one, and the condition defaults
+/// to off. Whether the running production EIF is strict is not the point; the
+/// claim is about what the code guarantees, not about one deployment.
+///
+/// Deliberately NOT `is_money_venue`. Making every money venue unconditionally
+/// strict would change how a permissive image handles CEX and HL-testnet blobs
+/// — a migration for every such deployment, not a fix for this defect. The venue
+/// whose unconditional guarantee ROT-1 removed is the one that gets it back.
+fn floor_is_unconditional(venue: &str) -> bool {
+    matches!(venue, "hyperliquid_main")
+}
+
+/// Does the strict blob floor apply to this venue on this build?
+///
+/// Pure and total on purpose, for the same reason as
+/// `rot3_uncapped_money_key_rejected`: `env_strict` is `policy_required()`
+/// threaded in, so the rule can be asserted directly and weakening it turns a
+/// test red instead of quietly widening what the enclave will load.
+fn blob_floor_strict(env_strict: bool, venue: &str) -> bool {
+    env_strict || floor_is_unconditional(venue)
+}
+
 /// Does this policy carry a cap that can actually BIND an order on `venue`?
 ///
 /// The distinction is not cosmetic, and getting it wrong is worse than having
@@ -670,10 +749,10 @@ fn is_hl_venue(venue: &str) -> bool {
 ///
 /// The second is the one that matters: it produces a FALSE guarantee, and the
 /// guarantee is one we state publicly. Found by Gemini and CodeRabbit
-/// independently on #355; the CTO withheld the cutover over it. It does not
-/// fire today only because HL is hard-denied — and ROT-1 (unblocking HL) is
-/// the very next rotation, so shipping it would have switched HL on top of a
-/// claim that was not true.
+/// independently on #355; the CTO withheld the cutover over it. On MAINNET it
+/// could not fire at the time, because that venue was hard-denied — on HL
+/// testnet it always could. ROT-1 removed the mainnet deny, so from here the
+/// predicate is load-bearing on real funds too.
 ///
 /// EMPTY VECTOR COUNTS AS ABSENT — and the reason is operator error, not
 /// permissiveness. At enforcement an empty list is the STRICTEST outcome, not
@@ -921,8 +1000,14 @@ fn enforce_agent_intent_order(
         tracing::warn!(event = "intent_order_missing_coid", venue = %venue);
         return Err(SignResponse::err(err_code::BAD_REQUEST));
     };
-    let intent_msg =
-        build_agent_intent_msg_order(&identity.customer_id, venue, action, timestamp_ms, coid, order);
+    let intent_msg = build_agent_intent_msg_order(
+        &identity.customer_id,
+        venue,
+        action,
+        timestamp_ms,
+        coid,
+        order,
+    );
     verify_agent_intent(pk, req.intent_signature.as_deref(), &intent_msg)
 }
 
@@ -948,8 +1033,14 @@ fn enforce_agent_intent_cancel(
         tracing::warn!(event = "intent_cancel_missing_nonce", venue = %venue);
         return Err(SignResponse::err(err_code::BAD_REQUEST));
     };
-    let intent_msg =
-        build_agent_intent_msg_cancel(&identity.customer_id, venue, action, timestamp_ms, nonce, cancel);
+    let intent_msg = build_agent_intent_msg_cancel(
+        &identity.customer_id,
+        venue,
+        action,
+        timestamp_ms,
+        nonce,
+        cancel,
+    );
     verify_agent_intent(pk, req.intent_signature.as_deref(), &intent_msg)
 }
 
@@ -1093,10 +1184,10 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     // Otherwise, the byte immediately after the prefix in `path` must
     // be EOS / `/` / `?` to count as a structural match.
     match path.as_bytes().get(prefix.len()) {
-        None => true,         // EOS — exact prefix match
-        Some(b'/') => true,   // path component boundary
-        Some(b'?') => true,   // query string start
-        _ => false,           // partial token match — reject
+        None => true,       // EOS — exact prefix match
+        Some(b'/') => true, // path component boundary
+        Some(b'?') => true, // query string start
+        _ => false,         // partial token match — reject
     }
 }
 
@@ -1117,6 +1208,11 @@ fn load_and_parse_blob(
     // Customer-scoped TOFU/rate namespace (D8) — replaces the gateway-supplied
     // `s3_key.unwrap_or("_default")` shared bucket (cross-tenant oracle + DoS).
     let tofu_key = format!("{}/{}", identity.customer_id, venue);
+    // ROT-1 round-3: one strictness decision for the whole function, so the
+    // policy-wrapped branch and the legacy branch cannot drift apart. On
+    // `hyperliquid_main` this is true regardless of the build flag — see
+    // `floor_is_unconditional`.
+    let strict = blob_floor_strict(policy_required(), venue);
     let plaintext = load_secret_for(req, identity, venue)?;
 
     let parsed = ParsedBlob::from_plaintext(&plaintext).map_err(|_| LoadSecretError::BadRequest)?;
@@ -1132,9 +1228,12 @@ fn load_and_parse_blob(
             // controls the ciphertext and could TOFU-pin their OWN key on first
             // use, then ship a policy without the withdrawal-deny / caps floor.
             // Requiring OUR baked-key signature (tenant-bound, domain-separated)
-            // closes that. Non-money venues and the permissive regime keep the
-            // existing TOFU behavior untouched.
-            if policy_required() && is_money_venue(venue) {
+            // closes that. Non-money venues keep the existing TOFU behavior
+            // untouched, and so does a permissive build — EXCEPT on the venues
+            // `floor_is_unconditional` names, where `strict` is true regardless
+            // of the flag and TOFU alone is therefore never enough (ROT-1
+            // round-3).
+            if strict && is_money_venue(venue) {
                 verify_policy_authority(&policy, &identity.customer_id, venue)?;
                 // ROT-3: an UNCAPPED money key is refused HERE, at load, before a
                 // single signature is produced.
@@ -1187,10 +1286,12 @@ fn load_and_parse_blob(
                 };
                 let canonical =
                     canonical_policy_signable(&policy).map_err(|_| LoadSecretError::BadRequest)?;
-                crate::tofu::verify_and_pin(&tofu_key, &canonical, pk_hex, sig_hex).map_err(|e| {
-                    tracing::warn!(event = "tofu_rejected", tofu_key = %tofu_key, error = %e);
-                    LoadSecretError::BadRequest
-                })?;
+                crate::tofu::verify_and_pin(&tofu_key, &canonical, pk_hex, sig_hex).map_err(
+                    |e| {
+                        tracing::warn!(event = "tofu_rejected", tofu_key = %tofu_key, error = %e);
+                        LoadSecretError::BadRequest
+                    },
+                )?;
             } else {
                 crate::tofu::require_if_pinned(&tofu_key).map_err(|e| {
                     tracing::warn!(event = "tofu_unsigned_bypass_blocked", tofu_key = %tofu_key, error = %e);
@@ -1223,12 +1324,14 @@ fn load_and_parse_blob(
             // to "<unset>" if the field is missing so logs stay structured.
             // Gemini round-1 PR #28 catch.
             let s3_key = req.key_blob_s3_key.as_deref().unwrap_or("<unset>");
-            if policy_required() {
+            if strict {
                 tracing::warn!(
                     event = "legacy_blob_rejected",
                     s3_key = %s3_key,
                     action = %req.action,
-                    "SIGNER_REQUIRE_POLICY=1 — legacy blob (no policy) rejected"
+                    venue = %venue,
+                    unconditional = floor_is_unconditional(venue),
+                    "legacy blob (no policy) rejected — strict floor"
                 );
                 return Err(LoadSecretError::PolicyRequired);
             }
@@ -1307,6 +1410,10 @@ pub fn handle(req: SignRequest) -> SignResponse {
         "registry_challenge" => return handle_registry_challenge(),
         "registry_refresh" => return handle_registry_refresh(req),
         "provision_data_key" => return handle_provision_data_key(req),
+        // ROT-1: same gate as `provision_data_key` — no tenant token, the IAM
+        // role is the authorisation. It carries no secret INTO the enclave and
+        // returns only a public address.
+        "provision_agent_key" => return handle_provision_agent_key(req),
         // H5: NSM attestation. Bypasses the tenant / rate / proto-version gates
         // below — it carries no opaque token and no secret, and publishes only
         // the enclave's own PUBLIC image measurement (PCR0) inside a COSE doc.
@@ -1334,7 +1441,10 @@ pub fn handle(req: SignRequest) -> SignResponse {
     // path resolve, so a request could be rate-limited as one customer and
     // signed as another). The single ResolvedIdentity is threaded through the
     // whole signing path below — there is no second resolve anywhere downstream.
-    let identity = req.opaque_token.as_deref().and_then(crate::registry::resolve);
+    let identity = req
+        .opaque_token
+        .as_deref()
+        .and_then(crate::registry::resolve);
 
     // Rate-limit per RESOLVED customer (D8) — never a gateway-supplied key. An
     // unresolvable token shares one bounded "unauthenticated" bucket so a
@@ -1390,7 +1500,10 @@ pub fn handle(req: SignRequest) -> SignResponse {
 /// `Zeroizing<Vec<u8>>` which wipes its bytes on drop — there is no log
 /// line, no debug print, no field that surfaces the plaintext outside
 /// this function's stack frame.
-fn handle_verify_blob(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_verify_blob(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     use sha2::{Digest, Sha256};
 
     // CR035 (red-team, 2026-05-29): collapse post-KMS failure modes into a
@@ -1439,7 +1552,9 @@ fn handle_verify_blob(req: SignRequest, identity: &crate::registry::ResolvedIden
         // load_secret_for itself never emits PolicyRequired today (the C18
         // gate lives in load_and_parse_blob), but keep the arm so a future
         // refactor that pushes the check earlier doesn't silently mismatch.
-        Err(LoadSecretError::PolicyRequired) => return SignResponse::err(err_code::POLICY_REQUIRED),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
     };
 
     // Gemini round-3 HIGH (refined in round-4): always parse the decrypted
@@ -1449,9 +1564,17 @@ fn handle_verify_blob(req: SignRequest, identity: &crate::registry::ResolvedIden
     // pre-flight hash never gives false confidence on a blob that the
     // actual sign path would reject.
     //
-    // Then, if `policy_required()` is set, additionally reject Legacy
+    // Then, if the strict floor applies, additionally reject Legacy
     // blobs (C18 mitigation: prevent verify_blob from being a back door
     // to hash legacy blobs on a strict-policy enclave).
+    //
+    // ROT-1 round-3: "the strict floor" here means the SAME predicate the sign
+    // path uses (`blob_floor_strict`), venue included — not the bare env flag.
+    // The invariant stated just above is that a pre-flight OK must not promise
+    // what signing would refuse, and after the mainnet floor became
+    // unconditional the bare flag no longer expresses it: on a permissive image
+    // a legacy `hyperliquid_main` blob would verify clean and then be refused at
+    // the first signature.
     let mut parsed = match ParsedBlob::from_plaintext(&plaintext) {
         Ok(p) => p,
         Err(_) => {
@@ -1480,11 +1603,18 @@ fn handle_verify_blob(req: SignRequest, identity: &crate::registry::ResolvedIden
         ParsedBlob::Legacy(v) => zeroize_json_value(v),
     }
 
-    if policy_required() && matches!(parsed, ParsedBlob::Legacy(_)) {
+    // ROT-1 round-3: the SAME predicate the sign path uses. The comment above
+    // states the invariant this must hold — an operator's pre-flight must never
+    // bless a blob the sign path refuses — and reading the bare env flag here
+    // while `load_and_parse_blob` reads `blob_floor_strict` would break exactly
+    // that on a permissive image: verify_blob 200-OK on an `hyperliquid_main`
+    // legacy blob that can never be signed with.
+    if blob_floor_strict(policy_required(), &venue) && matches!(parsed, ParsedBlob::Legacy(_)) {
         tracing::warn!(
             event = "verify_blob_legacy_rejected",
             s3_key = req.key_blob_s3_key.as_deref().unwrap_or("<unset>"),
-            "SIGNER_REQUIRE_POLICY=1 — legacy blob (no policy) rejected in verify_blob"
+            venue = %venue,
+            "legacy blob (no policy) rejected in verify_blob — strict floor"
         );
         drop(parsed);
         drop(plaintext);
@@ -1521,7 +1651,10 @@ fn handle_verify_blob(req: SignRequest, identity: &crate::registry::ResolvedIden
 /// UPL v0: supports policy-wrapped blobs `{"policy": {...}, "secret": {...}}`.
 /// Legacy flat blobs `{"key","secret","passphrase"}` remain supported
 /// (backward compatible, no policy enforcement).
-fn handle_sign_kucoin(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_kucoin(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let (Some(method), Some(path), Some(body), Some(ts)) = (
         req.method.as_deref(),
         req.path.as_deref(),
@@ -1561,7 +1694,11 @@ fn handle_sign_kucoin(req: SignRequest, identity: &crate::registry::ResolvedIden
     // CR051: kucoin has no sanctioned generic read/cancel route AND no structured
     // (cap-enforced) order route, so a capped kucoin key cannot use the generic
     // path at all — fail-closed (better than signing an uncapped kucoin order).
-    if policy.as_ref().and_then(|p| p.order_caps.as_ref()).is_some() {
+    if policy
+        .as_ref()
+        .and_then(|p| p.order_caps.as_ref())
+        .is_some()
+    {
         tracing::warn!(event = "generic_capped_denied", venue = "kucoin");
         return SignResponse::err(err_code::POLICY_DENIED);
     }
@@ -1625,14 +1762,30 @@ fn binance_request_allowed_params(op: &str) -> Option<&'static [&'static str]> {
         "account" => &["recvWindow", "timestamp"],
         "positionRisk" => &["symbol", "recvWindow", "timestamp"],
         "openOrders" => &["symbol", "recvWindow", "timestamp"],
-        "orderStatus" => {
-            &["symbol", "orderId", "origClientOrderId", "recvWindow", "timestamp"]
-        }
+        "orderStatus" => &[
+            "symbol",
+            "orderId",
+            "origClientOrderId",
+            "recvWindow",
+            "timestamp",
+        ],
         "userTrades" => &[
-            "symbol", "startTime", "endTime", "fromId", "limit", "recvWindow", "timestamp",
+            "symbol",
+            "startTime",
+            "endTime",
+            "fromId",
+            "limit",
+            "recvWindow",
+            "timestamp",
         ],
         "income" => &[
-            "symbol", "incomeType", "startTime", "endTime", "limit", "recvWindow", "timestamp",
+            "symbol",
+            "incomeType",
+            "startTime",
+            "endTime",
+            "limit",
+            "recvWindow",
+            "timestamp",
         ],
         // USER_STREAM: APIKEY-only (Binance ignores any signature). recvWindow /
         // timestamp are optional and harmless.
@@ -1657,7 +1810,13 @@ fn binance_request_allowed_params(op: &str) -> Option<&'static [&'static str]> {
             "recvWindow",
             "timestamp",
         ],
-        "cancel" => &["symbol", "orderId", "origClientOrderId", "recvWindow", "timestamp"],
+        "cancel" => &[
+            "symbol",
+            "orderId",
+            "origClientOrderId",
+            "recvWindow",
+            "timestamp",
+        ],
         "allOpenOrders" => &["symbol", "recvWindow", "timestamp"],
         "leverage" => &["symbol", "leverage", "recvWindow", "timestamp"],
         "positionMode" => &["dualSidePosition", "recvWindow", "timestamp"],
@@ -1716,12 +1875,13 @@ fn check_binance_request_allow(op: &str, payload: &str) -> Result<(), String> {
 /// them in `req.query`; we append `timestamp=<ms>&recvWindow=5000` ourselves.
 ///
 /// UPL v0: supports policy-wrapped blobs.
-fn handle_sign_binance(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
-    let (Some(method), Some(body), Some(ts)) = (
-        req.method.as_deref(),
-        req.body.as_deref(),
-        req.timestamp_ms,
-    ) else {
+fn handle_sign_binance(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
+    let (Some(method), Some(body), Some(ts)) =
+        (req.method.as_deref(), req.body.as_deref(), req.timestamp_ms)
+    else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
 
@@ -1755,7 +1915,10 @@ fn handle_sign_binance(req: SignRequest, identity: &crate::registry::ResolvedIde
 
     // CR051: a capped key may use the generic HMAC path only for enclave-vouched
     // safe reads/cancels — never to obtain an (uncapped) order signature.
-    if policy.as_ref().and_then(|p| p.order_caps.as_ref()).is_some()
+    if policy
+        .as_ref()
+        .and_then(|p| p.order_caps.as_ref())
+        .is_some()
         && !generic_capped_op_allowed(
             "binance",
             method,
@@ -1942,7 +2105,9 @@ fn enforce_order_cap(
     price: Option<&str>,
 ) -> Result<(), SignResponse> {
     let Some(p) = policy else { return Ok(()) };
-    let Some(caps) = p.order_caps.as_ref() else { return Ok(()) };
+    let Some(caps) = p.order_caps.as_ref() else {
+        return Ok(());
+    };
     let entry = match caps.iter().find(|c| c.symbol == symbol) {
         Some(e) => e,
         None => {
@@ -1972,9 +2137,7 @@ fn enforce_order_cap(
                 // against itself (only on this rare error path, so no hot-path
                 // cost); if that errors the policy is the culprit, otherwise the
                 // client `qty` is.
-                if crate::signer::cmp_positive_decimals(&entry.max_qty, &entry.max_qty)
-                    .is_err()
-                {
+                if crate::signer::cmp_positive_decimals(&entry.max_qty, &entry.max_qty).is_err() {
                     tracing::error!(
                         event = "order_cap_max_qty_malformed",
                         symbol = %symbol,
@@ -2108,7 +2271,13 @@ fn params_subset_of(q: &str, allowed: &[&str], required: &[&str]) -> bool {
     required.iter().all(|r| seen.contains(r))
 }
 
-fn generic_capped_op_allowed(venue: &str, method: &str, path: &str, query: &str, body: &str) -> bool {
+fn generic_capped_op_allowed(
+    venue: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+) -> bool {
     // No sanctioned read/cancel op carries a body — reject any body outright so
     // order params can't be smuggled past the (method, path, query) checks.
     if !body.is_empty() {
@@ -2129,7 +2298,11 @@ fn generic_capped_op_allowed(venue: &str, method: &str, path: &str, query: &str,
         Some((p, q)) => (p, q),
         None => (path, ""),
     };
-    let q = if !embedded.is_empty() { embedded } else { query };
+    let q = if !embedded.is_empty() {
+        embedded
+    } else {
+        query
+    };
     let empty = q.is_empty();
     // Exactly `key=<token>` (safe alphanumeric / `-` / `_`), no extra params —
     // rejects appending order fields (`&side=BUY&quantity=...`) to a read query.
@@ -2167,7 +2340,14 @@ fn generic_capped_op_allowed(venue: &str, method: &str, path: &str, query: &str,
             // rejects unknown/dup keys + non-token values (no order-field smuggle).
             ("GET", "/fapi/v1/userTrades") => params_subset_of(
                 q,
-                &["symbol", "orderId", "startTime", "endTime", "fromId", "limit"],
+                &[
+                    "symbol",
+                    "orderId",
+                    "startTime",
+                    "endTime",
+                    "fromId",
+                    "limit",
+                ],
                 &["symbol"],
             ),
             ("DELETE", "/fapi/v1/allOpenOrders") => single_filter("symbol"),
@@ -2182,7 +2362,9 @@ fn generic_capped_op_allowed(venue: &str, method: &str, path: &str, query: &str,
             // rejects unknown/dup keys + non-token values (no order smuggle).
             ("GET", "/api/v5/trade/fills-history") => params_subset_of(
                 q,
-                &["instType", "instId", "ordId", "after", "before", "begin", "end", "limit"],
+                &[
+                    "instType", "instId", "ordId", "after", "before", "begin", "end", "limit",
+                ],
                 &["instType"],
             ),
             _ => false,
@@ -2260,7 +2442,10 @@ fn enforce_x402_cap(
     // early break) for timing uniformity; a malformed entry is an operator
     // config error → fail closed.
     let Some(recipients) = cap.allowed_recipients.as_ref() else {
-        tracing::warn!(event = "x402_policy_required", reason = "no_allowed_recipients");
+        tracing::warn!(
+            event = "x402_policy_required",
+            reason = "no_allowed_recipients"
+        );
         return Err(SignResponse::err(err_code::POLICY_REQUIRED));
     };
     let mut recipient_ok = false;
@@ -2342,6 +2527,31 @@ fn enforce_hl_caps(
     // (2) Per-asset size caps — order actions only (cancels carry no size).
     if let Some(caps) = p.hl_order_caps.as_ref() {
         if let Some(orders) = action.get("orders").and_then(|v| v.as_array()) {
+            // ROT-1 round-3: the per-order pass below bounds ONE order; this
+            // accumulator bounds the whole action. `orders[]` is a batch under a
+            // SINGLE signature, and the gateway's daily counter (B3.б) charges
+            // that batch as one request — so a per-order-only cap bounded
+            // nothing the operator could reason about: N orders at the cap each
+            // rode out together, and the "worst-case exposure = per-order cap ×
+            // daily cap" arithmetic in `gateway/src/limits.rs` was simply wrong.
+            // Grouped by asset INDEX because that is what the cap is keyed by.
+            //
+            // A Vec with a linear scan, not a HashMap: an action carries a
+            // handful of distinct assets (and at most HL_MAX_ENTRIES_PER_ACTION
+            // orders), so this is smaller and allocation-cheaper, and it keeps
+            // the deny order deterministic — first offending asset in wire
+            // order, which is what an operator reading the log expects.
+            struct AssetTotal<'a> {
+                asset: u64,
+                cap: &'a crate::proto::HlOrderCap,
+                /// Every `orders[].s` seen for this asset, in wire order.
+                sizes: Vec<&'a str>,
+                /// `(size, price)` pairs — populated ONLY when the asset's cap
+                /// carries `max_notional`, so an empty list means "no notional
+                /// cap to enforce", not "no orders".
+                notionals: Vec<(&'a str, &'a str)>,
+            }
+            let mut totals: Vec<AssetTotal> = Vec::new();
             for order in orders {
                 // `a` (asset index) + `s` (size string) are REQUIRED to size-cap;
                 // missing them under an active cap is fail-closed bad_request.
@@ -2390,6 +2600,7 @@ fn enforce_hl_caps(
                 // trigger order's `p` is not the execution bound when
                 // `isMarket` fires market-side, so trigger-shaped orders are
                 // denied fail-closed under a notional cap.
+                let mut notional_pair: Option<(&str, &str)> = None;
                 if let Some(max_notional) = cap.max_notional.as_deref() {
                     if order.get("t").and_then(|t| t.get("limit")).is_none() {
                         tracing::warn!(
@@ -2416,9 +2627,7 @@ fn enforce_hl_caps(
                         Ok(false) => {}
                         Err(_) => {
                             // Blame attribution mirrors max_size above.
-                            if crate::signer::notional_exceeds("1", "1", max_notional)
-                                .is_err()
-                            {
+                            if crate::signer::notional_exceeds("1", "1", max_notional).is_err() {
                                 tracing::error!(
                                     event = "hl_order_cap_max_notional_malformed",
                                     asset = asset,
@@ -2428,6 +2637,151 @@ fn enforce_hl_caps(
                             }
                             tracing::warn!(
                                 event = "hl_order_cap_notional_malformed",
+                                asset = asset,
+                            );
+                            return Err(SignResponse::err(err_code::BAD_REQUEST));
+                        }
+                    }
+                    notional_pair = Some((size, px));
+                }
+
+                // Accumulate for the aggregate pass. Reached only AFTER every
+                // per-order check passed, so the operands here are already known
+                // to parse — the aggregate cannot be the first thing to notice a
+                // malformed number, only the first to notice a malformed BATCH.
+                //
+                // EVERY order counts, `r: true` (reduce-only) included, and that
+                // is a deliberate choice against the obvious objection. The
+                // objection: Hyperliquid's take-profit/stop-loss bundle carries
+                // an entry plus two reduce-only exits of the same size, so
+                // summing all three triple-counts a position that never exceeds
+                // the entry. Why we sum anyway:
+                //
+                //   * The cap bounds the SIZE a signature may move, not the net
+                //     change in exposure. A reduce-only order is still an
+                //     executable trade at a price the requester chooses — 64 of
+                //     them close a position accumulated over previous signatures
+                //     at whatever prices a compromised gateway picks, under ONE
+                //     daily-counter increment. Exempting them re-opens exactly
+                //     the burst this aggregate exists to bound.
+                //   * The same distrust is already settled precedent one screen
+                //     up: under a notional cap, trigger-shaped orders are denied
+                //     fail-closed because their `p` is not the execution bound.
+                //     Cancels are exempt for a different and stronger reason —
+                //     they cannot execute a trade at all.
+                //   * The bundle it would cost us is not a shape our clients
+                //     send: both shipped SDKs build exactly one order per action
+                //     (`sdk/python/…/hyperliquid_main.py`, `sdk/typescript/…`),
+                //     and a single-order action never reaches this pass. Anyone
+                //     hand-rolling a bundle can send the exits as their own
+                //     single-order actions, which the aggregate does not touch.
+                //
+                // So the conservative rule costs a flow nobody here sends and
+                // buys a bound that holds without trusting the venue.
+                match totals.iter_mut().find(|t| t.asset == asset) {
+                    Some(total) => {
+                        total.sizes.push(size);
+                        if let Some(pair) = notional_pair {
+                            total.notionals.push(pair);
+                        }
+                    }
+                    None => totals.push(AssetTotal {
+                        asset,
+                        cap,
+                        sizes: vec![size],
+                        notionals: notional_pair.map(|p| vec![p]).unwrap_or_default(),
+                    }),
+                }
+            }
+
+            // Aggregate pass: Σ per asset against the SAME cap. A single-order
+            // asset is skipped — its sum is the value the per-order pass already
+            // compared, so this adds no new verdict and cannot regress a shape
+            // that worked before this fix.
+            for AssetTotal {
+                asset,
+                cap,
+                sizes,
+                notionals,
+            } in &totals
+            {
+                if sizes.len() > 1 {
+                    match crate::signer::sum_exceeds(sizes, &cap.max_size) {
+                        Ok(true) => {
+                            tracing::warn!(
+                                event = "hl_order_cap_asset_total_exceeded",
+                                asset = asset,
+                                orders = sizes.len(),
+                                max_size = %cap.max_size,
+                            );
+                            return Err(SignResponse::err(err_code::POLICY_DENIED));
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            // Since the two decimal validators were unified,
+                            // anything the aggregate cannot parse the per-order
+                            // pass has already rejected — so this arm is a
+                            // guard, not an active path, and it is kept for the
+                            // day the two drift apart again (they did once).
+                            // It stays fail-closed and attributes blame the same
+                            // way the per-order pass does: probe the POLICY
+                            // operand alone first, because reporting a bad cap
+                            // as the client's bad request sends an operator
+                            // looking in the wrong place.
+                            if crate::signer::sum_exceeds(&["1"], &cap.max_size).is_err() {
+                                tracing::error!(
+                                    event = "hl_order_cap_max_size_malformed",
+                                    asset = asset,
+                                    max_size = %cap.max_size,
+                                    "policy operand rejected by the aggregate parser — server config error"
+                                );
+                                return Err(SignResponse::err(err_code::INTERNAL_ERROR));
+                            }
+                            tracing::warn!(
+                                event = "hl_order_cap_asset_total_malformed",
+                                asset = asset,
+                            );
+                            return Err(SignResponse::err(err_code::BAD_REQUEST));
+                        }
+                    }
+                }
+                if notionals.len() > 1 {
+                    // Present only when the cap carries `max_notional` (the
+                    // per-order pass pushes a pair exactly then), so the unwrap
+                    // below cannot be reached with a `None` cap field.
+                    let Some(max_notional) = cap.max_notional.as_deref() else {
+                        tracing::error!(
+                            event = "hl_order_cap_notional_accumulated_without_cap",
+                            asset = asset,
+                        );
+                        return Err(SignResponse::err(err_code::INTERNAL_ERROR));
+                    };
+                    match crate::signer::notional_sum_exceeds(notionals, max_notional) {
+                        Ok(true) => {
+                            tracing::warn!(
+                                event = "hl_order_cap_asset_notional_total_exceeded",
+                                asset = asset,
+                                orders = notionals.len(),
+                                max_notional = %max_notional,
+                            );
+                            return Err(SignResponse::err(err_code::POLICY_DENIED));
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            // Same attribution rule as the size aggregate above.
+                            if crate::signer::notional_sum_exceeds(&[("1", "1")], max_notional)
+                                .is_err()
+                            {
+                                tracing::error!(
+                                    event = "hl_order_cap_max_notional_malformed",
+                                    asset = asset,
+                                    max_notional = %max_notional,
+                                    "policy operand rejected by the aggregate parser — server config error"
+                                );
+                                return Err(SignResponse::err(err_code::INTERNAL_ERROR));
+                            }
+                            tracing::warn!(
+                                event = "hl_order_cap_asset_notional_total_malformed",
                                 asset = asset,
                             );
                             return Err(SignResponse::err(err_code::BAD_REQUEST));
@@ -2445,7 +2799,10 @@ fn enforce_hl_caps(
 /// builds the form-urlencoded canonical INSIDE the enclave (asterdex-T1 rule),
 /// signs it, and returns the canonical bytes alongside the auth headers so the
 /// gateway can append `&signature=<hex>` to form the final wire body.
-fn handle_sign_binance_order(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_binance_order(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let Some(order) = req.order.as_ref() else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
@@ -2458,7 +2815,9 @@ fn handle_sign_binance_order(req: SignRequest, identity: &crate::registry::Resol
         Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
         Err(LoadSecretError::KmsDenied) => return SignResponse::err(err_code::KMS_DECRYPT_DENIED),
         Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
-        Err(LoadSecretError::PolicyRequired) => return SignResponse::err(err_code::POLICY_REQUIRED),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
     };
 
     // Action whitelist + method/path checks. The gateway forwards the venue-
@@ -2473,7 +2832,12 @@ fn handle_sign_binance_order(req: SignRequest, identity: &crate::registry::Resol
     };
 
     // Per-asset cap (symbol must be in order_caps; qty ≤ max_qty).
-    if let Err(resp) = enforce_order_cap(policy.as_ref(), &order.symbol, Some(&order.qty), order.price.as_deref()) {
+    if let Err(resp) = enforce_order_cap(
+        policy.as_ref(),
+        &order.symbol,
+        Some(&order.qty),
+        order.price.as_deref(),
+    ) {
         return resp;
     }
 
@@ -2481,7 +2845,13 @@ fn handle_sign_binance_order(req: SignRequest, identity: &crate::registry::Resol
     // reduce_only/ord_type/coid — the dimensions the cap does NOT bound) before
     // the venue signature, when the policy opts in via `intent_pubkey`.
     if let Err(resp) = enforce_agent_intent_order(
-        policy.as_ref(), identity, "binance", "sign_binance_order", ts, order, &req,
+        policy.as_ref(),
+        identity,
+        "binance",
+        "sign_binance_order",
+        ts,
+        order,
+        &req,
     ) {
         return resp;
     }
@@ -2515,7 +2885,10 @@ fn handle_sign_binance_order(req: SignRequest, identity: &crate::registry::Resol
 /// Same shape as the order builder, structured `CancelRequest` in, canonical
 /// querystring out. The symbol must still be in `order_caps` (allow-list
 /// reused so a key restricted to `BTCUSDT` cannot cancel `ETHUSDT` orders).
-fn handle_sign_binance_cancel(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_binance_cancel(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let Some(cancel) = req.cancel.as_ref() else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
@@ -2528,7 +2901,9 @@ fn handle_sign_binance_cancel(req: SignRequest, identity: &crate::registry::Reso
         Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
         Err(LoadSecretError::KmsDenied) => return SignResponse::err(err_code::KMS_DECRYPT_DENIED),
         Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
-        Err(LoadSecretError::PolicyRequired) => return SignResponse::err(err_code::POLICY_REQUIRED),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
     };
 
     let policy_hash = match enforce_policy(policy.as_ref(), &req) {
@@ -2544,7 +2919,13 @@ fn handle_sign_binance_cancel(req: SignRequest, identity: &crate::registry::Reso
     // AF-2: agent-signed-intent (opt-in) — bind symbol/order_id so a gateway
     // cannot re-target the cancel. Nonce = intent_nonce (UUID).
     if let Err(resp) = enforce_agent_intent_cancel(
-        policy.as_ref(), identity, "binance", "sign_binance_cancel", ts, cancel, &req,
+        policy.as_ref(),
+        identity,
+        "binance",
+        "sign_binance_cancel",
+        ts,
+        cancel,
+        &req,
     ) {
         return resp;
     }
@@ -2580,7 +2961,10 @@ fn handle_sign_binance_cancel(req: SignRequest, identity: &crate::registry::Reso
 /// exact), and signs that EXACT byte string. The same byte string is returned
 /// via `SignResponse.canonical_body` for the gateway to forward verbatim —
 /// re-serialization downstream would invalidate the HMAC.
-fn handle_sign_okx_order(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_okx_order(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let Some(order) = req.order.as_ref() else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
@@ -2593,7 +2977,9 @@ fn handle_sign_okx_order(req: SignRequest, identity: &crate::registry::ResolvedI
         Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
         Err(LoadSecretError::KmsDenied) => return SignResponse::err(err_code::KMS_DECRYPT_DENIED),
         Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
-        Err(LoadSecretError::PolicyRequired) => return SignResponse::err(err_code::POLICY_REQUIRED),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
     };
 
     let policy_hash = match enforce_policy(policy.as_ref(), &req) {
@@ -2601,13 +2987,24 @@ fn handle_sign_okx_order(req: SignRequest, identity: &crate::registry::ResolvedI
         Err(resp) => return resp,
     };
 
-    if let Err(resp) = enforce_order_cap(policy.as_ref(), &order.symbol, Some(&order.qty), order.price.as_deref()) {
+    if let Err(resp) = enforce_order_cap(
+        policy.as_ref(),
+        &order.symbol,
+        Some(&order.qty),
+        order.price.as_deref(),
+    ) {
         return resp;
     }
 
     // AF-2: agent-signed-intent (opt-in) — verify full order intent pre-venue-sign.
     if let Err(resp) = enforce_agent_intent_order(
-        policy.as_ref(), identity, "okx", "sign_okx_order", ts, order, &req,
+        policy.as_ref(),
+        identity,
+        "okx",
+        "sign_okx_order",
+        ts,
+        order,
+        &req,
     ) {
         return resp;
     }
@@ -2629,8 +3026,7 @@ fn handle_sign_okx_order(req: SignRequest, identity: &crate::registry::ResolvedI
     // until its own drop). Gemini #79 — same fix as the Binance path (#78). The
     // passphrase below is borrowed via `as_bytes()` (no copy) and wiped by
     // `OkxSecret`'s `Drop`, so it needs no move. `secret` is not read again.
-    let secret_bytes =
-        Zeroizing::new(std::mem::take(&mut secret_triple.secret).into_bytes());
+    let secret_bytes = Zeroizing::new(std::mem::take(&mut secret_triple.secret).into_bytes());
     let passphrase_bytes = secret_triple.passphrase.as_bytes();
     match signer::compute_okx_headers(
         &secret_bytes,
@@ -2654,7 +3050,10 @@ fn handle_sign_okx_order(req: SignRequest, identity: &crate::registry::ResolvedI
 /// exact JSON treatment as the order builder. Symbol must still be in the
 /// policy's `order_caps` allow-list (the key restricted to BTC-USDT-SWAP
 /// can't cancel ETH-USDT-SWAP orders).
-fn handle_sign_okx_cancel(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_okx_cancel(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let Some(cancel) = req.cancel.as_ref() else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
@@ -2667,7 +3066,9 @@ fn handle_sign_okx_cancel(req: SignRequest, identity: &crate::registry::Resolved
         Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
         Err(LoadSecretError::KmsDenied) => return SignResponse::err(err_code::KMS_DECRYPT_DENIED),
         Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
-        Err(LoadSecretError::PolicyRequired) => return SignResponse::err(err_code::POLICY_REQUIRED),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
     };
 
     let policy_hash = match enforce_policy(policy.as_ref(), &req) {
@@ -2681,7 +3082,13 @@ fn handle_sign_okx_cancel(req: SignRequest, identity: &crate::registry::Resolved
 
     // AF-2: agent-signed-intent (opt-in) — nonce = intent_nonce (UUID).
     if let Err(resp) = enforce_agent_intent_cancel(
-        policy.as_ref(), identity, "okx", "sign_okx_cancel", ts, cancel, &req,
+        policy.as_ref(),
+        identity,
+        "okx",
+        "sign_okx_cancel",
+        ts,
+        cancel,
+        &req,
     ) {
         return resp;
     }
@@ -2703,8 +3110,7 @@ fn handle_sign_okx_cancel(req: SignRequest, identity: &crate::registry::Resolved
     // until its own drop). Gemini #79 — same fix as the Binance path (#78). The
     // passphrase below is borrowed via `as_bytes()` (no copy) and wiped by
     // `OkxSecret`'s `Drop`, so it needs no move. `secret` is not read again.
-    let secret_bytes =
-        Zeroizing::new(std::mem::take(&mut secret_triple.secret).into_bytes());
+    let secret_bytes = Zeroizing::new(std::mem::take(&mut secret_triple.secret).into_bytes());
     let passphrase_bytes = secret_triple.passphrase.as_bytes();
     match signer::compute_okx_headers(
         &secret_bytes,
@@ -2731,12 +3137,13 @@ fn handle_sign_okx_cancel(req: SignRequest, identity: &crate::registry::Resolved
 /// the payload is the query string; for POST/PUT it's the body.
 ///
 /// UPL v0: supports policy-wrapped blobs.
-fn handle_sign_bybit(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
-    let (Some(method), Some(body), Some(ts)) = (
-        req.method.as_deref(),
-        req.body.as_deref(),
-        req.timestamp_ms,
-    ) else {
+fn handle_sign_bybit(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
+    let (Some(method), Some(body), Some(ts)) =
+        (req.method.as_deref(), req.body.as_deref(), req.timestamp_ms)
+    else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
 
@@ -2770,7 +3177,11 @@ fn handle_sign_bybit(req: SignRequest, identity: &crate::registry::ResolvedIdent
     // CR051: bybit has no sanctioned generic read/cancel route AND no structured
     // (cap-enforced) order route, so a capped bybit key cannot use the generic
     // path at all — fail-closed (better than signing an uncapped bybit order).
-    if policy.as_ref().and_then(|p| p.order_caps.as_ref()).is_some() {
+    if policy
+        .as_ref()
+        .and_then(|p| p.order_caps.as_ref())
+        .is_some()
+    {
         tracing::warn!(event = "generic_capped_denied", venue = "bybit");
         return SignResponse::err(err_code::POLICY_DENIED);
     }
@@ -2785,7 +3196,14 @@ fn handle_sign_bybit(req: SignRequest, identity: &crate::registry::ResolvedIdent
 
     let secret_bytes = Zeroizing::new(secret_pair.secret.as_bytes().to_vec());
 
-    match signer::compute_bybit_headers(&secret_bytes, &secret_pair.key, ts, method, user_query, body) {
+    match signer::compute_bybit_headers(
+        &secret_bytes,
+        &secret_pair.key,
+        ts,
+        method,
+        user_query,
+        body,
+    ) {
         Ok(headers) => SignResponse::ok_headers(headers).with_policy_hash(policy_hash),
         Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
     }
@@ -2865,7 +3283,10 @@ fn handle_sign_okx(req: SignRequest, identity: &crate::registry::ResolvedIdentit
     // request_path above; the gate's path-contains-? && query-non-empty guard is
     // therefore a dead-but-deliberate safety net for any future caller that
     // forgets to merge first.
-    if policy.as_ref().and_then(|p| p.order_caps.as_ref()).is_some()
+    if policy
+        .as_ref()
+        .and_then(|p| p.order_caps.as_ref())
+        .is_some()
         && !generic_capped_op_allowed("okx", method, &request_path, "", body)
     {
         tracing::warn!(event = "generic_capped_denied", venue = "okx");
@@ -2935,15 +3356,25 @@ fn handle_sign_okx(req: SignRequest, identity: &crate::registry::ResolvedIdentit
 ///
 /// UPL v0: extracts and enforces the co-encrypted policy before returning
 /// the secret. If the policy denies the request, returns `policy_denied`.
-// The load/decrypt/cap-enforce path shared by the HL TESTNET dispatcher
-// (`sign_hyperliquid_testnet` below, source="b"). deny-HL-main (2026-06-26)
-// removed the mainnet callers — they now hard-deny BEFORE any secret load — and
-// this was retained for the testnet ticket; it is now wired.
+// The load/decrypt/cap-enforce path shared by BOTH HL dispatchers —
+// `sign_hyperliquid_mainnet` (source="a") and `sign_hyperliquid_testnet`
+// (source="b"). It was testnet-only while deny-HL-main (2026-06-26) stood;
+// ROT-1 removed that deny, so the mainnet callers are back on this same path
+// deliberately — one floor, not two that can drift.
 #[allow(clippy::result_large_err, clippy::type_complexity)]
 fn load_hyperliquid_request(
     req: &SignRequest,
     identity: &crate::registry::ResolvedIdentity,
-) -> Result<(HyperliquidSecret, serde_json::Value, u64, Option<[u8; 20]>, Option<String>), SignResponse> {
+) -> Result<
+    (
+        HyperliquidSecret,
+        serde_json::Value,
+        u64,
+        Option<[u8; 20]>,
+        Option<String>,
+    ),
+    SignResponse,
+> {
     // 1. Action JSON + nonce required.
     let Some(action) = req.hl_action.as_ref() else {
         return Err(SignResponse::err(err_code::BAD_REQUEST));
@@ -3016,9 +3447,56 @@ fn load_hyperliquid_request(
     Ok((secret, action.clone(), nonce, vault, policy_hash))
 }
 
+/// ROT-1 round-3: hard ceiling on how many entries one Hyperliquid action may
+/// carry, enforced on the SHAPE — i.e. before the KMS round-trip, in the same
+/// spirit as `ASTERDEX_MAX_BODY_LEN`.
+///
+/// Why a ceiling at all, given the aggregate cap. Two different bounds:
+/// `enforce_hl_caps` bounds the SIZE a batch may move (Σ per asset ≤ cap);
+/// this bounds the COUNT of entries the enclave will parse and sign at once.
+/// Without it the only limit was the 64 KiB vsock frame — roughly nine hundred
+/// minimal orders in one signature — and a `cancel` action carries no size at
+/// all, so the aggregate cap does not constrain it in any way.
+///
+/// The number is OURS, not the venue's: Hyperliquid publishes no batch limit we
+/// can cite, so this is a deliberate operational ceiling — an order of magnitude
+/// below what the frame allows, and comfortably above the batch shapes this
+/// codebase constructs (a TP/SL bundle is three entries; the hedge route builds
+/// two legs). Changing it is a one-constant change, but it changes the enclave
+/// measurement, so it belongs to a rotation rather than to a config knob.
+const HL_MAX_ENTRIES_PER_ACTION: usize = 64;
+
+/// Is EVERY entry array in this action within the ceiling?
+///
+/// Checks both `orders` and `cancels` regardless of the action's declared
+/// `type`, and that is the point: an action is a free-form JSON object whose
+/// EVERY field is covered by the signature, so a `cancel` may carry a stray
+/// `orders` array (and vice versa). A ceiling that inspects only the field
+/// matching the declared type is the same defect one level up that this whole
+/// change is about — a check that looks only where it expects the input to be.
+/// Hyperliquid would reject the resulting action hash, but "the venue would
+/// refuse it" is not a bound the enclave gets to rely on.
+fn hl_entry_arrays_within_ceiling(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    for field in ["orders", "cancels"] {
+        if let Some(entries) = obj.get(field).and_then(|v| v.as_array()) {
+            if entries.len() > HL_MAX_ENTRIES_PER_ACTION {
+                tracing::warn!(
+                    event = "hl_action_too_many_entries",
+                    field = field,
+                    count = entries.len(),
+                    max = HL_MAX_ENTRIES_PER_ACTION,
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Validate that an `order` action has the minimum required Hyperliquid
-/// shape: top-level `type=="order"` and `orders` is a non-empty array.
-/// Schema validation is intentionally narrow — we don't enforce inner
+/// shape: top-level `type=="order"` and `orders` is a non-empty array, with
+/// every entry array within `HL_MAX_ENTRIES_PER_ACTION`.
+/// Schema validation is otherwise intentionally narrow — we don't enforce inner
 /// field types because Hyperliquid's API will reject malformed orders
 /// itself and we'd rather not duplicate the validation surface.
 fn validate_order_action(action: &serde_json::Value) -> bool {
@@ -3034,11 +3512,16 @@ fn validate_order_action(action: &serde_json::Value) -> bool {
     let Some(orders) = obj.get("orders").and_then(|v| v.as_array()) else {
         return false;
     };
+    if !hl_entry_arrays_within_ceiling(obj) {
+        return false;
+    }
     !orders.is_empty()
 }
 
 /// Validate that a `cancel` action has top-level `type=="cancel"` and
-/// `cancels` is a non-empty array.
+/// `cancels` is a non-empty array, with every entry array within
+/// `HL_MAX_ENTRIES_PER_ACTION`. Cancels carry no size, so the ceiling is the
+/// ONLY bound on how much one cancel signature may do.
 fn validate_cancel_action(action: &serde_json::Value) -> bool {
     let Some(obj) = action.as_object() else {
         return false;
@@ -3052,11 +3535,17 @@ fn validate_cancel_action(action: &serde_json::Value) -> bool {
     let Some(cancels) = obj.get("cancels").and_then(|v| v.as_array()) else {
         return false;
     };
+    if !hl_entry_arrays_within_ceiling(obj) {
+        return false;
+    }
     !cancels.is_empty()
 }
 
 /// `sign_hyperliquid_main_order` — sign a Hyperliquid mainnet order.
-fn handle_sign_hyperliquid_main_order(req: SignRequest, _identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_hyperliquid_main_order(
+    req: SignRequest,
+    _identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     // Validate action shape BEFORE the KMS round-trip. The shape check
     // is cheap (one JSON walk) and doesn't need any secret material; we
     // want a wrong action type to fail fast with `bad_request` regardless
@@ -3071,18 +3560,49 @@ fn handle_sign_hyperliquid_main_order(req: SignRequest, _identity: &crate::regis
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
-    // SECURITY (deny-HL-main, 2026-06-26): `sign_hyperliquid` is hardcoded to
-    // source="a" (Hyperliquid MAINNET — real funds on Arbitrum). A testnet/demo
-    // signer must NEVER emit a real-money HL signature, so we HARD-DENY here,
-    // BEFORE loading or decrypting any secret. This also covers the generic
-    // `/sign` and `/hedge` paths — both dispatch this action to this handler
-    // (see `handle_sign`). HL testnet (source="b") is a separate, gated ticket.
-    tracing::warn!(event = "hyperliquid_main_denied", op = "order");
-    SignResponse::err(err_code::POLICY_DENIED)
+    // ROT-1 (2026-08-05): the hard-deny that stood here is LIFTED. Its stated
+    // reason — "a testnet/demo signer must never emit a real-money HL
+    // signature" — described a lane that no longer exists: this is the mainnet
+    // lane, and the key it now signs with is an AGENT key minted in-enclave
+    // (`provision_agent_key`) whose address the account owner approved from
+    // their own wallet.
+    //
+    // What replaces the blanket deny is not "nothing" — it is the ordinary
+    // money-venue floor, enforced per request. Inside `load_hyperliquid_request`:
+    // an authority-signed policy, `hl_order_caps` binding by asset INDEX both
+    // per order and SUMMED per asset across the batch, the vault allow-list, and
+    // a check that the address derived from the decrypted key matches the
+    // `wallet_address` stapled into that same sealed blob. Plus one gate that is
+    // NOT in there and is named separately for that reason: the ceiling on
+    // entries per action lives in `validate_order_action` / `validate_cancel_action`,
+    // i.e. in the line directly above this comment, because it must run before
+    // the KMS round-trip.
+    //
+    // That last one binds the key to the address the OPERATOR sealed alongside
+    // it — it is not a policy binding, and an earlier version of this comment
+    // said "the one the policy names", which does not exist: `Policy` has no
+    // wallet-address field (`allowed_vaults` constrains the vault a request may
+    // trade FOR, not the signing address). Worth stating precisely, because the
+    // guarantee it actually provides is narrower: it catches an operator who
+    // staples mismatched key/address, not a gateway choosing a different key.
+    //
+    // The floor's strictness is NOT contingent on the build flag here: the
+    // blanket deny it replaced was unconditional, so `floor_is_unconditional`
+    // keeps `hyperliquid_main` strict even on a permissive EIF.
+    //
+    // The withdrawal floor stays OUTSIDE our code and must keep being stated
+    // that way: Hyperliquid L1 rejects withdrawals initiated by an agent. That
+    // is a property of the venue, not of this enclave — the honest claim is
+    // that the key we hold provably never existed outside an attested enclave,
+    // not that we prevent withdrawal.
+    sign_hyperliquid_mainnet(req, _identity)
 }
 
 /// `sign_hyperliquid_main_cancel` — sign a Hyperliquid mainnet cancel.
-fn handle_sign_hyperliquid_main_cancel(req: SignRequest, _identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_hyperliquid_main_cancel(
+    req: SignRequest,
+    _identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     // Mirror `handle_sign_hyperliquid_main_order` — validate action shape
     // before the KMS round-trip for predictable error semantics and so
     // tests don't need a fake KMS endpoint.
@@ -3093,24 +3613,25 @@ fn handle_sign_hyperliquid_main_cancel(req: SignRequest, _identity: &crate::regi
         return SignResponse::err(err_code::BAD_REQUEST);
     }
 
-    // SECURITY (deny-HL-main, 2026-06-26): mainnet HL signing hard-disabled
-    // (source="a" = real Arbitrum funds). HARD-DENY before any secret load;
-    // covers the generic `/sign` + `/hedge` paths. HL testnet (source="b") is a
-    // separate, deliberately-gated ticket.
-    tracing::warn!(event = "hyperliquid_main_denied", op = "cancel");
-    SignResponse::err(err_code::POLICY_DENIED)
+    // ROT-1: deny lifted, see `handle_sign_hyperliquid_main_order`. Cancels are
+    // order-INCAPABLE by design (`ORDER_INCAPABLE_ACTIONS` in policy-cli), so
+    // no cap binds them — but they still cross the same blob-load floor, which
+    // is what makes an uncapped mainnet key unusable for cancels too.
+    sign_hyperliquid_mainnet(req, _identity)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// HL TESTNET dispatcher (source="b") — the ALLOWED Hyperliquid path.
+// HL TESTNET dispatcher (source="b").
 // ─────────────────────────────────────────────────────────────────────────
 //
-// Same crypto as the (hard-denied) mainnet handlers — `signer::sign_hyperliquid`
-// with the SHARED L1 phantom-agent domain (chainId 1337, "Exchange"). The ONLY
+// Same crypto as the mainnet handlers — `signer::sign_hyperliquid` with the
+// SHARED L1 phantom-agent domain (chainId 1337, "Exchange"). The ONLY
 // difference is the phantom-agent `source`: "b" = Hyperliquid TESTNET (mock
-// funds, api.hyperliquid-testnet.xyz), vs "a" = mainnet (real Arbitrum funds,
-// hard-denied). No crypto is duplicated. The sealed key is the demo AGENT wallet
-// (its own `hyperliquid_testnet` venue blob + tenant grant); the agent can
+// funds, api.hyperliquid-testnet.xyz), vs "a" = mainnet (real Arbitrum funds).
+// No crypto is duplicated. What separates the two is NOT this code but what
+// each key may do: a separate venue grant, a separate KMS context, a separate
+// sealed blob, and — since ROT-1 — an unconditional policy floor on mainnet
+// only. The sealed testnet key is the demo AGENT wallet; the agent can
 // place/cancel but L1 rejects agent withdrawals — the DEX-demo isolation proof.
 
 /// `sign_hyperliquid_testnet_order` — sign a Hyperliquid TESTNET order (source="b").
@@ -3146,6 +3667,37 @@ fn handle_sign_hyperliquid_testnet_cancel(
 /// Shared testnet sign tail: load+decrypt+policy/cap-enforce (`load_hyperliquid_request`),
 /// then sign with `source="b"`. The venue ACL (`hyperliquid_testnet`) + KMS context
 /// keep this bound to the demo agent identity.
+/// ROT-1: `source="a"` — Hyperliquid MAINNET. Twin of `sign_hyperliquid_testnet`
+/// below and deliberately nothing more than that.
+///
+/// The entire tail — action and nonce parsing, vault parsing, KMS decrypt,
+/// `enforce_policy`, `enforce_hl_caps` (vault allow-list + per-asset-index
+/// caps), and the check that the address derived from the decrypted key matches
+/// the one claimed — lives in `load_hyperliquid_request` and is shared verbatim
+/// with testnet. Duplicating any of it here would create two floors that can
+/// drift apart, and the one that drifts is always the one nobody is reading.
+///
+/// The single difference from testnet is the phantom-agent `source` byte.
+fn sign_hyperliquid_mainnet(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
+    let (secret, action, nonce, vault, policy_hash) = match load_hyperliquid_request(&req, identity)
+    {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
+        Ok(k) => k,
+        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+    };
+    let sig = match crate::signer::sign_hyperliquid(&pk, &action, nonce, vault, "a") {
+        Ok(s) => s,
+        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+    };
+    SignResponse::ok_hl_signature(sig).with_policy_hash(policy_hash)
+}
+
 fn sign_hyperliquid_testnet(
     req: SignRequest,
     identity: &crate::registry::ResolvedIdentity,
@@ -3159,8 +3711,9 @@ fn sign_hyperliquid_testnet(
         Ok(k) => k,
         Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
     };
-    // source="b" = Hyperliquid TESTNET. This is the ONLY HL signing path the
-    // enclave permits; mainnet (source="a") is hard-denied above.
+    // source="b" = Hyperliquid TESTNET. The mainnet twin above passes "a"; the
+    // byte is the whole difference at this layer, which is why the floors that
+    // decide WHO may reach either one live in `load_hyperliquid_request`.
     let sig = match crate::signer::sign_hyperliquid(&pk, &action, nonce, vault, "b") {
         Ok(s) => s,
         Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
@@ -3179,7 +3732,10 @@ fn sign_hyperliquid_testnet(
 // canonical-v1 (JCS) is computed in-enclave; the buyer ecrecovers the address.
 // No caps / no funds. EIP-712 disjointness is in signer::ATTESTED_DATA_DOMAIN_V1.
 // ─────────────────────────────────────────────────────────────────────────
-fn handle_sign_data(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_data(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let Some(data_raw) = req.data.as_deref() else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
@@ -3242,6 +3798,269 @@ fn handle_sign_data(req: SignRequest, identity: &crate::registry::ResolvedIdenti
     })
 }
 
+/// ROT-9: the policy sealed into every provisioned data-signing blob, split
+/// into the literals that bracket the key material.
+///
+/// The allow-list is the point of this change, not decoration. Read
+/// `build_data_key_plaintext` before touching either literal.
+const DATA_KEY_POLICY_PREFIX: &[u8] = br#"{"policy":{"allowed_actions":["sign_data"],"label":"attested-data service key (enclave-provisioned)"},"secret":{"exchange":"attested-data","private_key":"0x"#;
+const DATA_KEY_SECRET_MID: &[u8] = br#"","wallet_address":""#;
+const DATA_KEY_SECRET_SUFFIX: &[u8] = br#""}}"#;
+
+/// Assemble the plaintext that gets AES-GCM-sealed into the data-key envelope.
+///
+/// **ROT-9 — why this is policy-wrapped and no longer a bare secret.** The
+/// previous shape was a flat `{"exchange","private_key","wallet_address"}`
+/// object. Under `SIGNER_REQUIRE_POLICY=1` such a blob is *unloadable*:
+/// `load_and_parse_blob` classifies it as `ParsedBlob::Legacy` and the strict
+/// regime rejects every legacy blob unconditionally, before any venue is
+/// considered. Measured on mainnet 2026-08-04 — provisioning itself succeeded
+/// and the gateway then refused to boot with `policy_required`.
+///
+/// The `data-signing` exemption from `is_money_venue` does NOT rescue it, and
+/// this is the part that reads wrong at a glance: that exemption lives inside
+/// the `WithPolicy` branch, which a legacy blob never reaches.
+///
+/// **The policy CONSTRAINS.** An empty `{"policy":{}}` would parse as
+/// `WithPolicy` and satisfy the strict gate while every field stayed `None` —
+/// permit-all wearing a policy's clothes, which is strictly worse than the
+/// legacy blob it replaced because it *looks* governed. So the service key is
+/// pinned to exactly one action: `sign_data`, and nothing else. It is fixed
+/// here rather than caller-supplied — the provisioning request carries no
+/// policy field and must not gain one.
+///
+/// **Zeroization (Gemini security-HIGH, unchanged).** `hex::encode` would
+/// allocate an un-zeroized `String` holding the RAW key hex on the heap.
+/// Instead the caller hex-encodes into a `Zeroizing` buffer and the JSON is
+/// built directly in a `Zeroizing` Vec, so the only off-enclave copy is the
+/// SEALED ciphertext. The capacity is computed from the actual operands rather
+/// than a hand-counted constant, so `extend_from_slice` can NEVER reallocate —
+/// a realloc would free an old heap buffer still holding the key hex without
+/// wiping it (`Zeroizing` only wipes the FINAL buffer on drop). The previous
+/// comment carried a hand-counted "≤ ~173 B" that no test held to.
+fn build_data_key_plaintext(priv_hex: &[u8], pubkey_address: &str) -> Zeroizing<Vec<u8>> {
+    let cap = DATA_KEY_POLICY_PREFIX.len()
+        + priv_hex.len()
+        + DATA_KEY_SECRET_MID.len()
+        + pubkey_address.len()
+        + DATA_KEY_SECRET_SUFFIX.len();
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(cap));
+    plaintext.extend_from_slice(DATA_KEY_POLICY_PREFIX);
+    plaintext.extend_from_slice(priv_hex);
+    plaintext.extend_from_slice(DATA_KEY_SECRET_MID);
+    plaintext.extend_from_slice(pubkey_address.as_bytes());
+    plaintext.extend_from_slice(DATA_KEY_SECRET_SUFFIX);
+    plaintext
+}
+
+/// ROT-1: venues for which the enclave will MINT an agent key in-enclave.
+///
+/// Deliberately an allow-list and not "any money venue". Minting only makes
+/// sense where the venue's authorisation model is a delegated agent that the
+/// account owner approves out-of-band, and where the credential is a raw
+/// secp256k1 key rather than an HMAC pair the exchange issues. Binance/OKX
+/// credentials are MINTED BY THE EXCHANGE — the enclave cannot birth one, and
+/// listing them here would produce a valid key pair that no exchange has ever
+/// heard of.
+fn is_agent_key_venue(venue: &str) -> bool {
+    matches!(venue, "hyperliquid_main" | "hyperliquid_testnet")
+}
+
+/// Assemble the policy-wrapped plaintext for a minted AGENT key (ROT-1).
+///
+/// Same shape and the same zeroization contract as `build_data_key_plaintext`,
+/// with one difference that matters: the policy is **caller-supplied** rather
+/// than fixed, because an agent key's caps are per-tenant and per-asset and the
+/// enclave has no business inventing them.
+///
+/// The policy bytes are embedded **verbatim**, not re-serialized. They carry a
+/// `policy_authority_sig` computed off-box; re-serializing would be a second
+/// place where byte-level canonicalization could drift away from what was
+/// signed. Verbatim removes the question rather than answering it.
+fn build_agent_key_plaintext(
+    policy_json: &[u8],
+    venue: &str,
+    priv_hex: &[u8],
+    pubkey_address: &str,
+) -> Zeroizing<Vec<u8>> {
+    const P0: &[u8] = br#"{"policy":"#;
+    const P1: &[u8] = br#","secret":{"exchange":""#;
+    const P2: &[u8] = br#"","private_key":"0x"#;
+    const P3: &[u8] = br#"","wallet_address":""#;
+    const P4: &[u8] = br#""}}"#;
+    let cap = P0.len()
+        + policy_json.len()
+        + P1.len()
+        + venue.len()
+        + P2.len()
+        + priv_hex.len()
+        + P3.len()
+        + pubkey_address.len()
+        + P4.len();
+    let mut pt = Zeroizing::new(Vec::with_capacity(cap));
+    pt.extend_from_slice(P0);
+    pt.extend_from_slice(policy_json);
+    pt.extend_from_slice(P1);
+    pt.extend_from_slice(venue.as_bytes());
+    pt.extend_from_slice(P2);
+    pt.extend_from_slice(priv_hex);
+    pt.extend_from_slice(P3);
+    pt.extend_from_slice(pubkey_address.as_bytes());
+    pt.extend_from_slice(P4);
+    pt
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ROT-1 — AGENT KEY PROVISIONING: provision_agent_key.
+//
+// The same factory as the data-signing key, pointed at a tenant venue. The
+// agent's secp256k1 key is BORN in-enclave and only its ADDRESS comes out; the
+// account owner then approves that address on the venue from their own wallet.
+// Nothing secret ever passes through a human's hands, which is what removes the
+// hand-over ceremony that made this item expensive to estimate: there is no
+// credential to hand over.
+//
+// What DOES travel in is the policy — authored and authority-signed off-box.
+// That asymmetry is the design: the key must not come from outside, the rules
+// must not come from inside.
+// ─────────────────────────────────────────────────────────────────────────
+fn handle_provision_agent_key(req: SignRequest) -> SignResponse {
+    let Some(creds) = req.aws_credentials.as_ref() else {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+    let Some(key_id) = req.key_id.as_deref().filter(|s| !s.is_empty()) else {
+        tracing::warn!(event = "provision_agent_no_key_id");
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+    let Some(venue) = req.provision_venue.as_deref().filter(|s| !s.is_empty()) else {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+    let Some(customer_id) = req
+        .provision_customer_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+    let Some(policy_raw) = req.provision_policy.as_deref().filter(|s| !s.is_empty()) else {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+
+    if !is_agent_key_venue(venue) {
+        tracing::warn!(event = "provision_agent_venue_not_mintable", venue = %venue);
+        return SignResponse::err(err_code::POLICY_DENIED);
+    }
+    // Reject an unsafe customer id here for the same reason the registry does:
+    // it lands in the KMS context and the sealed AAD, and both are structured
+    // strings.
+    if !crate::registry::is_safe_id(customer_id) {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    }
+
+    let policy: Policy = match serde_json::from_str(policy_raw) {
+        Ok(p) => p,
+        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+    };
+
+    // ── MINT-TIME MIRROR OF THE LOAD-TIME GATES ──
+    //
+    // ROT-9's lesson, applied before it can bite again: provisioning succeeded,
+    // the strict enclave then refused the key, and the gap only surfaced when
+    // the gateway would not boot. Run the checks the read path will run, and
+    // fail HERE — a key that cannot be loaded must never be minted, sealed and
+    // handed back as if it were usable.
+    //
+    // Not a substitute for the load-time gates: those stay exactly where they
+    // are and remain the enforcement. This is a fail-fast copy.
+    //
+    // ROT-1 round-3: a mirror is only a mirror if it moves with what it
+    // reflects. The load floor became unconditional on `hyperliquid_main`, so
+    // this reads the SAME predicate — otherwise a permissive image would happily
+    // mint an HL mainnet key that the read path then refuses on every request:
+    // exactly ROT-9's failure, re-created by the fix meant to prevent its class.
+    //
+    // The AF-2 shape refusal is mirrored for the same reason: `provision_agent_key`
+    // is a SECOND mint path for HL keys (policy-cli is the other), and a shape
+    // the signing path always rejects must not be sealed and handed back as
+    // usable.
+    if policy.intent_pubkey.is_some() && is_hl_venue(venue) {
+        tracing::error!(
+            event = "provision_agent_intent_pubkey_unsupported_on_hl",
+            venue = %venue,
+            "refusing to mint an AF-2 policy for a venue whose path does not verify agent intent"
+        );
+        return SignResponse::err(err_code::POLICY_REQUIRED);
+    }
+    if blob_floor_strict(policy_required(), venue) && is_money_venue(venue) {
+        if let Err(e) = verify_policy_authority(&policy, customer_id, venue) {
+            tracing::warn!(event = "provision_agent_policy_not_authority_signed", venue = %venue);
+            return match e {
+                LoadSecretError::PolicyRequired => SignResponse::err(err_code::POLICY_REQUIRED),
+                _ => SignResponse::err(err_code::BAD_REQUEST),
+            };
+        }
+        if rot3_uncapped_money_key_rejected(true, venue, &policy) {
+            tracing::error!(
+                event = "provision_agent_uncapped",
+                venue = %venue,
+                "refusing to mint a money-venue key whose policy carries no binding cap"
+            );
+            return SignResponse::err(err_code::POLICY_REQUIRED);
+        }
+    }
+
+    let id = crate::registry::ResolvedIdentity::for_provisioned_agent(customer_id, venue);
+    let ctx = id.encryption_context(venue);
+    let aad = id.sealed_aad(venue, KEY_VERSION);
+
+    let pk = crate::signer::generate_secp256k1_private_key();
+    let (pubkey_compressed, pubkey_address) = match crate::signer::attested_data_pubkey(&pk) {
+        Ok(p) => p,
+        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+    };
+    let mut priv_hex = Zeroizing::new([0u8; 64]);
+    if hex::encode_to_slice(pk.as_slice(), &mut priv_hex[..]).is_err() {
+        return SignResponse::err(err_code::PROVISION_KEY_DERIVATION_FAILED);
+    }
+    let plaintext =
+        build_agent_key_plaintext(policy_raw.as_bytes(), venue, &priv_hex[..], &pubkey_address);
+
+    let dek = crate::signer::generate_dek();
+    let wrapped =
+        match crate::kms_client::wrap_dek_with_context(creds, key_id, &dek[..], Some(&ctx)) {
+            Ok(w) => w,
+            Err(crate::kms_client::GenKeyError::AccessDenied) => {
+                return SignResponse::err(err_code::KMS_DECRYPT_DENIED)
+            }
+            Err(crate::kms_client::GenKeyError::Internal) => {
+                return SignResponse::err(err_code::PROVISION_WRAP_FAILED)
+            }
+        };
+    let envelope = match crate::envelope::seal_with_dek(&dek[..], &wrapped, &plaintext, &aad) {
+        Ok(e) => e,
+        Err(_) => return SignResponse::err(err_code::PROVISION_SEAL_FAILED),
+    };
+    let blob = match serde_json::to_vec(&envelope) {
+        Ok(b) => b,
+        Err(_) => return SignResponse::err(err_code::PROVISION_SEAL_FAILED),
+    };
+
+    // The address is the ONLY thing that leaves, and it is public by
+    // construction — the account owner approves exactly this string on the
+    // venue.
+    tracing::info!(
+        event = "provision_agent_key_ok",
+        venue = %venue,
+        customer_id = %customer_id,
+        address = %pubkey_address
+    );
+    SignResponse::ok_provision(crate::proto::ProvisionDataKeyResponse {
+        envelope_b64: B64.encode(&blob),
+        pubkey_compressed,
+        pubkey_address,
+    })
+}
+
 // Attested-data PROVISIONING (Option-1): provision_data_key.
 //
 // One-shot KEY FACTORY — the data-signing key is BORN inside the enclave and
@@ -3277,26 +4096,13 @@ fn handle_provision_data_key(req: SignRequest) -> SignResponse {
         Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
     };
 
-    // 2. Legacy (no-policy → no caps on sign_data) secret plaintext, assembled so
-    //    EVERY copy of the key is zeroized (Gemini security-HIGH): `hex::encode`
-    //    would allocate an un-zeroized String holding the RAW key hex on the heap.
-    //    Instead hex-encode into a Zeroizing buffer and build the JSON directly in
-    //    a Zeroizing Vec — the only off-enclave copy is then the SEALED ciphertext.
+    // 2. POLICY-WRAPPED secret plaintext (ROT-9). See `build_data_key_plaintext`
+    //    for why this is not a bare secret any more.
     let mut priv_hex = Zeroizing::new([0u8; 64]);
     if hex::encode_to_slice(pk.as_slice(), &mut priv_hex[..]).is_err() {
         return SignResponse::err(err_code::PROVISION_KEY_DERIVATION_FAILED);
     }
-    // Capacity MUST exceed the assembled size (≤ ~173 B: 45 prefix + 64 hex + 20
-    // mid + 42 address + 2 close) so the `extend_from_slice` calls NEVER
-    // reallocate — a realloc would free an OLD heap buffer still holding the key
-    // hex WITHOUT zeroizing it (Zeroizing only wipes the FINAL buffer on drop).
-    // Gemini security (3rd of the key-plaintext class).
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(256));
-    plaintext.extend_from_slice(br#"{"exchange":"attested-data","private_key":"0x"#);
-    plaintext.extend_from_slice(&priv_hex[..]);
-    plaintext.extend_from_slice(br#"","wallet_address":""#);
-    plaintext.extend_from_slice(pubkey_address.as_bytes());
-    plaintext.extend_from_slice(br#""}"#);
+    let plaintext = build_data_key_plaintext(&priv_hex[..], &pubkey_address);
 
     // 3. Birth the DEK HERE and have KMS only WRAP it, under the data-signing
     //    context (needs the scoped provisioning role; prod decrypt-only role →
@@ -3310,18 +4116,19 @@ fn handle_provision_data_key(req: SignRequest) -> SignResponse {
     //    the same in-enclave CSPRNG that already births the signing key keeps
     //    the DEK from ever leaving the enclave at all.
     let dek = crate::signer::generate_dek();
-    let wrapped = match crate::kms_client::wrap_dek_with_context(creds, key_id, &dek[..], Some(&ctx)) {
-        Ok(w) => w,
-        Err(crate::kms_client::GenKeyError::AccessDenied) => {
-            return SignResponse::err(err_code::KMS_DECRYPT_DENIED)
-        }
-        Err(crate::kms_client::GenKeyError::Internal) => {
-            // ROT-6: distinct from a KMS DENIAL above. This is "the wrap did not
-            // work" — the exact bucket that cost a day when it read
-            // `internal_error`.
-            return SignResponse::err(err_code::PROVISION_WRAP_FAILED)
-        }
-    };
+    let wrapped =
+        match crate::kms_client::wrap_dek_with_context(creds, key_id, &dek[..], Some(&ctx)) {
+            Ok(w) => w,
+            Err(crate::kms_client::GenKeyError::AccessDenied) => {
+                return SignResponse::err(err_code::KMS_DECRYPT_DENIED)
+            }
+            Err(crate::kms_client::GenKeyError::Internal) => {
+                // ROT-6: distinct from a KMS DENIAL above. This is "the wrap did not
+                // work" — the exact bucket that cost a day when it read
+                // `internal_error`.
+                return SignResponse::err(err_code::PROVISION_WRAP_FAILED);
+            }
+        };
 
     // 4. AES-GCM-seal under the DEK + sealed AAD → v2 envelope (the prod path
     //    KMS-decrypts wrapped_dek then GCM-decrypts under the identical AAD).
@@ -3436,8 +4243,7 @@ fn validate_asterdex_body(body: &str, derived: &[u8; 20]) -> Result<(), &'static
     };
     // Boundary check: param must be at body start OR preceded by `&`.
     // Reject prefixed collisions like `xsigner=...`.
-    if first_signer_start != 0
-        && body.as_bytes().get(first_signer_start - 1).copied() != Some(b'&')
+    if first_signer_start != 0 && body.as_bytes().get(first_signer_start - 1).copied() != Some(b'&')
     {
         return Err(err_code::BAD_REQUEST);
     }
@@ -3481,9 +4287,7 @@ fn validate_asterdex_body(body: &str, derived: &[u8; 20]) -> Result<(), &'static
     let Some(first_nonce_start) = body.find("nonce=") else {
         return Err(err_code::BAD_REQUEST);
     };
-    if first_nonce_start != 0
-        && body.as_bytes().get(first_nonce_start - 1).copied() != Some(b'&')
-    {
+    if first_nonce_start != 0 && body.as_bytes().get(first_nonce_start - 1).copied() != Some(b'&') {
         return Err(err_code::BAD_REQUEST);
     }
     let nonce_value_start = first_nonce_start + "nonce=".len();
@@ -3665,10 +4469,9 @@ fn enforce_asterdex_size_cap(policy: Option<&Policy>, body: &str) -> Result<(), 
     // the whole alt-separator / percent-decode class independently of the
     // venue's exact parser rules. Scoped to the capped path (un-capped legacy
     // flows unchanged).
-    if body
-        .bytes()
-        .any(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'&' | b'=' | b'.' | b'_' | b'-' | b':' | b'/')))
-    {
+    if body.bytes().any(|b| {
+        !(b.is_ascii_alphanumeric() || matches!(b, b'&' | b'=' | b'.' | b'_' | b'-' | b':' | b'/'))
+    }) {
         tracing::warn!(event = "asterdex_unsafe_char_in_capped_body");
         return Err(SignResponse::err(err_code::BAD_REQUEST));
     }
@@ -3757,7 +4560,10 @@ fn enforce_asterdex_size_cap(policy: Option<&Policy>, body: &str) -> Result<(), 
     enforce_order_cap(policy, symbol, Some(qty), price)
 }
 
-fn handle_sign_asterdex(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_asterdex(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     // Asterdex needs the URL-encoded params string in `body`. Method/path
     // are informational only — the canonical EIP-712 envelope ignores
     // them — but we still validate method is allowlisted for defense in
@@ -3922,10 +4728,7 @@ fn handle_sign_asterdex(req: SignRequest, identity: &crate::registry::ResolvedId
             let mut headers = std::collections::BTreeMap::new();
             headers.insert("signature".to_owned(), signature);
             // Lowercase 0x-prefixed signer for SDK assertion comfort.
-            headers.insert(
-                "signer".to_owned(),
-                format!("0x{}", hex::encode(derived)),
-            );
+            headers.insert("signer".to_owned(), format!("0x{}", hex::encode(derived)));
             SignResponse::ok_headers(headers).with_policy_hash(policy_hash)
         }
         Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
@@ -3940,7 +4743,10 @@ fn handle_sign_asterdex(req: SignRequest, identity: &crate::registry::ResolvedId
 ///
 /// EIP-712 flow (no HTTP method/path) — governed by `allowed_actions` +
 /// the `x402` policy clause, not method/path whitelists.
-fn handle_sign_x402_eip3009(req: SignRequest, identity: &crate::registry::ResolvedIdentity) -> SignResponse {
+fn handle_sign_x402_eip3009(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
     let Some(x402) = req.x402.as_ref() else {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
@@ -3961,7 +4767,9 @@ fn handle_sign_x402_eip3009(req: SignRequest, identity: &crate::registry::Resolv
         Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
         Err(LoadSecretError::KmsDenied) => return SignResponse::err(err_code::KMS_DECRYPT_DENIED),
         Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
-        Err(LoadSecretError::PolicyRequired) => return SignResponse::err(err_code::POLICY_REQUIRED),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
     };
 
     let policy_hash = match enforce_policy(policy.as_ref(), &req) {
@@ -3994,8 +4802,7 @@ fn handle_sign_x402_eip3009(req: SignRequest, identity: &crate::registry::Resolv
     // CR050: x402 is a WITHDRAWAL primitive (moves USDC out of the payer key),
     // so the spend cap + recipient allow-list are MANDATORY and fail-closed —
     // "no clause" must never mean "no limit". Enforced in `enforce_x402_cap`.
-    if let Err(resp) =
-        enforce_x402_cap(policy.as_ref(), x402.chain_id, &token_address, &to, &value)
+    if let Err(resp) = enforce_x402_cap(policy.as_ref(), x402.chain_id, &token_address, &to, &value)
     {
         return resp;
     }
@@ -4090,10 +4897,9 @@ mod tests {
 
     #[test]
     fn attestation_rejects_bad_user_data() {
-        let req: SignRequest = serde_json::from_str(
-            r#"{"action":"attestation","attestation_user_data":"nothexZZ"}"#,
-        )
-        .unwrap();
+        let req: SignRequest =
+            serde_json::from_str(r#"{"action":"attestation","attestation_user_data":"nothexZZ"}"#)
+                .unwrap();
         assert_eq!(handle(req).error.as_deref(), Some(err_code::BAD_REQUEST));
     }
 
@@ -4151,6 +4957,9 @@ mod tests {
             intent_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         };
 
         // (a) proto_version too low → BAD_REQUEST (the gate, before dispatch).
@@ -4168,7 +4977,10 @@ mod tests {
         // signing path — consults ONLY this resolved identity, never a gateway
         // field. The identity is resolved exactly once per request in handle().
         let id = crate::registry::resolve("tok-a").expect("tok-a was seeded");
-        assert!(!id.venue_allowed("x402"), "binance-only tenant must be denied x402");
+        assert!(
+            !id.venue_allowed("x402"),
+            "binance-only tenant must be denied x402"
+        );
         assert!(id.venue_allowed("binance"), "binance must be granted");
     }
 
@@ -4242,6 +5054,9 @@ mod tests {
             intent_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         }
     }
 
@@ -4335,7 +5150,13 @@ mod tests {
     }
     /// Returns the err_code (owned) or `None` on allow. `chain` lets a couple
     /// of tests pin a mismatching request chain.
-    fn x402_check_chain(p: Option<&Policy>, chain: u64, token: &str, to: &str, value: &str) -> Option<String> {
+    fn x402_check_chain(
+        p: Option<&Policy>,
+        chain: u64,
+        token: &str,
+        to: &str,
+        value: &str,
+    ) -> Option<String> {
         // SignResponse impls Drop (zeroizes) → can't move `error` out; clone it.
         enforce_x402_cap(p, chain, &evm_addr(token), &evm_addr(to), &u256_be(value))
             .err()
@@ -4426,8 +5247,14 @@ mod tests {
     fn cr050_wrong_chain_is_policy_denied() {
         // policy pins 8453; request chain 1.
         assert_eq!(
-            x402_check_chain(Some(&x402_capped_policy()), 1, X402_USDC_BASE, X402_FACILITATOR, "1")
-                .as_deref(),
+            x402_check_chain(
+                Some(&x402_capped_policy()),
+                1,
+                X402_USDC_BASE,
+                X402_FACILITATOR,
+                "1"
+            )
+            .as_deref(),
             Some(err_code::POLICY_DENIED)
         );
     }
@@ -4436,8 +5263,14 @@ mod tests {
     fn cr050_wrong_token_is_policy_denied() {
         // request token ≠ pinned USDC.
         assert_eq!(
-            x402_check_chain(Some(&x402_capped_policy()), 8453, X402_ATTACKER, X402_FACILITATOR, "1")
-                .as_deref(),
+            x402_check_chain(
+                Some(&x402_capped_policy()),
+                8453,
+                X402_ATTACKER,
+                X402_FACILITATOR,
+                "1"
+            )
+            .as_deref(),
             Some(err_code::POLICY_DENIED)
         );
     }
@@ -4447,8 +5280,7 @@ mod tests {
         // List entry lower-case, request `to` checksummed — both parse to the
         // same 20 bytes, so membership holds (no checksum dependence).
         let mut p = x402_capped_policy();
-        p.x402.as_mut().unwrap().allowed_recipients =
-            Some(vec![X402_FACILITATOR.to_lowercase()]);
+        p.x402.as_mut().unwrap().allowed_recipients = Some(vec![X402_FACILITATOR.to_lowercase()]);
         assert_eq!(x402_check(Some(&p), X402_FACILITATOR, "1"), None);
     }
 
@@ -4491,26 +5323,42 @@ mod tests {
     const HL_VAULT_OTHER: &str = "0x00000000000000000000000000000000000000B2";
 
     fn hl_cap(asset: u64, max_size: &str) -> crate::proto::HlOrderCap {
-        crate::proto::HlOrderCap { asset, max_size: max_size.to_owned(), max_notional: None }
+        crate::proto::HlOrderCap {
+            asset,
+            max_size: max_size.to_owned(),
+            max_notional: None,
+        }
     }
     fn hl_order(a: u64, s: &str) -> serde_json::Value {
         serde_json::json!({"type": "order", "orders": [{"a": a, "b": true, "s": s, "p": "1"}]})
     }
-    fn hl_check(p: Option<&Policy>, action: &serde_json::Value, vault: Option<&[u8; 20]>) -> Option<String> {
-        enforce_hl_caps(p, action, vault).err().and_then(|r| r.error.clone())
+    fn hl_check(
+        p: Option<&Policy>,
+        action: &serde_json::Value,
+        vault: Option<&[u8; 20]>,
+    ) -> Option<String> {
+        enforce_hl_caps(p, action, vault)
+            .err()
+            .and_then(|r| r.error.clone())
     }
 
     #[test]
     fn cr053_hl_no_policy_or_no_caps_allows_any_size() {
         let big = hl_order(0, "999999");
         assert_eq!(hl_check(None, &big, None), None);
-        let p = Policy { allowed_actions: Some(vec!["sign_hyperliquid_main_order".into()]), ..Policy::default() };
+        let p = Policy {
+            allowed_actions: Some(vec!["sign_hyperliquid_main_order".into()]),
+            ..Policy::default()
+        };
         assert_eq!(hl_check(Some(&p), &big, None), None);
     }
 
     #[test]
     fn cr053_hl_order_within_cap_ok() {
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
         assert_eq!(hl_check(Some(&p), &hl_order(0, "3"), None), None);
         // boundary: equal to cap is allowed (inclusive).
         assert_eq!(hl_check(Some(&p), &hl_order(0, "5"), None), None);
@@ -4518,49 +5366,85 @@ mod tests {
 
     #[test]
     fn cr053_hl_order_over_cap_denied() {
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
-        assert_eq!(hl_check(Some(&p), &hl_order(0, "5.0001"), None).as_deref(), Some(err_code::POLICY_DENIED));
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(0, "5.0001"), None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
     }
 
     #[test]
     fn cr053_hl_unlisted_asset_denied() {
         // caps only for asset 0; an order for asset 1 is fail-closed denied.
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
-        assert_eq!(hl_check(Some(&p), &hl_order(1, "1"), None).as_deref(), Some(err_code::POLICY_DENIED));
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(1, "1"), None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
     }
 
     #[test]
     fn cr053_hl_order_missing_size_is_bad_request_when_capped() {
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
         let no_size = serde_json::json!({"type": "order", "orders": [{"a": 0, "b": true}]});
-        assert_eq!(hl_check(Some(&p), &no_size, None).as_deref(), Some(err_code::BAD_REQUEST));
+        assert_eq!(
+            hl_check(Some(&p), &no_size, None).as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
     }
 
     #[test]
     fn cr053_hl_multi_order_one_over_cap_denies_whole() {
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
         let batch = serde_json::json!({"type": "order", "orders": [{"a": 0, "s": "3"}, {"a": 0, "s": "99"}]});
-        assert_eq!(hl_check(Some(&p), &batch, None).as_deref(), Some(err_code::POLICY_DENIED));
+        assert_eq!(
+            hl_check(Some(&p), &batch, None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
     }
 
     #[test]
     fn cr053_hl_cancel_action_skips_size_caps() {
         // A cancel action has no orders[]; size caps must not fire (vault check
         // still applies, but none set here).
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
         let cancel = serde_json::json!({"type": "cancel", "cancels": [{"a": 0, "o": 123}]});
         assert_eq!(hl_check(Some(&p), &cancel, None), None);
     }
 
     #[test]
     fn cr053_hl_vault_in_allowlist_ok() {
-        let p = Policy { allowed_vaults: Some(vec![HL_VAULT.into()]), ..Policy::default() };
-        assert_eq!(hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT))), None);
+        let p = Policy {
+            allowed_vaults: Some(vec![HL_VAULT.into()]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT))),
+            None
+        );
     }
 
     #[test]
     fn cr053_hl_vault_off_allowlist_denied() {
-        let p = Policy { allowed_vaults: Some(vec![HL_VAULT.into()]), ..Policy::default() };
+        let p = Policy {
+            allowed_vaults: Some(vec![HL_VAULT.into()]),
+            ..Policy::default()
+        };
         assert_eq!(
             hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT_OTHER))).as_deref(),
             Some(err_code::POLICY_DENIED)
@@ -4570,19 +5454,31 @@ mod tests {
     #[test]
     fn cr053_hl_vault_none_main_account_unaffected() {
         // allowed_vaults present but request has NO vault (main account) → allowed.
-        let p = Policy { allowed_vaults: Some(vec![HL_VAULT.into()]), ..Policy::default() };
+        let p = Policy {
+            allowed_vaults: Some(vec![HL_VAULT.into()]),
+            ..Policy::default()
+        };
         assert_eq!(hl_check(Some(&p), &hl_order(0, "1"), None), None);
     }
 
     #[test]
     fn cr053_hl_vault_match_case_insensitive() {
-        let p = Policy { allowed_vaults: Some(vec![HL_VAULT.to_lowercase()]), ..Policy::default() };
-        assert_eq!(hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT))), None);
+        let p = Policy {
+            allowed_vaults: Some(vec![HL_VAULT.to_lowercase()]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT))),
+            None
+        );
     }
 
     #[test]
     fn cr053_hl_vault_malformed_entry_denied() {
-        let p = Policy { allowed_vaults: Some(vec!["not-an-address".into()]), ..Policy::default() };
+        let p = Policy {
+            allowed_vaults: Some(vec!["not-an-address".into()]),
+            ..Policy::default()
+        };
         assert_eq!(
             hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT))).as_deref(),
             Some(err_code::POLICY_DENIED)
@@ -4592,7 +5488,10 @@ mod tests {
     #[test]
     fn cr053_hl_cancel_vault_binding_enforced() {
         // Vault check applies to cancel actions too (loader covers order+cancel).
-        let p = Policy { allowed_vaults: Some(vec![HL_VAULT.into()]), ..Policy::default() };
+        let p = Policy {
+            allowed_vaults: Some(vec![HL_VAULT.into()]),
+            ..Policy::default()
+        };
         let cancel = serde_json::json!({"type": "cancel", "cancels": [{"a": 0, "o": 123}]});
         assert_eq!(
             hl_check(Some(&p), &cancel, Some(&evm_addr(HL_VAULT_OTHER))).as_deref(),
@@ -4604,7 +5503,10 @@ mod tests {
     #[test]
     fn cr053_hl_empty_vault_allowlist_denies_explicit_vault() {
         // Some(vec![]) = explicit "no vault permitted" (≠ None = no constraint).
-        let p = Policy { allowed_vaults: Some(vec![]), ..Policy::default() };
+        let p = Policy {
+            allowed_vaults: Some(vec![]),
+            ..Policy::default()
+        };
         assert_eq!(
             hl_check(Some(&p), &hl_order(0, "1"), Some(&evm_addr(HL_VAULT))).as_deref(),
             Some(err_code::POLICY_DENIED)
@@ -4627,6 +5529,448 @@ mod tests {
         );
     }
 
+    // ─── ROT-1 round-3: the batch is the unit, not the order ────────────────
+    //
+    // Every test below fails if the aggregate pass is removed or weakened —
+    // that is the point of them. The per-order pass alone cannot produce any of
+    // these verdicts, because every individual order here is within its cap.
+
+    fn hl_cap_notional(asset: u64, max_size: &str, max_notional: &str) -> crate::proto::HlOrderCap {
+        crate::proto::HlOrderCap {
+            asset,
+            max_size: max_size.to_owned(),
+            max_notional: Some(max_notional.to_owned()),
+        }
+    }
+
+    /// N orders on ONE asset, each `s` — the exact shape the per-order-only
+    /// check waved through.
+    fn hl_orders_same_asset(a: u64, sizes: &[&str]) -> serde_json::Value {
+        let orders: Vec<serde_json::Value> = sizes
+            .iter()
+            .map(|s| serde_json::json!({"a": a, "b": true, "s": s, "p": "1"}))
+            .collect();
+        serde_json::json!({"type": "order", "orders": orders})
+    }
+
+    #[test]
+    fn rot1_hl_batch_sum_over_cap_denied_though_each_order_is_within_cap() {
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        // 3 + 3 = 6 > 5, and NEITHER order is over the cap on its own.
+        let batch = hl_orders_same_asset(0, &["3", "3"]);
+        assert_eq!(
+            hl_check(Some(&p), &batch, None).as_deref(),
+            Some(err_code::POLICY_DENIED),
+            "two in-cap orders summing over the cap must be denied"
+        );
+        // The falsification handle: each order alone is fine.
+        assert_eq!(hl_check(Some(&p), &hl_order(0, "3"), None), None);
+    }
+
+    #[test]
+    fn rot1_hl_batch_sum_at_cap_allowed_inclusive() {
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        // 2 + 3 == 5: inclusive on the cap, mirroring the per-order semantics.
+        assert_eq!(
+            hl_check(Some(&p), &hl_orders_same_asset(0, &["2", "3"]), None),
+            None
+        );
+        // 2.5 + 2.5 == 5 — fractional scales must align exactly, no float drift.
+        assert_eq!(
+            hl_check(Some(&p), &hl_orders_same_asset(0, &["2.5", "2.5"]), None),
+            None
+        );
+        // …and one ulp over is denied.
+        assert_eq!(
+            hl_check(Some(&p), &hl_orders_same_asset(0, &["2.5", "2.5001"]), None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+    }
+
+    #[test]
+    fn rot1_hl_sum_is_per_asset_not_across_assets() {
+        // Assets are capped independently: 3+3 on DIFFERENT assets is fine even
+        // though the total is 6. Summing across assets would be a different
+        // (wrong) rule and this test pins that it is not what we do.
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5"), hl_cap(1, "5")]),
+            ..Policy::default()
+        };
+        let mixed = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": true, "s": "3", "p": "1"},
+            {"a": 1, "b": true, "s": "3", "p": "1"},
+        ]});
+        assert_eq!(hl_check(Some(&p), &mixed, None), None);
+        // But two on the SAME asset inside the same mixed batch still deny.
+        let mixed_dup = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": true, "s": "3", "p": "1"},
+            {"a": 1, "b": true, "s": "1", "p": "1"},
+            {"a": 0, "b": true, "s": "3", "p": "1"},
+        ]});
+        assert_eq!(
+            hl_check(Some(&p), &mixed_dup, None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+    }
+
+    #[test]
+    fn rot1_hl_reduce_only_orders_still_count_toward_the_asset_total() {
+        // Pins the DECISION, not just the behaviour: `r: true` buys no exemption.
+        //
+        // The case for exempting it was the normalTpsl bundle (entry + two
+        // reduce-only exits, one action, same asset) — three orders at the cap
+        // that never leave a position larger than the entry. The case against,
+        // which won: a reduce-only order is still an executable trade at a
+        // requester-chosen price, so an exemption lets ONE signature carry 64 of
+        // them against a position built up over earlier signatures, under one
+        // daily-counter increment. Neither shipped SDK sends a bundle (both
+        // build exactly one order per action), so the exemption would have cost
+        // a real bound to buy back a flow nobody here sends.
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "1")]),
+            ..Policy::default()
+        };
+        let tpsl = serde_json::json!({"type": "order", "grouping": "normalTpsl", "orders": [
+            {"a": 0, "b": true,  "p": "50000", "s": "1", "r": false, "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "55000", "s": "1", "r": true,  "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": false, "p": "45000", "s": "1", "r": true,  "t": {"limit": {"tif": "Gtc"}}},
+        ]});
+        assert_eq!(
+            hl_check(Some(&p), &tpsl, None).as_deref(),
+            Some(err_code::POLICY_DENIED),
+            "reduce-only entries must count toward the asset total"
+        );
+
+        // The documented way through, so the denial is a bound and not a wall:
+        // each exit sent as its OWN single-order action is untouched by the
+        // aggregate and bounded by the per-order cap, exactly as before ROT-1.
+        let lone_exit = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": false, "p": "55000", "s": "1", "r": true, "t": {"limit": {"tif": "Gtc"}}},
+        ]});
+        assert_eq!(hl_check(Some(&p), &lone_exit, None), None);
+
+        // And an oversized lone exit is still denied by the per-order cap.
+        let oversized_exit = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": false, "p": "55000", "s": "9", "r": true, "t": {"limit": {"tif": "Gtc"}}},
+        ]});
+        assert_eq!(
+            hl_check(Some(&p), &oversized_exit, None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+    }
+
+    #[test]
+    fn rot1_hl_batch_sum_counts_both_sides() {
+        // b=true/false (buy/sell) both count toward the asset total. Netting
+        // them would let a wash pair carry unlimited size, and the enclave
+        // cannot know the venue will actually net them. Conservative on purpose.
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        let hedged = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": true,  "s": "4", "p": "1"},
+            {"a": 0, "b": false, "s": "4", "p": "1"},
+        ]});
+        assert_eq!(
+            hl_check(Some(&p), &hedged, None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+    }
+
+    #[test]
+    fn rot1_hl_batch_notional_sum_over_cap_denied() {
+        // Σ(s × p) — the notional cap had the same per-order-only defect.
+        // 2×50 + 2×50 = 200 > 150, and each order alone is 100 ≤ 150.
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap_notional(0, "100", "150")]),
+            ..Policy::default()
+        };
+        let batch = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": true, "s": "2", "p": "50", "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": true, "s": "2", "p": "50", "t": {"limit": {"tif": "Gtc"}}},
+        ]});
+        assert_eq!(
+            hl_check(Some(&p), &batch, None).as_deref(),
+            Some(err_code::POLICY_DENIED),
+            "two in-cap notionals summing over the cap must be denied"
+        );
+        // Falsification handle: one such order alone passes.
+        let single = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": true, "s": "2", "p": "50", "t": {"limit": {"tif": "Gtc"}}},
+        ]});
+        assert_eq!(hl_check(Some(&p), &single, None), None);
+    }
+
+    #[test]
+    fn rot1_hl_aggregate_blames_the_policy_for_a_policy_operand_it_cannot_parse() {
+        // Two properties, and the second one only became true once the two
+        // decimal validators were unified (CodeRabbit):
+        //
+        //  (a) an operand the enclave cannot parse is the POLICY's fault, and
+        //      must not be reported as the client's malformed request —
+        //      otherwise an operator debugging an error storm goes looking at
+        //      the agent instead of at their own cap;
+        //  (b) the verdict does not depend on how many orders the batch holds.
+        //      Before unification a 65-byte cap worked for a single order and
+        //      failed only for two, so the same key was usable or broken
+        //      depending on the shape of the request.
+        let long_cap = format!("1{}", "0".repeat(66));
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, &long_cap)]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(0, "1"), None).as_deref(),
+            Some(err_code::INTERNAL_ERROR),
+            "single order: an unparseable POLICY cap is a server error"
+        );
+        assert_eq!(
+            hl_check(Some(&p), &hl_orders_same_asset(0, &["1", "1"]), None).as_deref(),
+            Some(err_code::INTERNAL_ERROR),
+            "batch: same verdict as the single order — no shape-dependent behaviour"
+        );
+        // Same rule on the notional side.
+        let pn = Policy {
+            hl_order_caps: Some(vec![hl_cap_notional(0, "100", &long_cap)]),
+            ..Policy::default()
+        };
+        let batch = serde_json::json!({"type": "order", "orders": [
+            {"a": 0, "b": true, "s": "1", "p": "1", "t": {"limit": {"tif": "Gtc"}}},
+            {"a": 0, "b": true, "s": "1", "p": "1", "t": {"limit": {"tif": "Gtc"}}},
+        ]});
+        assert_eq!(
+            hl_check(Some(&pn), &batch, None).as_deref(),
+            Some(err_code::INTERNAL_ERROR)
+        );
+        // Falsification handle: with a parseable cap the same batch is fine.
+        let ok = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            hl_check(Some(&ok), &hl_orders_same_asset(0, &["1", "1"]), None),
+            None
+        );
+    }
+
+    #[test]
+    fn rot1_hl_single_order_behaviour_is_unchanged() {
+        // The aggregate pass skips single-order assets, so every pre-existing
+        // single-order verdict must be bit-for-bit what it was: within cap ok,
+        // over cap denied, unlisted asset denied, missing size bad_request.
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
+        assert_eq!(hl_check(Some(&p), &hl_order(0, "5"), None), None);
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(0, "5.0001"), None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+        assert_eq!(
+            hl_check(Some(&p), &hl_order(9, "1"), None).as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+    }
+
+    #[test]
+    fn rot1_hl_action_entry_ceiling_rejects_oversized_batch_before_kms() {
+        // The ceiling lives in the SHAPE validators, which every HL handler runs
+        // before the KMS round-trip — so an oversized batch never reaches a
+        // decrypt, and the check holds even for a policy-less (legacy) blob.
+        let ok_orders: Vec<serde_json::Value> = (0..HL_MAX_ENTRIES_PER_ACTION)
+            .map(|_| serde_json::json!({"a": 0, "b": true, "s": "1", "p": "1"}))
+            .collect();
+        let at_limit = serde_json::json!({"type": "order", "orders": ok_orders});
+        assert!(
+            validate_order_action(&at_limit),
+            "exactly the limit must be accepted"
+        );
+
+        let too_many: Vec<serde_json::Value> = (0..HL_MAX_ENTRIES_PER_ACTION + 1)
+            .map(|_| serde_json::json!({"a": 0, "b": true, "s": "1", "p": "1"}))
+            .collect();
+        assert!(
+            !validate_order_action(&serde_json::json!({"type": "order", "orders": too_many})),
+            "one over the limit must be rejected"
+        );
+
+        // Cancels carry no size at all, so this ceiling is their ONLY bound.
+        let cancels_ok: Vec<serde_json::Value> = (0..HL_MAX_ENTRIES_PER_ACTION)
+            .map(|i| serde_json::json!({"a": 0, "o": i}))
+            .collect();
+        assert!(validate_cancel_action(
+            &serde_json::json!({"type": "cancel", "cancels": cancels_ok})
+        ));
+        let cancels_too_many: Vec<serde_json::Value> = (0..HL_MAX_ENTRIES_PER_ACTION + 1)
+            .map(|i| serde_json::json!({"a": 0, "o": i}))
+            .collect();
+        assert!(!validate_cancel_action(
+            &serde_json::json!({"type": "cancel", "cancels": cancels_too_many.clone()})
+        ));
+
+        // A STRAY array of the other kind is bounded too. Every field of the
+        // action is covered by the signature, so a cancel carrying a huge
+        // `orders` array is a real input — and "Hyperliquid would reject that
+        // action hash" is the venue's behaviour, not a bound we may lean on.
+        let orders_too_many: Vec<serde_json::Value> = (0..HL_MAX_ENTRIES_PER_ACTION + 1)
+            .map(|_| serde_json::json!({"a": 0, "b": true, "s": "1", "p": "1"}))
+            .collect();
+        assert!(
+            !validate_cancel_action(&serde_json::json!({
+                "type": "cancel",
+                "cancels": [{"a": 0, "o": 1}],
+                "orders": orders_too_many,
+            })),
+            "a cancel action smuggling an oversized orders[] must be rejected"
+        );
+        assert!(
+            !validate_order_action(&serde_json::json!({
+                "type": "order",
+                "orders": [{"a": 0, "b": true, "s": "1", "p": "1"}],
+                "cancels": cancels_too_many,
+            })),
+            "an order action smuggling an oversized cancels[] must be rejected"
+        );
+    }
+
+    #[test]
+    fn rot1_hl_ceiling_is_far_below_what_the_vsock_frame_allows() {
+        // The bound this replaces was the 64 KiB vsock frame. Pin the ratio so
+        // a future edit that raises the ceiling toward the frame has to justify
+        // itself against this number rather than drift into it silently.
+        let one_order =
+            r#"{"a":0,"b":true,"p":"50000","s":"0.001","r":false,"t":{"limit":{"tif":"Gtc"}}}"#;
+        let frame_allows = (64 * 1024) / one_order.len();
+        assert!(
+            frame_allows > 10 * HL_MAX_ENTRIES_PER_ACTION,
+            "frame fits ~{frame_allows} minimal orders; ceiling {HL_MAX_ENTRIES_PER_ACTION} \
+             must stay an order of magnitude below it"
+        );
+    }
+
+    // ─── ROT-1 round-3: the mainnet floor does not depend on the build flag ──
+
+    #[test]
+    fn rot1_hl_main_floor_is_unconditional_permissive_build_included() {
+        // The blanket deny ROT-1 removed could not be softened by any env var.
+        // Its replacement must not be either — on hyperliquid_main the strict
+        // floor holds with SIGNER_REQUIRE_POLICY unset.
+        assert!(
+            blob_floor_strict(false, "hyperliquid_main"),
+            "permissive build must STILL be strict on hyperliquid_main"
+        );
+        assert!(blob_floor_strict(true, "hyperliquid_main"));
+    }
+
+    #[test]
+    fn rot1_other_venues_keep_the_flag_semantics() {
+        // Scope check: this is a restored guarantee for ONE venue, not a
+        // migration of every venue to strict. A permissive image keeps working
+        // for the demo/testnet lane exactly as before.
+        for venue in [
+            "binance",
+            "okx",
+            "bybit",
+            "kucoin",
+            "asterdex",
+            "hyperliquid_testnet",
+            "x402",
+            "data-signing",
+        ] {
+            assert!(
+                !blob_floor_strict(false, venue),
+                "{venue} must follow the build flag, not the unconditional floor"
+            );
+            assert!(
+                blob_floor_strict(true, venue),
+                "{venue} strict under the flag"
+            );
+        }
+    }
+
+    #[test]
+    fn rot1_unconditional_floor_venue_is_a_money_venue() {
+        // The unconditional floor only means anything if the venue it names is
+        // subject to the money-venue gate it turns on — otherwise the strict
+        // branch in load_and_parse_blob is never entered and the whole thing is
+        // decorative.
+        assert!(is_money_venue("hyperliquid_main"));
+        assert!(floor_is_unconditional("hyperliquid_main"));
+    }
+
+    // ─── ROT-1 round-3: AF-2 is refused on HL rather than silently absent ────
+
+    fn hl_intent_policy() -> Policy {
+        Policy {
+            intent_pubkey: Some("aa".repeat(32)),
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            order_caps: Some(vec![crate::proto::OrderAssetCap {
+                // A DECORATIVE symbol cap — the shape an operator would add to
+                // satisfy the AF-2 floor. It cannot bind an index-keyed order.
+                symbol: "BTC".to_owned(),
+                max_qty: "1".to_owned(),
+                max_notional: None,
+            }]),
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn rot1_intent_pubkey_on_hl_is_refused_even_with_caps_that_satisfy_the_af2_floor() {
+        // This is the trap: with a decorative order_caps the policy passes the
+        // AF-2 floor, and the HL path verifies no intent at all. Refuse it.
+        for action in [
+            "sign_hyperliquid_main_order",
+            "sign_hyperliquid_main_cancel",
+            "sign_hyperliquid_testnet_order",
+            "sign_hyperliquid_testnet_cancel",
+        ] {
+            let req = SignRequest {
+                action: action.to_owned(),
+                ..req_template()
+            };
+            let err = enforce_policy(Some(&hl_intent_policy()), &req)
+                .err()
+                .and_then(|r| r.error.clone());
+            assert_eq!(
+                err.as_deref(),
+                Some(err_code::POLICY_REQUIRED),
+                "{action}: an AF-2 policy on HL must be refused, not silently unenforced"
+            );
+        }
+    }
+
+    #[test]
+    fn rot1_intent_pubkey_still_works_on_the_venues_af2_actually_covers() {
+        // Falsification handle for the rule above: the same policy shape on a
+        // CEX action must NOT be refused by the HL rule — AF-2 is wired there.
+        let p = Policy {
+            intent_pubkey: Some("aa".repeat(32)),
+            order_caps: Some(vec![crate::proto::OrderAssetCap {
+                symbol: "BTCUSDT".to_owned(),
+                max_qty: "1".to_owned(),
+                max_notional: None,
+            }]),
+            ..Policy::default()
+        };
+        let req = SignRequest {
+            action: "sign_binance_order".to_owned(),
+            ..req_template()
+        };
+        assert!(
+            enforce_policy(Some(&p), &req).is_ok(),
+            "AF-2 on a CEX venue must keep working"
+        );
+    }
+
     // ─── CR053 Asterdex ZN-204: body order-size cap (reuses order_caps) ──────
 
     fn aster_policy() -> Policy {
@@ -4640,13 +5984,18 @@ mod tests {
         }
     }
     fn aster_check(p: Option<&Policy>, body: &str) -> Option<String> {
-        enforce_asterdex_size_cap(p, body).err().and_then(|r| r.error.clone())
+        enforce_asterdex_size_cap(p, body)
+            .err()
+            .and_then(|r| r.error.clone())
     }
 
     #[test]
     fn cr053_asterdex_size_within_cap_ok() {
         assert_eq!(
-            aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&quantity=3&signer=0xa&nonce=1700000000000"),
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&quantity=3&signer=0xa&nonce=1700000000000"
+            ),
             None
         );
     }
@@ -4654,7 +6003,11 @@ mod tests {
     #[test]
     fn cr053_asterdex_size_over_cap_denied() {
         assert_eq!(
-            aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&quantity=6&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&quantity=6&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::SIZE_OVER_CAP)
         );
     }
@@ -4672,7 +6025,11 @@ mod tests {
         // Q2: batchOrders body-param → deny when capped (can't bound array size).
         // Plain (non-%) value → POLICY_DENIED via the batchOrders guard.
         assert_eq!(
-            aster_check(Some(&aster_policy()), "batchOrders=2&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "batchOrders=2&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::POLICY_DENIED)
         );
         // Mid-token collision (xbatchOrders=) also denies (fail-closed). H1:
@@ -4687,7 +6044,11 @@ mod tests {
         // A url-encoded batch body ([]=%5B%5D) is still denied — the percent-guard
         // catches it first as BAD_REQUEST (also fail-closed, different code).
         assert_eq!(
-            aster_check(Some(&aster_policy()), "batchOrders=%5B%5D&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "batchOrders=%5B%5D&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::BAD_REQUEST)
         );
     }
@@ -4695,14 +6056,24 @@ mod tests {
     #[test]
     fn cr053_asterdex_no_quantity_is_read_or_cancel_ok() {
         // No size in the body (read / cancel-by-id) → nothing to size-cap.
-        assert_eq!(aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&signer=0xa&nonce=1700000000000"), None);
+        assert_eq!(
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&signer=0xa&nonce=1700000000000"
+            ),
+            None
+        );
     }
 
     #[test]
     fn cr053_asterdex_quantity_without_symbol_denied() {
         // A sized order we can't attribute to a symbol can't be capped → deny.
         assert_eq!(
-            aster_check(Some(&aster_policy()), "quantity=1&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "quantity=1&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::POLICY_DENIED)
         );
     }
@@ -4710,7 +6081,10 @@ mod tests {
     #[test]
     fn cr053_asterdex_no_caps_is_legacy_passthrough() {
         // No order_caps declared → no size enforcement (unchanged behaviour).
-        assert_eq!(aster_check(Some(&Policy::default()), "symbol=ASTERUSDT&quantity=99999"), None);
+        assert_eq!(
+            aster_check(Some(&Policy::default()), "symbol=ASTERUSDT&quantity=99999"),
+            None
+        );
         assert_eq!(aster_check(None, "symbol=ASTERUSDT&quantity=99999"), None);
     }
 
@@ -4718,7 +6092,11 @@ mod tests {
     fn cr053_asterdex_duplicate_quantity_bad_request() {
         // Parameter pollution on the size field → bad_request (fail-closed).
         assert_eq!(
-            aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&quantity=1&quantity=99").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&quantity=1&quantity=99"
+            )
+            .as_deref(),
             Some(err_code::BAD_REQUEST)
         );
     }
@@ -4757,18 +6135,29 @@ mod tests {
         // Gemini final-review: a bare valueless `closePosition` / `batchOrders`
         // (no `=`) must also be denied — a permissive backend could honour it.
         assert_eq!(
-            aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&closePosition&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&closePosition&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::POLICY_DENIED)
         );
         assert_eq!(
-            aster_check(Some(&aster_policy()), "batchOrders&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "batchOrders&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::POLICY_DENIED)
         );
         // boundary correctness: real flag matches, mid-token does not.
         assert!(asterdex_flag_present("a&closePosition&b", "closePosition"));
         assert!(asterdex_flag_present("closePosition=true", "closePosition"));
         assert!(!asterdex_flag_present("xclosePosition=1", "closePosition"));
-        assert!(!asterdex_flag_present("symbol=ASTERUSDT&quantity=1", "closePosition"));
+        assert!(!asterdex_flag_present(
+            "symbol=ASTERUSDT&quantity=1",
+            "closePosition"
+        ));
     }
 
     #[test]
@@ -4776,13 +6165,21 @@ mod tests {
         // %71uantity= (%71='q') would slip past the literal quantity= search; the
         // percent-guard rejects any % in a capped body (final-review MEDIUM).
         assert_eq!(
-            aster_check(Some(&aster_policy()), "%71uantity=3&symbol=ASTERUSDT&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "%71uantity=3&symbol=ASTERUSDT&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::BAD_REQUEST)
         );
         // …and a percent-encoded VALUE is likewise rejected (was already caught
         // by cmp_positive_decimals, now caught earlier).
         assert_eq!(
-            aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&quantity=%35&signer=0xa&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&quantity=%35&signer=0xa&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::BAD_REQUEST)
         );
     }
@@ -4792,7 +6189,11 @@ mod tests {
         // quantity= with no value → cmp_positive_decimals("") errors; attribution
         // probe confirms policy max_qty valid → BAD_REQUEST (not INTERNAL_ERROR).
         assert_eq!(
-            aster_check(Some(&aster_policy()), "symbol=ASTERUSDT&quantity=&nonce=1700000000000").as_deref(),
+            aster_check(
+                Some(&aster_policy()),
+                "symbol=ASTERUSDT&quantity=&nonce=1700000000000"
+            )
+            .as_deref(),
             Some(err_code::BAD_REQUEST)
         );
     }
@@ -4830,7 +6231,14 @@ mod tests {
             );
         }
         // Alt sizing / exposure params the byte extractor never knew about.
-        for name in ["quoteOrderQty", "leverage", "notional", "closeAll", "sz", "amount"] {
+        for name in [
+            "quoteOrderQty",
+            "leverage",
+            "notional",
+            "closeAll",
+            "sz",
+            "amount",
+        ] {
             assert!(
                 check_asterdex_body_allow(&format!(
                     "symbol=ASTERUSDT&{name}=999&signer=0xa&nonce=1"
@@ -4915,9 +6323,12 @@ mod tests {
     fn h1_asterdex_floor_denies_uncapped_under_strict() {
         let capped = aster_policy(); // has order_caps
         let uncapped = Policy::default(); // no order_caps
-        // Strict regime: a money-venue policy with no order_caps is refused; with
-        // caps it passes the floor. Non-strict (dev): never floors.
-        assert!(asterdex_floor_denies(true, None), "strict + no policy → deny");
+                                          // Strict regime: a money-venue policy with no order_caps is refused; with
+                                          // caps it passes the floor. Non-strict (dev): never floors.
+        assert!(
+            asterdex_floor_denies(true, None),
+            "strict + no policy → deny"
+        );
         assert!(
             asterdex_floor_denies(true, Some(&uncapped)),
             "strict + no caps → deny"
@@ -4961,9 +6372,22 @@ mod tests {
     /// guarantee: if either side drifts, the hex diverges and this fails.
     #[test]
     fn af2_intent_golden_order_limit() {
-        let o = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), false, Some("coid-abc-001"));
+        let o = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            Some("coid-abc-001"),
+        );
         let msg = build_agent_intent_msg_order(
-            "cust1", "binance", "sign_binance_order", 1714997000000, "coid-abc-001", &o,
+            "cust1",
+            "binance",
+            "sign_binance_order",
+            1714997000000,
+            "coid-abc-001",
+            &o,
         );
         assert_eq!(
             hex::encode(&msg),
@@ -4973,9 +6397,22 @@ mod tests {
 
     #[test]
     fn af2_intent_golden_order_market_reduce_only() {
-        let o = af2_order("BTC-USDT-SWAP", "sell", "1", "market", None, true, Some("coid-xyz-9"));
+        let o = af2_order(
+            "BTC-USDT-SWAP",
+            "sell",
+            "1",
+            "market",
+            None,
+            true,
+            Some("coid-xyz-9"),
+        );
         let msg = build_agent_intent_msg_order(
-            "cust1", "okx", "sign_okx_order", 1714997000000, "coid-xyz-9", &o,
+            "cust1",
+            "okx",
+            "sign_okx_order",
+            1714997000000,
+            "coid-xyz-9",
+            &o,
         );
         assert_eq!(
             hex::encode(&msg),
@@ -4990,8 +6427,12 @@ mod tests {
             order_id: "123456789".to_owned(),
         };
         let msg = build_agent_intent_msg_cancel(
-            "cust1", "binance", "sign_binance_cancel", 1714997000000,
-            "550e8400-e29b-41d4-a716-446655440000", &c,
+            "cust1",
+            "binance",
+            "sign_binance_cancel",
+            1714997000000,
+            "550e8400-e29b-41d4-a716-446655440000",
+            &c,
         );
         assert_eq!(
             hex::encode(&msg),
@@ -5006,8 +6447,10 @@ mod tests {
     fn af2_intent_none_vs_empty_price_differ() {
         let o_none = af2_order("BTCUSDT", "buy", "1", "market", None, false, Some("n"));
         let o_empty = af2_order("BTCUSDT", "buy", "1", "market", Some(""), false, Some("n"));
-        let m_none = build_agent_intent_msg_order("c", "binance", "sign_binance_order", 1, "n", &o_none);
-        let m_empty = build_agent_intent_msg_order("c", "binance", "sign_binance_order", 1, "n", &o_empty);
+        let m_none =
+            build_agent_intent_msg_order("c", "binance", "sign_binance_order", 1, "n", &o_none);
+        let m_empty =
+            build_agent_intent_msg_order("c", "binance", "sign_binance_order", 1, "n", &o_empty);
         assert_ne!(m_none, m_empty);
     }
 
@@ -5016,30 +6459,145 @@ mod tests {
     /// agent signature. Deterministic; mirrors the AF-1 fuzzer style.
     #[test]
     fn af2_intent_every_field_change_alters_bytes() {
-        let base_o = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), false, Some("c1"));
-        let base = build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1", &base_o);
+        let base_o = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            Some("c1"),
+        );
+        let base = build_agent_intent_msg_order(
+            "cust1",
+            "binance",
+            "sign_binance_order",
+            1000,
+            "c1",
+            &base_o,
+        );
         // Each variant differs from base in exactly one dimension.
         let variants = vec![
-            build_agent_intent_msg_order("cust2", "binance", "sign_binance_order", 1000, "c1", &base_o), // customer
-            build_agent_intent_msg_order("cust1", "okx", "sign_binance_order", 1000, "c1", &base_o),     // venue
-            build_agent_intent_msg_order("cust1", "binance", "sign_okx_order", 1000, "c1", &base_o),      // action
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1001, "c1", &base_o), // timestamp
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c2", &base_o), // nonce
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1",
-                &af2_order("ETHUSDT", "buy", "0.001", "limit", Some("50000"), false, Some("c1"))),        // symbol
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1",
-                &af2_order("BTCUSDT", "sell", "0.001", "limit", Some("50000"), false, Some("c1"))),       // side
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1",
-                &af2_order("BTCUSDT", "buy", "0.002", "limit", Some("50000"), false, Some("c1"))),        // qty
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1",
-                &af2_order("BTCUSDT", "buy", "0.001", "market", None, false, Some("c1"))),                // ord_type+price
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1",
-                &af2_order("BTCUSDT", "buy", "0.001", "limit", Some("49999"), false, Some("c1"))),        // price
-            build_agent_intent_msg_order("cust1", "binance", "sign_binance_order", 1000, "c1",
-                &af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), true, Some("c1"))),         // reduce_only
+            build_agent_intent_msg_order(
+                "cust2",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &base_o,
+            ), // customer
+            build_agent_intent_msg_order("cust1", "okx", "sign_binance_order", 1000, "c1", &base_o), // venue
+            build_agent_intent_msg_order("cust1", "binance", "sign_okx_order", 1000, "c1", &base_o), // action
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1001,
+                "c1",
+                &base_o,
+            ), // timestamp
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c2",
+                &base_o,
+            ), // nonce
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &af2_order(
+                    "ETHUSDT",
+                    "buy",
+                    "0.001",
+                    "limit",
+                    Some("50000"),
+                    false,
+                    Some("c1"),
+                ),
+            ), // symbol
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &af2_order(
+                    "BTCUSDT",
+                    "sell",
+                    "0.001",
+                    "limit",
+                    Some("50000"),
+                    false,
+                    Some("c1"),
+                ),
+            ), // side
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &af2_order(
+                    "BTCUSDT",
+                    "buy",
+                    "0.002",
+                    "limit",
+                    Some("50000"),
+                    false,
+                    Some("c1"),
+                ),
+            ), // qty
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &af2_order("BTCUSDT", "buy", "0.001", "market", None, false, Some("c1")),
+            ), // ord_type+price
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &af2_order(
+                    "BTCUSDT",
+                    "buy",
+                    "0.001",
+                    "limit",
+                    Some("49999"),
+                    false,
+                    Some("c1"),
+                ),
+            ), // price
+            build_agent_intent_msg_order(
+                "cust1",
+                "binance",
+                "sign_binance_order",
+                1000,
+                "c1",
+                &af2_order(
+                    "BTCUSDT",
+                    "buy",
+                    "0.001",
+                    "limit",
+                    Some("50000"),
+                    true,
+                    Some("c1"),
+                ),
+            ), // reduce_only
         ];
         for (i, v) in variants.iter().enumerate() {
-            assert_ne!(&base, v, "variant {i} collided with base — a tamper would be invisible");
+            assert_ne!(
+                &base, v,
+                "variant {i} collided with base — a tamper would be invisible"
+            );
         }
         // And no two variants collide with each other (distinct field spaces).
         for i in 0..variants.len() {
@@ -5088,7 +6646,9 @@ mod tests {
         assert!(verify_agent_intent(&pk, Some(&sig), &msg).is_ok());
         // The SAME intent bytes again (replay) → BAD_REQUEST even with a valid sig.
         assert_eq!(
-            verify_agent_intent(&pk, Some(&sig), &msg).err().and_then(|r| r.error.clone()),
+            verify_agent_intent(&pk, Some(&sig), &msg)
+                .err()
+                .and_then(|r| r.error.clone()),
             Some(err_code::BAD_REQUEST.to_owned())
         );
         // Tampered message (same sig, distinct bytes → fresh ledger key) → BAD_REQUEST.
@@ -5099,7 +6659,9 @@ mod tests {
         assert!(verify_agent_intent(&pk, None, b"af2-verify-nosig-B").is_err());
         // Malformed pubkey → INTERNAL_ERROR (policy/deploy bug, not client).
         assert_eq!(
-            verify_agent_intent("zz", Some(&sig), b"af2-verify-badpk-C").err().and_then(|r| r.error.clone()),
+            verify_agent_intent("zz", Some(&sig), b"af2-verify-badpk-C")
+                .err()
+                .and_then(|r| r.error.clone()),
             Some(err_code::INTERNAL_ERROR.to_owned())
         );
     }
@@ -5111,48 +6673,132 @@ mod tests {
         let cust = &id.customer_id;
         let ts = 1_700_000_000_000u64;
         let coid = "af2-coid-order-1";
-        let order = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), false, Some(coid));
+        let order = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            Some(coid),
+        );
         // Agent signs the exact intent the enclave will reconstruct.
-        let msg = build_agent_intent_msg_order(cust, "binance", "sign_binance_order", ts, coid, &order);
+        let msg =
+            build_agent_intent_msg_order(cust, "binance", "sign_binance_order", ts, coid, &order);
         let sig = af2_sign(&sk, &msg);
         let pol = af2_policy(Some(&pk));
         // Untampered → Ok.
         assert!(enforce_agent_intent_order(
-            Some(&pol), &id, "binance", "sign_binance_order", ts, &order, &af2_req(Some(&sig), None)
-        ).is_ok());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_order",
+            ts,
+            &order,
+            &af2_req(Some(&sig), None)
+        )
+        .is_ok());
         // TAMPER: gateway flips side buy→sell (within qty cap) — same signature,
         // reconstructed msg differs → BAD_REQUEST. (fresh coid to avoid replay.)
-        let flipped = af2_order("BTCUSDT", "sell", "0.001", "limit", Some("50000"), false, Some("af2-coid-order-1b"));
+        let flipped = af2_order(
+            "BTCUSDT",
+            "sell",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            Some("af2-coid-order-1b"),
+        );
         assert_eq!(
             enforce_agent_intent_order(
-                Some(&pol), &id, "binance", "sign_binance_order", ts, &flipped, &af2_req(Some(&sig), None)
-            ).err().and_then(|r| r.error.clone()),
+                Some(&pol),
+                &id,
+                "binance",
+                "sign_binance_order",
+                ts,
+                &flipped,
+                &af2_req(Some(&sig), None)
+            )
+            .err()
+            .and_then(|r| r.error.clone()),
             Some(err_code::BAD_REQUEST.to_owned())
         );
         // TAMPER: price change → denied.
-        let repriced = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("1"), false, Some("af2-coid-order-1c"));
+        let repriced = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("1"),
+            false,
+            Some("af2-coid-order-1c"),
+        );
         assert!(enforce_agent_intent_order(
-            Some(&pol), &id, "binance", "sign_binance_order", ts, &repriced, &af2_req(Some(&sig), None)
-        ).is_err());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_order",
+            ts,
+            &repriced,
+            &af2_req(Some(&sig), None)
+        )
+        .is_err());
         // TAMPER: reduce_only flip → denied.
-        let ro = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), true, Some("af2-coid-order-1d"));
+        let ro = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            true,
+            Some("af2-coid-order-1d"),
+        );
         assert!(enforce_agent_intent_order(
-            Some(&pol), &id, "binance", "sign_binance_order", ts, &ro, &af2_req(Some(&sig), None)
-        ).is_err());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_order",
+            ts,
+            &ro,
+            &af2_req(Some(&sig), None)
+        )
+        .is_err());
     }
 
     #[test]
     fn af2_enforce_order_optin_absent_is_ok() {
         // No intent_pubkey → opt-in not enabled → Ok (AF-2-exposed, current behaviour).
         let id = crate::registry::ResolvedIdentity::for_data_signing();
-        let order = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), false, Some("x"));
+        let order = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            Some("x"),
+        );
         assert!(enforce_agent_intent_order(
-            Some(&af2_policy(None)), &id, "binance", "sign_binance_order", 1, &order, &af2_req(None, None)
-        ).is_ok());
+            Some(&af2_policy(None)),
+            &id,
+            "binance",
+            "sign_binance_order",
+            1,
+            &order,
+            &af2_req(None, None)
+        )
+        .is_ok());
         // Also Ok with no policy at all.
         assert!(enforce_agent_intent_order(
-            None, &id, "binance", "sign_binance_order", 1, &order, &af2_req(None, None)
-        ).is_ok());
+            None,
+            &id,
+            "binance",
+            "sign_binance_order",
+            1,
+            &order,
+            &af2_req(None, None)
+        )
+        .is_ok());
     }
 
     #[test]
@@ -5162,15 +6808,45 @@ mod tests {
         let pol = af2_policy(Some(&pk));
         // Order with NO client_order_id under intent enforcement → BAD_REQUEST
         // (there is no nonce to bind / dedup).
-        let no_coid = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), false, None);
+        let no_coid = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            None,
+        );
         assert!(enforce_agent_intent_order(
-            Some(&pol), &id, "binance", "sign_binance_order", 1, &no_coid, &af2_req(Some("00"), None)
-        ).is_err());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_order",
+            1,
+            &no_coid,
+            &af2_req(Some("00"), None)
+        )
+        .is_err());
         // Order with coid but NO signature → BAD_REQUEST.
-        let with_coid = af2_order("BTCUSDT", "buy", "0.001", "limit", Some("50000"), false, Some("af2-coid-nosig"));
+        let with_coid = af2_order(
+            "BTCUSDT",
+            "buy",
+            "0.001",
+            "limit",
+            Some("50000"),
+            false,
+            Some("af2-coid-nosig"),
+        );
         assert!(enforce_agent_intent_order(
-            Some(&pol), &id, "binance", "sign_binance_order", 1, &with_coid, &af2_req(None, None)
-        ).is_err());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_order",
+            1,
+            &with_coid,
+            &af2_req(None, None)
+        )
+        .is_err());
         let _ = sk;
     }
 
@@ -5186,7 +6862,9 @@ mod tests {
             ..Policy::default()
         };
         assert_eq!(
-            enforce_policy(Some(&intent_no_caps), &req).err().and_then(|r| r.error.clone()),
+            enforce_policy(Some(&intent_no_caps), &req)
+                .err()
+                .and_then(|r| r.error.clone()),
             Some(err_code::POLICY_REQUIRED.to_owned()),
             "intent_pubkey without order_caps must be refused"
         );
@@ -5203,13 +6881,22 @@ mod tests {
         assert!(enforce_policy(Some(&intent_with_caps), &req).is_ok());
         // Defence-in-depth: the generic binance-request route denies op=order for
         // an intent key (independent of the floor).
-        assert!(binance_request_order_denied_for_capped("order", Some(&intent_with_caps)));
         assert!(binance_request_order_denied_for_capped(
             "order",
-            Some(&Policy { intent_pubkey: Some("aa".repeat(32)), ..Policy::default() })
+            Some(&intent_with_caps)
+        ));
+        assert!(binance_request_order_denied_for_capped(
+            "order",
+            Some(&Policy {
+                intent_pubkey: Some("aa".repeat(32)),
+                ..Policy::default()
+            })
         ));
         // A non-intent, non-capped policy is unaffected (op=order allowed on generic).
-        assert!(!binance_request_order_denied_for_capped("order", Some(&Policy::default())));
+        assert!(!binance_request_order_denied_for_capped(
+            "order",
+            Some(&Policy::default())
+        ));
     }
 
     #[test]
@@ -5219,18 +6906,42 @@ mod tests {
         let cust = &id.customer_id;
         let ts = 1_700_000_000_000u64;
         let nonce = "af2-cancel-uuid-1";
-        let cancel = crate::proto::CancelRequest { symbol: "BTCUSDT".to_owned(), order_id: "999".to_owned() };
-        let msg = build_agent_intent_msg_cancel(cust, "binance", "sign_binance_cancel", ts, nonce, &cancel);
+        let cancel = crate::proto::CancelRequest {
+            symbol: "BTCUSDT".to_owned(),
+            order_id: "999".to_owned(),
+        };
+        let msg = build_agent_intent_msg_cancel(
+            cust,
+            "binance",
+            "sign_binance_cancel",
+            ts,
+            nonce,
+            &cancel,
+        );
         let sig = af2_sign(&sk, &msg);
         let pol = af2_policy(Some(&pk));
         // Valid cancel intent → Ok.
         assert!(enforce_agent_intent_cancel(
-            Some(&pol), &id, "binance", "sign_binance_cancel", ts, &cancel, &af2_req(Some(&sig), Some(nonce))
-        ).is_ok());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_cancel",
+            ts,
+            &cancel,
+            &af2_req(Some(&sig), Some(nonce))
+        )
+        .is_ok());
         // Missing intent_nonce (no coid to fall back on for cancels) → BAD_REQUEST.
         assert!(enforce_agent_intent_cancel(
-            Some(&pol), &id, "binance", "sign_binance_cancel", ts, &cancel, &af2_req(Some(&sig), None)
-        ).is_err());
+            Some(&pol),
+            &id,
+            "binance",
+            "sign_binance_cancel",
+            ts,
+            &cancel,
+            &af2_req(Some(&sig), None)
+        )
+        .is_err());
     }
 
     // ─── B2: per-order notional cap (qty × price ≤ max_notional) ────────────
@@ -5255,8 +6966,14 @@ mod tests {
     #[test]
     fn b2_notional_limit_under_cap_ok() {
         // 0.01 × 50000 = 500 ≤ 1000; also exactly at the cap (inclusive).
-        assert_eq!(cap_check(&notional_policy(), Some("0.01"), Some("50000")), None);
-        assert_eq!(cap_check(&notional_policy(), Some("0.02"), Some("50000")), None);
+        assert_eq!(
+            cap_check(&notional_policy(), Some("0.01"), Some("50000")),
+            None
+        );
+        assert_eq!(
+            cap_check(&notional_policy(), Some("0.02"), Some("50000")),
+            None
+        );
     }
 
     #[test]
@@ -5347,9 +7064,15 @@ mod tests {
     #[test]
     fn b2_hl_notional_under_cap_ok() {
         let p = hl_notional_policy();
-        assert_eq!(hl_check(Some(&p), &hl_limit_order(0, "0.01", "50000"), None), None);
+        assert_eq!(
+            hl_check(Some(&p), &hl_limit_order(0, "0.01", "50000"), None),
+            None
+        );
         // inclusive boundary.
-        assert_eq!(hl_check(Some(&p), &hl_limit_order(0, "0.02", "50000"), None), None);
+        assert_eq!(
+            hl_check(Some(&p), &hl_limit_order(0, "0.02", "50000"), None),
+            None
+        );
     }
 
     #[test]
@@ -5385,7 +7108,10 @@ mod tests {
     fn b2_hl_no_notional_trigger_unchanged() {
         // Without max_notional, trigger orders remain size-capped only (no
         // behavior change for existing policies).
-        let p = Policy { hl_order_caps: Some(vec![hl_cap(0, "5")]), ..Policy::default() };
+        let p = Policy {
+            hl_order_caps: Some(vec![hl_cap(0, "5")]),
+            ..Policy::default()
+        };
         let trigger = serde_json::json!({"type": "order", "orders": [
             {"a": 0, "b": true, "s": "3", "p": "50000",
              "t": {"trigger": {"isMarket": true, "triggerPx": "50000", "tpsl": "tp"}}}
@@ -5558,12 +7284,12 @@ mod tests {
         // (2) Absent max_notional serializes to byte-identical canonical bytes
         // as a pre-B2 policy (skip_serializing_if) → existing policy hashes,
         // TOFU and authority signatures stay valid.
-        let pre_b2: Policy = serde_json::from_str(
-            r#"{"order_caps":[{"symbol":"BTCUSDT","max_qty":"1"}]}"#,
-        )
-        .unwrap();
+        let pre_b2: Policy =
+            serde_json::from_str(r#"{"order_caps":[{"symbol":"BTCUSDT","max_qty":"1"}]}"#).unwrap();
         let bytes = canonical_policy_signable(&pre_b2).unwrap();
-        assert!(!String::from_utf8(bytes.clone()).unwrap().contains("max_notional"));
+        assert!(!String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains("max_notional"));
         // (3) Adding max_notional CHANGES the canonical bytes → a policy that
         // gains a notional cap requires an authority re-sign (no silent reuse).
         assert_ne!(bytes, canonical_policy_signable(&p).unwrap());
@@ -5607,8 +7333,16 @@ mod tests {
 
         // (op, payload, expected error prefix) — never signs on the deny path.
         let deny: &[(&str, &str, &str)] = &[
-            ("account", "coin=USDT&address=0xattacker&amount=1000&timestamp=1783003070821", "param_not_allowed"),
-            ("order", "asset=USDT&amount=1000&type=1&timestamp=1783003070821", "param_not_allowed"),
+            (
+                "account",
+                "coin=USDT&address=0xattacker&amount=1000&timestamp=1783003070821",
+                "param_not_allowed",
+            ),
+            (
+                "order",
+                "asset=USDT&amount=1000&type=1&timestamp=1783003070821",
+                "param_not_allowed",
+            ),
             ("withdraw", "timestamp=1783003070821", "op_not_allowed"),
         ];
         for (op, payload, prefix) in deny {
@@ -5641,8 +7375,17 @@ mod tests {
         // else the handler would fail closed on a phantom op. Keep the two tables
         // in lock-step.
         for op in [
-            "account", "positionRisk", "openOrders", "orderStatus", "userTrades",
-            "income", "listenKey", "order", "cancel", "allOpenOrders", "leverage",
+            "account",
+            "positionRisk",
+            "openOrders",
+            "orderStatus",
+            "userTrades",
+            "income",
+            "listenKey",
+            "order",
+            "cancel",
+            "allOpenOrders",
+            "leverage",
             "positionMode",
         ] {
             assert!(binance_request_allowed_params(op).is_some(), "{op} params");
@@ -5734,28 +7477,50 @@ mod tests {
         }
     }
     fn index_cap() -> crate::proto::HlOrderCap {
-        crate::proto::HlOrderCap { asset: 0, max_size: "1".to_owned(), max_notional: None }
+        crate::proto::HlOrderCap {
+            asset: 0,
+            max_size: "1".to_owned(),
+            max_notional: None,
+        }
     }
     /// Venue-AWARE, deliberately. The previous helper set only `order_caps` and
     /// would have kept `rot3_covers_every_money_venue` green through the HL bug
     /// — a test that passes by inertia is worse than no test (Gemini #355).
     fn capped_policy(venue: &str) -> Policy {
         if is_hl_venue(venue) {
-            Policy { hl_order_caps: Some(vec![index_cap()]), ..Policy::default() }
+            Policy {
+                hl_order_caps: Some(vec![index_cap()]),
+                ..Policy::default()
+            }
         } else {
-            Policy { order_caps: Some(vec![symbol_cap()]), ..Policy::default() }
+            Policy {
+                order_caps: Some(vec![symbol_cap()]),
+                ..Policy::default()
+            }
         }
     }
     fn uncapped_policy() -> Policy {
-        Policy { order_caps: None, hl_order_caps: None, ..Policy::default() }
+        Policy {
+            order_caps: None,
+            hl_order_caps: None,
+            ..Policy::default()
+        }
     }
     /// The dangerous shape: caps present, but in the field that CANNOT bind an
     /// order on this venue.
     fn wrong_field_policy(venue: &str) -> Policy {
         if is_hl_venue(venue) {
-            Policy { order_caps: Some(vec![symbol_cap()]), hl_order_caps: None, ..Policy::default() }
+            Policy {
+                order_caps: Some(vec![symbol_cap()]),
+                hl_order_caps: None,
+                ..Policy::default()
+            }
         } else {
-            Policy { hl_order_caps: Some(vec![index_cap()]), order_caps: None, ..Policy::default() }
+            Policy {
+                hl_order_caps: Some(vec![index_cap()]),
+                order_caps: None,
+                ..Policy::default()
+            }
         }
     }
 
@@ -5791,8 +7556,14 @@ mod tests {
     #[test]
     fn rot3_covers_every_money_venue() {
         for v in [
-            "binance", "binance_futures", "okx", "bybit", "kucoin", "asterdex",
-            "hyperliquid_main", "hyperliquid_testnet",
+            "binance",
+            "binance_futures",
+            "okx",
+            "bybit",
+            "kucoin",
+            "asterdex",
+            "hyperliquid_main",
+            "hyperliquid_testnet",
         ] {
             assert!(
                 rot3_uncapped_money_key_rejected(true, v, &uncapped_policy()),
@@ -5841,7 +7612,11 @@ mod tests {
                 rot3_uncapped_money_key_rejected(true, v, &wrong_field_policy(v)),
                 "{v}: hl_order_caps is index-keyed and cannot bind a symbol venue"
             );
-            assert!(!rot3_uncapped_money_key_rejected(true, v, &capped_policy(v)));
+            assert!(!rot3_uncapped_money_key_rejected(
+                true,
+                v,
+                &capped_policy(v)
+            ));
         }
     }
 
@@ -5853,20 +7628,48 @@ mod tests {
     /// FALSIFICATION: drop `&& !c.is_empty()` from `non_empty` and this goes red.
     #[test]
     fn rot3_empty_cap_vector_counts_as_uncapped() {
-        let empty_sym = Policy { order_caps: Some(vec![]), ..Policy::default() };
-        let empty_hl = Policy { hl_order_caps: Some(vec![]), ..Policy::default() };
-        assert!(rot3_uncapped_money_key_rejected(true, "binance", &empty_sym));
-        assert!(rot3_uncapped_money_key_rejected(true, "hyperliquid_main", &empty_hl));
+        let empty_sym = Policy {
+            order_caps: Some(vec![]),
+            ..Policy::default()
+        };
+        let empty_hl = Policy {
+            hl_order_caps: Some(vec![]),
+            ..Policy::default()
+        };
+        assert!(rot3_uncapped_money_key_rejected(
+            true, "binance", &empty_sym
+        ));
+        assert!(rot3_uncapped_money_key_rejected(
+            true,
+            "hyperliquid_main",
+            &empty_hl
+        ));
     }
 
     /// ROT-4: the two SPOT reads are allowed for a capped key, with the same
     /// filter shapes as their futures twins.
     #[test]
     fn rot4_spot_reads_allowed_for_capped_key() {
-        assert!(generic_capped_op_allowed("binance", "GET", "/api/v3/account", "", ""));
-        assert!(generic_capped_op_allowed("binance", "GET", "/api/v3/openOrders", "", ""));
         assert!(generic_capped_op_allowed(
-            "binance", "GET", "/api/v3/openOrders", "symbol=BTCUSDT", ""
+            "binance",
+            "GET",
+            "/api/v3/account",
+            "",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/api/v3/openOrders",
+            "",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/api/v3/openOrders",
+            "symbol=BTCUSDT",
+            ""
         ));
     }
 
@@ -5877,11 +7680,26 @@ mod tests {
     #[test]
     fn rot4_spot_order_and_cancel_stay_denied() {
         assert!(!generic_capped_op_allowed(
-            "binance", "POST", "/api/v3/order",
-            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=1000", ""
+            "binance",
+            "POST",
+            "/api/v3/order",
+            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=1000",
+            ""
         ));
-        assert!(!generic_capped_op_allowed("binance", "DELETE", "/api/v3/order", "symbol=BTCUSDT", ""));
-        assert!(!generic_capped_op_allowed("binance", "DELETE", "/api/v3/openOrders", "symbol=BTCUSDT", ""));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "DELETE",
+            "/api/v3/order",
+            "symbol=BTCUSDT",
+            ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "DELETE",
+            "/api/v3/openOrders",
+            "symbol=BTCUSDT",
+            ""
+        ));
     }
 
     /// ROT-4 must not reopen the smuggling hole the futures reads already close:
@@ -5890,17 +7708,31 @@ mod tests {
     #[test]
     fn rot4_spot_reads_reject_smuggled_order_params() {
         assert!(!generic_capped_op_allowed(
-            "binance", "GET", "/api/v3/account", "symbol=BTCUSDT&side=BUY&quantity=1", ""
+            "binance",
+            "GET",
+            "/api/v3/account",
+            "symbol=BTCUSDT&side=BUY&quantity=1",
+            ""
         ));
         assert!(!generic_capped_op_allowed(
-            "binance", "GET", "/api/v3/openOrders", "symbol=BTCUSDT&side=SELL", ""
+            "binance",
+            "GET",
+            "/api/v3/openOrders",
+            "symbol=BTCUSDT&side=SELL",
+            ""
         ));
         assert!(
             !generic_capped_op_allowed("binance", "GET", "/api/v3/account", "", "{\"qty\":1}"),
             "no sanctioned read carries a body"
         );
         assert!(
-            !generic_capped_op_allowed("binance", "GET", "/api/v3/openOrders?symbol=A", "symbol=B", ""),
+            !generic_capped_op_allowed(
+                "binance",
+                "GET",
+                "/api/v3/openOrders?symbol=A",
+                "symbol=B",
+                ""
+            ),
             "query in two places must never validate"
         );
     }
@@ -5920,12 +7752,21 @@ mod tests {
             (E::BadPubkey, err_code::REGISTRY_SIGNATURE_REJECTED),
             (E::BadSignature, err_code::REGISTRY_SIGNATURE_REJECTED),
             (E::SignatureInvalid, err_code::REGISTRY_SIGNATURE_REJECTED),
-            (E::ContentHashMismatch, err_code::REGISTRY_SIGNATURE_REJECTED),
+            (
+                E::ContentHashMismatch,
+                err_code::REGISTRY_SIGNATURE_REJECTED,
+            ),
             (E::MalformedEntries, err_code::REGISTRY_ENTRIES_REJECTED),
             (E::Empty, err_code::REGISTRY_ENTRIES_REJECTED),
             (E::UnsafeId, err_code::REGISTRY_ENTRIES_REJECTED),
             (E::ReservedVenue, err_code::REGISTRY_ENTRIES_REJECTED),
-            (E::NonMonotonicVersion { got: 2, max_known: 103 }, err_code::REGISTRY_VERSION_REJECTED),
+            (
+                E::NonMonotonicVersion {
+                    got: 2,
+                    max_known: 103,
+                },
+                err_code::REGISTRY_VERSION_REJECTED,
+            ),
         ];
         for (err, want) in &cases {
             assert_eq!(err.wire_code(), *want, "wrong code for {err:?}");
@@ -5943,22 +7784,57 @@ mod tests {
     #[test]
     fn rot6_version_code_leaks_no_value() {
         use crate::registry::RegistryError as E;
-        let code = E::NonMonotonicVersion { got: 2, max_known: 103 }.wire_code();
+        let code = E::NonMonotonicVersion {
+            got: 2,
+            max_known: 103,
+        }
+        .wire_code();
         assert!(!code.contains("103"), "wire code must not carry max_known");
-        assert!(!code.contains('2'), "wire code must not carry the attempted version");
+        assert!(
+            !code.contains('2'),
+            "wire code must not carry the attempted version"
+        );
         assert_eq!(
             code,
-            E::NonMonotonicVersion { got: 9, max_known: 7 }.wire_code(),
+            E::NonMonotonicVersion {
+                got: 9,
+                max_known: 7
+            }
+            .wire_code(),
             "the code must be value-independent"
         );
     }
 
     #[test]
     fn cr051_binance_safe_reads_and_cancel_allowed() {
-        assert!(generic_capped_op_allowed("binance", "GET", "/fapi/v2/account", "", ""));
-        assert!(generic_capped_op_allowed("binance", "GET", "/fapi/v1/openOrders", "", ""));
-        assert!(generic_capped_op_allowed("binance", "GET", "/fapi/v1/openOrders", "symbol=BTCUSDT", ""));
-        assert!(generic_capped_op_allowed("binance", "DELETE", "/fapi/v1/allOpenOrders", "symbol=BTCUSDT", ""));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v2/account",
+            "",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/openOrders",
+            "",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/openOrders",
+            "symbol=BTCUSDT",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "DELETE",
+            "/fapi/v1/allOpenOrders",
+            "symbol=BTCUSDT",
+            ""
+        ));
     }
 
     #[test]
@@ -5970,7 +7846,13 @@ mod tests {
             "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=1000",
             ""
         ));
-        assert!(!generic_capped_op_allowed("binance", "POST", "/fapi/v1/batchOrders", "", ""));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "POST",
+            "/fapi/v1/batchOrders",
+            "",
+            ""
+        ));
     }
 
     #[test]
@@ -6009,15 +7891,45 @@ mod tests {
             "&symbol=BTCUSDT&side=BUY&type=MARKET&quantity=1000"
         ));
         // Same for open-orders + cancel-all with a body.
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/openOrders", "symbol=BTCUSDT", "x"));
-        assert!(!generic_capped_op_allowed("binance", "DELETE", "/fapi/v1/allOpenOrders", "symbol=BTCUSDT", "x"));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/openOrders",
+            "symbol=BTCUSDT",
+            "x"
+        ));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "DELETE",
+            "/fapi/v1/allOpenOrders",
+            "symbol=BTCUSDT",
+            "x"
+        ));
     }
 
     #[test]
     fn cr051_binance_filter_edge_cases() {
-        assert!(!generic_capped_op_allowed("binance", "DELETE", "/fapi/v1/allOpenOrders", "", "")); // symbol required
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/openOrders", "symbol=BTC&quantity=1000", "")); // extra param
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/openOrders", "symbol=", "")); // empty value
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "DELETE",
+            "/fapi/v1/allOpenOrders",
+            "",
+            ""
+        )); // symbol required
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/openOrders",
+            "symbol=BTC&quantity=1000",
+            ""
+        )); // extra param
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/openOrders",
+            "symbol=",
+            ""
+        )); // empty value
     }
 
     #[test]
@@ -6031,7 +7943,13 @@ mod tests {
     #[test]
     fn gate2_binance_user_trades_allowed_and_guarded() {
         // symbol REQUIRED, plus read-only filters / pagination.
-        assert!(generic_capped_op_allowed("binance", "GET", "/fapi/v1/userTrades", "symbol=BTCUSDT", ""));
+        assert!(generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/userTrades",
+            "symbol=BTCUSDT",
+            ""
+        ));
         assert!(generic_capped_op_allowed(
             "binance",
             "GET",
@@ -6047,9 +7965,27 @@ mod tests {
             ""
         ));
         // symbol is REQUIRED — absent (empty or only other filters) is denied.
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/userTrades", "", ""));
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/userTrades", "limit=500", ""));
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/userTrades", "symbol=", ""));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/userTrades",
+            "",
+            ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/userTrades",
+            "limit=500",
+            ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/userTrades",
+            "symbol=",
+            ""
+        ));
         // Unknown / order params rejected (no smuggle past the read gate).
         assert!(!generic_capped_op_allowed(
             "binance",
@@ -6067,9 +8003,21 @@ mod tests {
             ""
         ));
         // Non-token value (path / encoding tricks) rejected.
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/userTrades", "symbol=BTC/USDT", ""));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/userTrades",
+            "symbol=BTC/USDT",
+            ""
+        ));
         // Body must be empty (Binance HMAC signs query+body → body-smuggle guard).
-        assert!(!generic_capped_op_allowed("binance", "GET", "/fapi/v1/userTrades", "symbol=BTCUSDT", "x"));
+        assert!(!generic_capped_op_allowed(
+            "binance",
+            "GET",
+            "/fapi/v1/userTrades",
+            "symbol=BTCUSDT",
+            "x"
+        ));
         // Double-query (path-embedded ? AND a separate query) rejected.
         assert!(!generic_capped_op_allowed(
             "binance",
@@ -6084,7 +8032,13 @@ mod tests {
     fn gate2_okx_fills_history_allowed_and_guarded() {
         // instType REQUIRED (OKX); plus read-only filters / pagination. OKX embeds
         // the query in the path (?instType=…), so exercise that shape.
-        assert!(generic_capped_op_allowed("okx", "GET", "/api/v5/trade/fills-history?instType=SWAP", "", ""));
+        assert!(generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/trade/fills-history?instType=SWAP",
+            "",
+            ""
+        ));
         assert!(generic_capped_op_allowed(
             "okx",
             "GET",
@@ -6100,7 +8054,13 @@ mod tests {
             ""
         ));
         // instType REQUIRED — absent / empty is denied.
-        assert!(!generic_capped_op_allowed("okx", "GET", "/api/v5/trade/fills-history", "", ""));
+        assert!(!generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/trade/fills-history",
+            "",
+            ""
+        ));
         assert!(!generic_capped_op_allowed(
             "okx",
             "GET",
@@ -6144,9 +8104,27 @@ mod tests {
 
     #[test]
     fn cr051_okx_safe_reads_allowed_incl_embedded_query() {
-        assert!(generic_capped_op_allowed("okx", "GET", "/api/v5/account/balance", "", ""));
-        assert!(generic_capped_op_allowed("okx", "GET", "/api/v5/account/positions", "", ""));
-        assert!(generic_capped_op_allowed("okx", "GET", "/api/v5/trade/orders-pending", "", ""));
+        assert!(generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/account/balance",
+            "",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/account/positions",
+            "",
+            ""
+        ));
+        assert!(generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/trade/orders-pending",
+            "",
+            ""
+        ));
         // OKX merges the filter into the path (?instId=…):
         assert!(generic_capped_op_allowed(
             "okx",
@@ -6159,12 +8137,36 @@ mod tests {
 
     #[test]
     fn cr051_okx_order_and_smuggle_denied() {
-        assert!(!generic_capped_op_allowed("okx", "POST", "/api/v5/trade/order", "", ""));
-        assert!(!generic_capped_op_allowed("okx", "POST", "/api/v5/trade/batch-orders", "", ""));
+        assert!(!generic_capped_op_allowed(
+            "okx",
+            "POST",
+            "/api/v5/trade/order",
+            "",
+            ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "okx",
+            "POST",
+            "/api/v5/trade/batch-orders",
+            "",
+            ""
+        ));
         // balance path but smuggled order params embedded → denied
-        assert!(!generic_capped_op_allowed("okx", "GET", "/api/v5/account/balance?instId=X&sz=999", "", ""));
+        assert!(!generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/account/balance?instId=X&sz=999",
+            "",
+            ""
+        ));
         // safe okx read but with a body → denied (okx prehash includes body)
-        assert!(!generic_capped_op_allowed("okx", "GET", "/api/v5/account/balance", "", "{\"sz\":\"999\"}"));
+        assert!(!generic_capped_op_allowed(
+            "okx",
+            "GET",
+            "/api/v5/account/balance",
+            "",
+            "{\"sz\":\"999\"}"
+        ));
     }
 
     #[test]
@@ -6220,9 +8222,27 @@ mod tests {
 
     #[test]
     fn cr051_bybit_kucoin_unknown_have_no_safe_generic_ops() {
-        assert!(!generic_capped_op_allowed("bybit", "GET", "/v5/account/wallet-balance", "", ""));
-        assert!(!generic_capped_op_allowed("kucoin", "GET", "/api/v1/accounts", "", ""));
-        assert!(!generic_capped_op_allowed("unknown", "GET", "/anything", "", ""));
+        assert!(!generic_capped_op_allowed(
+            "bybit",
+            "GET",
+            "/v5/account/wallet-balance",
+            "",
+            ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "kucoin",
+            "GET",
+            "/api/v1/accounts",
+            "",
+            ""
+        ));
+        assert!(!generic_capped_op_allowed(
+            "unknown",
+            "GET",
+            "/anything",
+            "",
+            ""
+        ));
     }
 
     #[test]
@@ -6486,6 +8506,9 @@ mod tests {
             intent_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         }
     }
 
@@ -6570,8 +8593,8 @@ mod tests {
     fn validate_asterdex_body_accepts_well_formed_request() {
         // Real-shape body: signer=<20 bytes derived>, nonce=16 digits.
         let derived: [u8; 20] = [
-            0x19, 0xe7, 0xe3, 0x76, 0xe7, 0xc2, 0x13, 0xb7, 0xe7, 0xe7, 0xe4, 0x6c,
-            0xc7, 0x0a, 0x5d, 0xd0, 0x86, 0xda, 0xff, 0x2a,
+            0x19, 0xe7, 0xe3, 0x76, 0xe7, 0xc2, 0x13, 0xb7, 0xe7, 0xe7, 0xe4, 0x6c, 0xc7, 0x0a,
+            0x5d, 0xd0, 0x86, 0xda, 0xff, 0x2a,
         ];
         let body = "nonce=1778670074644885\
                     &signer=0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a\
@@ -6862,6 +8885,9 @@ mod tests {
             intent_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         }
     }
 
@@ -6877,7 +8903,10 @@ mod tests {
             data: None,
             ..hl_req_template("sign_data")
         };
-        assert_eq!(handle_seeded(req).error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert_eq!(
+            handle_seeded(req).error.as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
     }
 
     #[test]
@@ -6893,15 +8922,27 @@ mod tests {
     }
 
     #[test]
-    fn sign_hyperliquid_main_order_hard_denied() {
-        // deny-HL-main: a well-formed HL MAINNET order is HARD-DENIED before any
-        // secret load — never signed (source="a" = real Arbitrum funds). This is
-        // also the chokepoint for the generic /sign and /hedge paths.
-        // (Replaces the former missing-nonce / missing-creds / bad-vault tests:
-        // those exercised loader-stage validation the deny now short-circuits.)
+    fn rot1_sign_hyperliquid_main_order_reaches_the_floor_instead_of_a_blanket_deny() {
+        // ROT-1 replaced the blanket deny with the ordinary money-venue floor.
+        // What must be asserted is NOT "it is allowed" — it is that the request
+        // now travels the same road as testnet and still produces NO signature
+        // without a key: the seed token carries no `hyperliquid_main` grant, so
+        // it stops at the venue ACL.
         let resp = handle_seeded(hl_req_template("sign_hyperliquid_main_order"));
-        assert_eq!(resp.error.as_deref(), Some(err_code::POLICY_DENIED));
-        assert!(resp.hl_signature.is_none());
+        assert_ne!(
+            resp.error.as_deref(),
+            Some(err_code::POLICY_DENIED),
+            "the blanket deny is lifted — a denial here would mean ROT-1 never took effect"
+        );
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(err_code::BAD_REQUEST),
+            "without the venue grant it must stop at the ACL, on the normal load path"
+        );
+        assert!(
+            resp.hl_signature.is_none(),
+            "no signature may exist without a decrypted key — this is the assertion that matters"
+        );
     }
 
     #[test]
@@ -6946,8 +8987,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_hyperliquid_main_cancel_hard_denied() {
-        // deny-HL-main: a well-formed HL MAINNET cancel is HARD-DENIED.
+    fn rot1_sign_hyperliquid_main_cancel_reaches_the_floor_instead_of_a_blanket_deny() {
         let req = SignRequest {
             hl_action: Some(serde_json::json!({
                 "type": "cancel",
@@ -6956,7 +8996,9 @@ mod tests {
             ..hl_req_template("sign_hyperliquid_main_cancel")
         };
         let resp = handle_seeded(req);
-        assert_eq!(resp.error.as_deref(), Some(err_code::POLICY_DENIED));
+        assert_ne!(resp.error.as_deref(), Some(err_code::POLICY_DENIED));
+        assert_eq!(resp.error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert!(resp.hl_signature.is_none());
     }
 
     #[test]
@@ -7056,6 +9098,9 @@ mod tests {
             intent_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         }
     }
 
@@ -7075,10 +9120,7 @@ mod tests {
     #[test]
     fn enforce_policy_allowed_actions_permits_listed() {
         let p = Policy {
-            allowed_actions: Some(vec![
-                "sign_binance".to_owned(),
-                "sign_okx".to_owned(),
-            ]),
+            allowed_actions: Some(vec!["sign_binance".to_owned(), "sign_okx".to_owned()]),
             ..Policy::default()
         };
         let req = policy_test_req("sign_binance", "POST", "/api/v1/order");
@@ -7165,7 +9207,10 @@ mod tests {
         };
         let req = policy_test_req("sign_binance", "POST", "/api/v1/withdraw/apply");
         let err = enforce_policy(Some(&p), &req).unwrap_err();
-        assert_eq!(err.error.as_deref(), Some(err_code::WITHDRAWAL_NOT_SIGNABLE));
+        assert_eq!(
+            err.error.as_deref(),
+            Some(err_code::WITHDRAWAL_NOT_SIGNABLE)
+        );
     }
 
     #[test]
@@ -7183,7 +9228,11 @@ mod tests {
         // Real-world: "Binance only, trading endpoints only, no withdrawals"
         let p = Policy {
             allowed_actions: Some(vec!["sign_binance".to_owned()]),
-            allowed_methods: Some(vec!["GET".to_owned(), "POST".to_owned(), "DELETE".to_owned()]),
+            allowed_methods: Some(vec![
+                "GET".to_owned(),
+                "POST".to_owned(),
+                "DELETE".to_owned(),
+            ]),
             allowed_path_prefixes: Some(vec![
                 "/api/v3/order".to_owned(),
                 "/fapi/v1/order".to_owned(),
@@ -7366,7 +9415,12 @@ mod tests {
             ..Policy::default()
         };
         // With only an empty prefix, NOTHING should match.
-        for path in &["/", "/fapi/v1/order", "/anything", "/sapi/v1/capital/withdraw"] {
+        for path in &[
+            "/",
+            "/fapi/v1/order",
+            "/anything",
+            "/sapi/v1/capital/withdraw",
+        ] {
             let req = policy_test_req("sign_binance", "POST", path);
             let err = enforce_policy(Some(&p), &req).unwrap_err();
             assert_eq!(
@@ -7421,11 +9475,7 @@ mod tests {
             ..Policy::default()
         };
         // EOS, '/', and '?' are all valid prefix terminators.
-        assert!(enforce_policy(
-            Some(&p),
-            &policy_test_req("sign_binance", "POST", "/api")
-        )
-        .is_ok());
+        assert!(enforce_policy(Some(&p), &policy_test_req("sign_binance", "POST", "/api")).is_ok());
         assert!(enforce_policy(
             Some(&p),
             &policy_test_req("sign_binance", "POST", "/api/v1/order")
@@ -7451,23 +9501,22 @@ mod tests {
         };
         // prefix="/api/" should accept ANY path that starts with "/api/"
         // — the trailing `/` makes the boundary unambiguous.
-        assert!(enforce_policy(
-            Some(&p),
-            &policy_test_req("sign_binance", "POST", "/api/v1/order")
-        )
-        .is_ok(), "prefix='/api/' must accept /api/v1/order");
-        assert!(enforce_policy(
-            Some(&p),
-            &policy_test_req("sign_binance", "POST", "/api/")
-        )
-        .is_ok(), "prefix='/api/' must accept exact match");
+        assert!(
+            enforce_policy(
+                Some(&p),
+                &policy_test_req("sign_binance", "POST", "/api/v1/order")
+            )
+            .is_ok(),
+            "prefix='/api/' must accept /api/v1/order"
+        );
+        assert!(
+            enforce_policy(Some(&p), &policy_test_req("sign_binance", "POST", "/api/")).is_ok(),
+            "prefix='/api/' must accept exact match"
+        );
         // But NOT match "/api" without the slash — that's a different
         // path (would be matched by prefix "/api" without trailing /).
-        let err = enforce_policy(
-            Some(&p),
-            &policy_test_req("sign_binance", "POST", "/api"),
-        )
-        .unwrap_err();
+        let err =
+            enforce_policy(Some(&p), &policy_test_req("sign_binance", "POST", "/api")).unwrap_err();
         assert_eq!(err.error.as_deref(), Some(err_code::ACTION_NOT_ALLOWED));
     }
 
@@ -7862,6 +9911,42 @@ mod tests {
         // Dropped after the env-var restoration in Drop::drop.
         _lock: std::sync::MutexGuard<'static, ()>,
     }
+    /// Guard for SEVERAL env vars under ONE lock acquisition.
+    ///
+    /// `EnvVarGuard` holds `ENV_LOCK` for its lifetime, so two of them in the
+    /// same test would deadlock on the second `set`. The mint-time floor needs
+    /// both `SIGNER_REQUIRE_POLICY` and `SIGNER_POLICY_PUBKEY` at once, so it
+    /// gets a guard that takes the lock once and restores every var on drop.
+    struct EnvVarsGuard {
+        prev: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl EnvVarsGuard {
+        fn set(pairs: &[(&'static str, String)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut prev = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                prev.push((*k, std::env::var(k).ok()));
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+            }
+            Self { prev, _lock: lock }
+        }
+    }
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             // If another test poisoned the mutex, recover silently — the
@@ -7923,7 +10008,9 @@ mod tests {
     /// of `"1"|"true"|"TRUE"|"yes"` which rejected `True`, `YES`, etc).
     #[test]
     fn policy_required_accepts_all_truthy_cases() {
-        for v in &["1", "true", "True", "TRUE", "TrUe", "yes", "YES", "yEs", "on", "ON", "On"] {
+        for v in &[
+            "1", "true", "True", "TRUE", "TrUe", "yes", "YES", "yEs", "on", "ON", "On",
+        ] {
             let _g = EnvVarGuard::set("SIGNER_REQUIRE_POLICY", v);
             assert!(
                 policy_required(),
@@ -8010,19 +10097,31 @@ mod tests {
         let mut none = req_template();
         none.action = "sign_data".to_owned();
         none.data = None;
-        assert_eq!(handle_seeded(none).error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert_eq!(
+            handle_seeded(none).error.as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
 
         // (size-cap) an oversized populated payload → BAD_REQUEST, before KMS.
         let mut big = req_template();
         big.action = "sign_data".to_owned();
-        big.data = Some(format!(r#"{{"x":"{}"}}"#, "a".repeat(MAX_ATTESTED_DATA_BYTES)));
-        assert_eq!(handle_seeded(big).error.as_deref(), Some(err_code::BAD_REQUEST));
+        big.data = Some(format!(
+            r#"{{"x":"{}"}}"#,
+            "a".repeat(MAX_ATTESTED_DATA_BYTES)
+        ));
+        assert_eq!(
+            handle_seeded(big).error.as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
 
         // (dup-key) duplicate object keys in a populated payload → fail-closed.
         let mut dup = req_template();
         dup.action = "sign_data".to_owned();
         dup.data = Some(r#"{"a":"1","a":"2"}"#.to_owned());
-        assert_eq!(handle_seeded(dup).error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert_eq!(
+            handle_seeded(dup).error.as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
     }
 
     #[test]
@@ -8040,14 +10139,23 @@ mod tests {
         assert_eq!(ds.customer_id, "attested-data");
         assert!(ds.venue_allowed("data-signing"));
         let ctx = ds.encryption_context("data-signing");
-        assert_eq!(ctx.get("customer_id").map(String::as_str), Some("attested-data"));
-        assert_eq!(ctx.get("venue_id").map(String::as_str), Some("data-signing"));
+        assert_eq!(
+            ctx.get("customer_id").map(String::as_str),
+            Some("attested-data")
+        );
+        assert_eq!(
+            ctx.get("venue_id").map(String::as_str),
+            Some("data-signing")
+        );
         // Invariant (c) (crypto-panel #211 regression-guard): the data-signing
         // identity can ONLY sign data-signing — never a money/venue key
         // (authorize_venue denies it; the KMS context also wouldn't decrypt a
         // venue blob). So even a money-shaped payload through /sign-data can never
         // reach a venue key.
-        assert!(!ds.venue_allowed("binance"), "data-signing identity must never sign money");
+        assert!(
+            !ds.venue_allowed("binance"),
+            "data-signing identity must never sign money"
+        );
         assert!(!ds.venue_allowed("hyperliquid_main"));
         assert!(!ds.venue_allowed("x402"));
 
@@ -8056,15 +10164,24 @@ mod tests {
         // → KMS AccessDenied). Defense-in-depth behind the gateway operator route.
         crate::registry::test_install(&[("tok-t", "cust-t", &["binance"])]);
         let t = crate::registry::resolve("tok-t").expect("tenant seeded");
-        assert!(!t.venue_allowed("data-signing"), "a tenant must never reach the data key");
+        assert!(
+            !t.venue_allowed("data-signing"),
+            "a tenant must never reach the data key"
+        );
     }
 
     // ───────────────── HL testnet dispatcher (source="b") ─────────────────
     #[test]
     fn hyperliquid_testnet_dispatched_and_not_denied() {
         // venue arm exists (separate from mainnet).
-        assert_eq!(venue_for_action("sign_hyperliquid_testnet_order"), Some("hyperliquid_testnet"));
-        assert_eq!(venue_for_action("sign_hyperliquid_testnet_cancel"), Some("hyperliquid_testnet"));
+        assert_eq!(
+            venue_for_action("sign_hyperliquid_testnet_order"),
+            Some("hyperliquid_testnet")
+        );
+        assert_eq!(
+            venue_for_action("sign_hyperliquid_testnet_cancel"),
+            Some("hyperliquid_testnet")
+        );
 
         let order = serde_json::json!({"type": "order", "orders": [{}]});
         let mk = |action: &str| {
@@ -8074,28 +10191,34 @@ mod tests {
             r.nonce = Some(1);
             r
         };
-        // Testnet is NOT hard-denied (unlike mainnet): with a valid shape but the
-        // broad seed token lacking the `hyperliquid_testnet` grant it stops at the
-        // venue ACL (BAD_REQUEST) — it reaches the normal load path, never the
-        // POLICY_DENIED hard-deny. Mainnet with the same shape stays DENIED.
+        // ROT-1: mainnet and testnet now travel the SAME road and differ only in
+        // the phantom-agent source byte. With a valid shape but a seed token
+        // carrying neither venue grant, both stop at the venue ACL. Asserting
+        // they are EQUAL is the point: if a future change re-special-cases one
+        // of them, this goes red regardless of which way it was special-cased.
         let testnet = handle_seeded(mk("sign_hyperliquid_testnet_order"));
+        let mainnet = handle_seeded(mk("sign_hyperliquid_main_order"));
         assert_ne!(
             testnet.error.as_deref(),
             Some(err_code::POLICY_DENIED),
             "testnet must NOT be hard-denied"
         );
         assert_eq!(
-            handle_seeded(mk("sign_hyperliquid_main_order")).error.as_deref(),
-            Some(err_code::POLICY_DENIED),
-            "mainnet stays hard-denied"
+            mainnet.error.as_deref(),
+            testnet.error.as_deref(),
+            "ROT-1: mainnet must reach the same floor as testnet, not a blanket deny"
         );
+        assert!(mainnet.hl_signature.is_none() && testnet.hl_signature.is_none());
 
         // Wrong action shape → BAD_REQUEST before any KMS work.
         let mut bad = req_template();
         bad.action = "sign_hyperliquid_testnet_order".to_owned();
         bad.hl_action = Some(serde_json::json!({"type": "cancel"}));
         bad.nonce = Some(1);
-        assert_eq!(handle_seeded(bad).error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert_eq!(
+            handle_seeded(bad).error.as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
 
         // A tenant granted ONLY hyperliquid_testnet can reach it, and is NOT
         // granted mainnet (venue isolation).
@@ -8105,7 +10228,10 @@ mod tests {
         crate::registry::test_install(&[("tok-hl", "cust-hl", &["hyperliquid_testnet"])]);
         let id = crate::registry::resolve("tok-hl").expect("seeded");
         assert!(id.venue_allowed("hyperliquid_testnet"));
-        assert!(!id.venue_allowed("hyperliquid_main"), "testnet grant must not imply mainnet");
+        assert!(
+            !id.venue_allowed("hyperliquid_main"),
+            "testnet grant must not imply mainnet"
+        );
     }
 
     // ───────────────── attested-data provisioning (Option-1) ─────────────────
@@ -8116,7 +10242,10 @@ mod tests {
         let mut no_creds = req_template();
         no_creds.action = "provision_data_key".to_owned();
         no_creds.aws_credentials = None;
-        assert_eq!(handle(no_creds).error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert_eq!(
+            handle(no_creds).error.as_deref(),
+            Some(err_code::BAD_REQUEST)
+        );
 
         let mut no_key = req_template();
         no_key.action = "provision_data_key".to_owned();
@@ -8127,6 +10256,438 @@ mod tests {
         });
         no_key.key_id = None;
         assert_eq!(handle(no_key).error.as_deref(), Some(err_code::BAD_REQUEST));
+    }
+
+    /// ROT-9 fixtures. A 64-char hex string and a 42-char address stand in for
+    /// the real ones — `build_data_key_plaintext` is pure, so no enclave, no
+    /// KMS and no network are needed to assert what it produces.
+    fn data_key_plaintext_fixture() -> Zeroizing<Vec<u8>> {
+        build_data_key_plaintext(
+            b"1111111111111111111111111111111111111111111111111111111111111111",
+            "0x6eb000e9c1a86c4ba20f4fbd563bcb43e8d93f82",
+        )
+    }
+
+    #[test]
+    fn rot9_data_key_blob_is_policy_wrapped_not_legacy() {
+        // The whole point: the strict regime rejects `ParsedBlob::Legacy`
+        // unconditionally, so a provisioned key that parses as Legacy is a key
+        // the prod enclave can never load. That is exactly what shipped before
+        // ROT-9 and it cost a live window.
+        let pt = data_key_plaintext_fixture();
+        match ParsedBlob::from_plaintext(&pt[..]).expect("must parse") {
+            ParsedBlob::WithPolicy {
+                policy,
+                secret_json,
+            } => {
+                // Secret half still deserializes into the EVM shape the prod
+                // sign_data path expects. Routed through `SecretJson` so the
+                // test mirrors the prod call shape rather than a looser one —
+                // the fixture key is a constant, but a reader who copies this
+                // into a test with a real key inherits the wiping behaviour.
+                let secret: crate::proto::HyperliquidSecret =
+                    crate::proto::SecretJson::new(secret_json)
+                        .deserialize_into()
+                        .expect("secret must parse");
+                assert!(secret.is_complete(), "secret half must survive wrapping");
+                // Policy half must CONSTRAIN, not merely exist.
+                let allowed = policy
+                    .allowed_actions
+                    .as_ref()
+                    .expect("policy must pin an action allow-list, not leave it None");
+                assert!(
+                    !allowed.is_empty(),
+                    "an empty allow-list is deny-all, which would brick the key"
+                );
+                assert_eq!(allowed, &vec!["sign_data".to_owned()]);
+            }
+            ParsedBlob::Legacy(_) => {
+                panic!(
+                    "provisioned blob parsed as Legacy — unloadable under SIGNER_REQUIRE_POLICY=1"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn rot9_data_key_policy_permits_sign_data_and_denies_everything_else() {
+        // FALSIFICATION: widen the allow-list (or empty the policy to `{}`) and
+        // this test goes red on the second assert — a permit-all policy would
+        // satisfy the strict gate while governing nothing.
+        let pt = data_key_plaintext_fixture();
+        let policy = match ParsedBlob::from_plaintext(&pt[..]).unwrap() {
+            ParsedBlob::WithPolicy {
+                policy,
+                secret_json,
+            } => {
+                // Wipe the secret half immediately — `let _ =` drops here, not
+                // at end of scope. Only the policy is under test.
+                let _ = crate::proto::SecretJson::new(secret_json);
+                policy
+            }
+            ParsedBlob::Legacy(_) => panic!("not policy-wrapped"),
+        };
+
+        let mut ok = req_template();
+        ok.action = "sign_data".to_owned();
+        assert!(
+            enforce_policy(Some(&policy), &ok).is_ok(),
+            "the service key must still be able to sign data"
+        );
+
+        for forbidden in ["sign_binance", "sign_binance_order", "sign_okx", "sign"] {
+            let mut bad = req_template();
+            bad.action = forbidden.to_owned();
+            let denied = enforce_policy(Some(&policy), &bad)
+                .err()
+                .unwrap_or_else(|| panic!("{forbidden} must be denied by the data-key policy"));
+            assert_eq!(denied.error.as_deref(), Some(err_code::ACTION_NOT_ALLOWED));
+        }
+    }
+
+    // ── ROT-1: agent-key minting ──────────────────────────────────────────
+
+    fn agent_policy_fixture() -> &'static str {
+        // `asset` is the INTEGER index HL addresses the asset by — the field
+        // ROT-3 looks at for this venue. `deny_unknown_fields` on HlOrderCap
+        // caught an invented `asset_index` here, which is the fixture doing its
+        // job: a hand-written cap that the real struct would reject proves
+        // nothing about the real path.
+        r#"{"allowed_actions":["sign_hyperliquid_main_order","sign_hyperliquid_main_cancel"],"hl_order_caps":[{"asset":0,"max_size":"1"}]}"#
+    }
+
+    fn agent_plaintext_fixture() -> Zeroizing<Vec<u8>> {
+        build_agent_key_plaintext(
+            agent_policy_fixture().as_bytes(),
+            "hyperliquid_main",
+            b"2222222222222222222222222222222222222222222222222222222222222222",
+            "0x6eb000e9c1a86c4ba20f4fbd563bcb43e8d93f82",
+        )
+    }
+
+    #[test]
+    fn rot1_only_agent_model_venues_are_mintable() {
+        // FALSIFICATION: add "binance" to `is_agent_key_venue` and this goes red.
+        // The distinction is not fussiness — an HMAC credential is minted BY THE
+        // EXCHANGE, so a key born here would be a valid keypair no exchange has
+        // ever heard of, handed back as if it were usable.
+        for mintable in ["hyperliquid_main", "hyperliquid_testnet"] {
+            assert!(is_agent_key_venue(mintable), "{mintable} must be mintable");
+        }
+        for exchange_issued in [
+            "binance",
+            "binance_futures",
+            "okx",
+            "bybit",
+            "kucoin",
+            "asterdex",
+        ] {
+            assert!(
+                !is_agent_key_venue(exchange_issued),
+                "{exchange_issued} credentials are issued by the exchange — the enclave must not mint one"
+            );
+        }
+    }
+
+    #[test]
+    fn rot1_agent_blob_is_policy_wrapped_and_keeps_the_policy_verbatim() {
+        let pt = agent_plaintext_fixture();
+        match ParsedBlob::from_plaintext(&pt[..]).expect("must parse") {
+            ParsedBlob::WithPolicy {
+                policy,
+                secret_json,
+            } => {
+                // The caps that ROT-3 will look for must survive minting — a
+                // blob without them is refused at load, so minting one is
+                // minting a brick.
+                assert!(
+                    rot3_binding_cap_present("hyperliquid_main", &policy),
+                    "the minted HL policy must carry a cap that can BIND an order"
+                );
+                assert_eq!(
+                    policy.allowed_actions.as_deref(),
+                    Some(
+                        &[
+                            "sign_hyperliquid_main_order".to_owned(),
+                            "sign_hyperliquid_main_cancel".to_owned()
+                        ][..]
+                    )
+                );
+                let secret: crate::proto::HyperliquidSecret =
+                    crate::proto::SecretJson::new(secret_json)
+                        .deserialize_into()
+                        .expect("secret must parse");
+                assert!(secret.is_complete());
+            }
+            ParsedBlob::Legacy(_) => {
+                panic!("minted agent blob is Legacy — unloadable under strict")
+            }
+        }
+    }
+
+    #[test]
+    fn rot1_agent_plaintext_never_reallocates() {
+        let pt = agent_plaintext_fixture();
+        assert_eq!(pt.len(), pt.capacity());
+    }
+
+    #[test]
+    fn rot1_provision_agent_key_input_gates() {
+        fn base() -> SignRequest {
+            let mut r = req_template();
+            r.action = "provision_agent_key".to_owned();
+            r.aws_credentials = Some(crate::proto::AwsCredentials {
+                access_key_id: "AKIA".to_owned(),
+                secret_access_key: "sk".to_owned(),
+                session_token: "tok".to_owned(),
+            });
+            r.key_id = Some("alias/whatever".to_owned());
+            r.provision_venue = Some("hyperliquid_main".to_owned());
+            r.provision_customer_id = Some("usenami-dogfood".to_owned());
+            r.provision_policy = Some(agent_policy_fixture().to_owned());
+            r
+        }
+        // Every required input is required, and all of them fail BEFORE any KMS
+        // round-trip (which a unit test cannot reach).
+        for (name, mutate) in [
+            (
+                "no venue",
+                (|r: &mut SignRequest| r.provision_venue = None) as fn(&mut SignRequest),
+            ),
+            ("no customer", |r: &mut SignRequest| {
+                r.provision_customer_id = None
+            }),
+            ("no policy", |r: &mut SignRequest| r.provision_policy = None),
+            ("no creds", |r: &mut SignRequest| r.aws_credentials = None),
+            ("no key id", |r: &mut SignRequest| r.key_id = None),
+            ("unparseable policy", |r: &mut SignRequest| {
+                r.provision_policy = Some("not json".to_owned())
+            }),
+            ("unsafe customer id", |r: &mut SignRequest| {
+                r.provision_customer_id = Some("bad\nid=x".to_owned())
+            }),
+        ] {
+            let mut r = base();
+            mutate(&mut r);
+            assert_eq!(
+                handle(r).error.as_deref(),
+                Some(err_code::BAD_REQUEST),
+                "{name} must be rejected"
+            );
+        }
+        // A venue whose credential the exchange issues is refused with a
+        // DIFFERENT code — it is a policy decision, not a malformed request.
+        let mut wrong_venue = base();
+        wrong_venue.provision_venue = Some("binance".to_owned());
+        assert_eq!(
+            handle(wrong_venue).error.as_deref(),
+            Some(err_code::POLICY_DENIED)
+        );
+    }
+
+    // ── ROT-1: the MINT-TIME FLOOR, which had no test at all ──────────────
+    //
+    // The floor exists so provisioning cannot hand back a key the strict enclave
+    // would refuse at load — ROT-9's failure, where the gateway would not boot.
+    // `rot1_provision_agent_key_input_gates` never reached it: it sets no env, so
+    // `policy_required()` is false there and the whole branch is skipped. Found by
+    // CodeRabbit on #382. A guard nobody executes is not a guard.
+
+    const HL_CUST: &str = "usenami-dogfood";
+    const HL_VENUE: &str = "hyperliquid_main";
+
+    /// A policy shaped like a real HL agent key: pinned actions + a cap that can
+    /// actually BIND an order (`hl_order_caps`, by asset INDEX — `order_caps` is
+    /// structurally incapable of binding an HL order).
+    fn hl_agent_policy(with_caps: bool) -> Policy {
+        Policy {
+            allowed_actions: Some(vec![
+                "sign_hyperliquid_main_order".to_owned(),
+                "sign_hyperliquid_main_cancel".to_owned(),
+            ]),
+            hl_order_caps: if with_caps {
+                Some(vec![crate::proto::HlOrderCap {
+                    asset: 0,
+                    max_size: "0.01".to_owned(),
+                    max_notional: None,
+                }])
+            } else {
+                None
+            },
+            ..Policy::default()
+        }
+    }
+
+    /// A provisioning request that is complete in every way EXCEPT the policy —
+    /// so whatever the test asserts is attributable to the policy alone.
+    fn provision_agent_req(
+        policy: &Policy,
+        sign_with: Option<&ed25519_dalek::SigningKey>,
+    ) -> SignRequest {
+        let mut p = policy.clone();
+        if let Some(sk) = sign_with {
+            p.policy_authority_sig = Some(sign_authority(&p, HL_CUST, HL_VENUE, sk));
+        }
+        let mut r = req_template();
+        r.action = "provision_agent_key".to_owned();
+        r.aws_credentials = Some(crate::proto::AwsCredentials {
+            access_key_id: "AKIA".to_owned(),
+            secret_access_key: "sk".to_owned(),
+            session_token: "tok".to_owned(),
+        });
+        r.key_id = Some("alias/signer-mainnet-hyperliquid".to_owned());
+        r.provision_venue = Some(HL_VENUE.to_owned());
+        r.provision_customer_id = Some(HL_CUST.to_owned());
+        r.provision_policy = Some(serde_json::to_string(&p).unwrap());
+        r
+    }
+
+    #[test]
+    fn rot1_mint_floor_refuses_a_policy_that_is_not_authority_signed() {
+        let sk = authority_key(7);
+        let _g = EnvVarsGuard::set(&[
+            ("SIGNER_REQUIRE_POLICY", "1".to_owned()),
+            (POLICY_PUBKEY_ENV, authority_pubkey_hex(&sk)),
+        ]);
+        // Capped, but unsigned: the ONE thing wrong is the missing authority
+        // signature, so POLICY_REQUIRED can only be about that.
+        let resp = handle(provision_agent_req(&hl_agent_policy(true), None));
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(err_code::POLICY_REQUIRED),
+            "an unsigned money-venue policy must not be minted"
+        );
+        assert!(resp.provision.is_none(), "no envelope may be returned");
+    }
+
+    #[test]
+    fn rot1_mint_floor_refuses_a_signed_policy_with_no_binding_cap() {
+        let sk = authority_key(7);
+        let _g = EnvVarsGuard::set(&[
+            ("SIGNER_REQUIRE_POLICY", "1".to_owned()),
+            (POLICY_PUBKEY_ENV, authority_pubkey_hex(&sk)),
+        ]);
+        // Properly signed, so it clears the authority check — and still must be
+        // refused, because `hl_order_caps` is absent and nothing would bind the
+        // size of a real-money order.
+        let resp = handle(provision_agent_req(&hl_agent_policy(false), Some(&sk)));
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(err_code::POLICY_REQUIRED),
+            "a signed but uncapped HL policy must not be minted"
+        );
+        assert!(resp.provision.is_none());
+    }
+
+    #[test]
+    fn rot1_mint_floor_lets_a_signed_and_capped_policy_through() {
+        // POSITIVE CONTROL, and the two tests above mean nothing without it.
+        // Both of them assert POLICY_REQUIRED; if the handler returned that for
+        // some unrelated reason they would pass while proving nothing. This one
+        // shows the floor is passable: a signed, capped policy gets PAST it and
+        // dies later, at the KMS wrap a unit test cannot reach.
+        let sk = authority_key(7);
+        let _g = EnvVarsGuard::set(&[
+            ("SIGNER_REQUIRE_POLICY", "1".to_owned()),
+            (POLICY_PUBKEY_ENV, authority_pubkey_hex(&sk)),
+        ]);
+        let resp = handle(provision_agent_req(&hl_agent_policy(true), Some(&sk)));
+        // Asserted EXACTLY, not as "not POLICY_REQUIRED". `provision_wrap_failed`
+        // is the KMS wrap — the first step past the floor and the first one a
+        // unit test cannot reach. Landing there is positive evidence the floor
+        // was crossed; "not the denial code" would also hold if the handler had
+        // bailed somewhere earlier for an unrelated reason.
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(err_code::PROVISION_WRAP_FAILED),
+            "a signed, capped policy must clear the floor and reach the KMS wrap"
+        );
+        assert!(resp.provision.is_none());
+    }
+
+    #[test]
+    fn rot1_mint_floor_holds_on_a_permissive_build_for_hyperliquid_main() {
+        // ROT-1 round-3. The load floor became unconditional on this venue; the
+        // mint mirror has to move with it, or a permissive image happily seals a
+        // key that the read path then refuses on EVERY request — ROT-9's exact
+        // failure, re-created by the fix meant to prevent its class.
+        //
+        // SIGNER_REQUIRE_POLICY is explicitly UNSET here (the documented build
+        // default), and the authority pubkey is present so that a refusal cannot
+        // be attributed to a missing deploy config.
+        let sk = authority_key(7);
+        let _g = EnvVarsGuard::set(&[
+            ("SIGNER_REQUIRE_POLICY", String::new()),
+            (POLICY_PUBKEY_ENV, authority_pubkey_hex(&sk)),
+        ]);
+        assert!(!policy_required(), "this test is meaningless under strict");
+
+        let unsigned = handle(provision_agent_req(&hl_agent_policy(true), None));
+        assert_eq!(
+            unsigned.error.as_deref(),
+            Some(err_code::POLICY_REQUIRED),
+            "permissive build must still refuse an unsigned mainnet HL policy"
+        );
+        let uncapped = handle(provision_agent_req(&hl_agent_policy(false), Some(&sk)));
+        assert_eq!(
+            uncapped.error.as_deref(),
+            Some(err_code::POLICY_REQUIRED),
+            "permissive build must still refuse an uncapped mainnet HL policy"
+        );
+        // Positive control on the same build: a signed, capped policy still
+        // clears the floor, so the two refusals above are about the policy and
+        // not about the venue being blocked outright.
+        let good = handle(provision_agent_req(&hl_agent_policy(true), Some(&sk)));
+        assert_eq!(
+            good.error.as_deref(),
+            Some(err_code::PROVISION_WRAP_FAILED),
+            "a signed, capped policy must still reach the KMS wrap"
+        );
+    }
+
+    #[test]
+    fn rot1_mint_refuses_an_af2_policy_for_hyperliquid() {
+        // `provision_agent_key` is the SECOND mint path for HL keys (policy-cli
+        // is the other). The signing path refuses `intent_pubkey` on HL, so
+        // minting that shape would seal a key that cannot sign — and the comment
+        // on the signing gate claims the mint paths refuse it, which has to be
+        // true of this one too.
+        let sk = authority_key(7);
+        let _g = EnvVarsGuard::set(&[
+            ("SIGNER_REQUIRE_POLICY", "1".to_owned()),
+            (POLICY_PUBKEY_ENV, authority_pubkey_hex(&sk)),
+        ]);
+        let mut p = hl_agent_policy(true);
+        p.intent_pubkey = Some("aa".repeat(32));
+        // Give it the decorative symbol cap too — the shape that satisfies every
+        // OTHER gate and would otherwise sail through.
+        p.order_caps = Some(vec![crate::proto::OrderAssetCap {
+            symbol: "BTC".to_owned(),
+            max_qty: "1".to_owned(),
+            max_notional: None,
+        }]);
+        let resp = handle(provision_agent_req(&p, Some(&sk)));
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(err_code::POLICY_REQUIRED),
+            "an AF-2 policy for an HL venue must not be minted"
+        );
+        assert!(resp.provision.is_none());
+    }
+
+    #[test]
+    fn rot9_data_key_plaintext_never_reallocates() {
+        // A realloc mid-assembly frees a heap buffer still holding the RAW key
+        // hex WITHOUT wiping it — `Zeroizing` only wipes the final buffer. The
+        // capacity is derived from the operands, so this holds however the
+        // literals or the address length change; the old hand-counted comment
+        // had no test behind it.
+        let pt = data_key_plaintext_fixture();
+        assert_eq!(
+            pt.len(),
+            pt.capacity(),
+            "assembled length must exactly equal the reserved capacity"
+        );
     }
 
     #[test]
@@ -8141,13 +10702,18 @@ mod tests {
         let id = crate::registry::ResolvedIdentity::for_data_signing();
         let aad = id.sealed_aad("data-signing", KEY_VERSION);
 
-        // The exact plaintext handle_provision_data_key builds.
-        let plaintext = format!(
-            r#"{{"exchange":"attested-data","private_key":"0x{}","wallet_address":"{}"}}"#,
-            hex::encode(pk.as_slice()),
-            provisioned_addr
-        )
-        .into_bytes();
+        // The exact plaintext handle_provision_data_key builds — obtained by
+        // CALLING it, not by re-typing it. The re-typed copy used to live here
+        // and it drifted the moment ROT-9 wrapped the secret in a policy: it
+        // kept sealing a legacy blob, so this test stayed green while the strict
+        // enclave refused the very key the loop had just "verified" (CodeRabbit
+        // on #372). A fixture that restates the assumption cannot falsify it.
+        //
+        // Zeroizing all the way: `hex::encode` would leave an unwiped String
+        // holding the RAW key hex on the test heap.
+        let mut priv_hex = Zeroizing::new([0u8; 64]);
+        hex::encode_to_slice(pk.as_slice(), &mut priv_hex[..]).unwrap();
+        let plaintext = build_data_key_plaintext(&priv_hex[..], &provisioned_addr);
         let dek = Zeroizing::new(vec![0x42u8; 32]); // stands in for the genkey DEK
         let envelope =
             crate::envelope::seal_with_dek(&dek, b"wrapped-dek", &plaintext, &aad).unwrap();
@@ -8162,9 +10728,28 @@ mod tests {
         // The data-signing identity's AAD decrypts it (as the prod path rebuilds).
         let pt = crate::envelope::decrypt_with_dek(&dek, &env, &aad).unwrap();
 
+        // Require the POLICY-WRAPPED shape explicitly. `parsed.secret_json()`
+        // alone would accept `Legacy` too, which is exactly the regression this
+        // loop must catch: reconnect provisioning to the flat format and the
+        // strict enclave stops booting, so the test has to stop passing first.
         let parsed = crate::proto::ParsedBlob::from_plaintext(&pt).unwrap();
-        let secret: crate::proto::HyperliquidSecret =
-            serde_json::from_value(parsed.secret_json().clone()).unwrap();
+        let (policy, secret_json) = match parsed {
+            crate::proto::ParsedBlob::WithPolicy {
+                policy,
+                secret_json,
+            } => (policy, secret_json),
+            crate::proto::ParsedBlob::Legacy(_) => {
+                panic!("provisioned blob is Legacy — the prod enclave would reject it")
+            }
+        };
+        assert_eq!(
+            policy.allowed_actions.as_deref(),
+            Some(&["sign_data".to_owned()][..]),
+            "the decrypted policy must still pin sign_data after the full seal/open loop"
+        );
+        let secret: crate::proto::HyperliquidSecret = crate::proto::SecretJson::new(secret_json)
+            .deserialize_into()
+            .unwrap();
         assert!(secret.is_complete());
         let signing_pk = crate::signer::parse_evm_private_key(&secret.private_key).unwrap();
 
@@ -8270,11 +10855,34 @@ mod tests {
             // legal decimals (within / over the max_qty=5 cap). NB: "01" and
             // "5.0" are LEGAL (cmp_positive_decimals strips leading/trailing
             // zeros → 1 and 5) — listed for pool variety, not as fail-closed.
-            "1", "5", "5.0", "4.999", "6", "10", "0.001", ".5", "5.", "01",
+            "1",
+            "5",
+            "5.0",
+            "4.999",
+            "6",
+            "10",
+            "0.001",
+            ".5",
+            "5.",
+            "01",
             // JSON-number-edge that MUST be fail-closed by cmp_positive_decimals
             // (exponent / sign / space / hex / underscore / multi-dot / empty).
-            "1e3", "1E3", "+1", "-1", "1.0e2", "0x10", " 1", "1 ", "1_000",
-            "1.2.3", "", ".", "..", "5&quantity=9999", "5;quantity=9999", "5=9",
+            "1e3",
+            "1E3",
+            "+1",
+            "-1",
+            "1.0e2",
+            "0x10",
+            " 1",
+            "1 ",
+            "1_000",
+            "1.2.3",
+            "",
+            ".",
+            "..",
+            "5&quantity=9999",
+            "5;quantity=9999",
+            "5=9",
             "999999999999999999999999999999",
         ];
         const PRICES: &[&str] = &["50000", "0.1", "1e3", "", "5=9", "abc"];
@@ -8444,7 +11052,10 @@ mod tests {
                 let body = fuzz_asterdex_body(&mut rng);
                 if enforce_asterdex_size_cap(Some(&pol), &body).is_ok() {
                     // Percent-encoding on a capped body is always denied.
-                    assert!(!body.contains('%'), "allowed a percent-encoded body: {body}");
+                    assert!(
+                        !body.contains('%'),
+                        "allowed a percent-encoded body: {body}"
+                    );
                     // Close-all / batch flags are presence-denied.
                     assert!(
                         !ref_flag_present(&body, "closePosition"),
@@ -8459,7 +11070,11 @@ mod tests {
                         // A sized order the venue could read two ways must never pass.
                         assert_eq!(qvals.len(), 1, "allowed an ambiguous quantity: {body}");
                         let svals = ref_qs_values(&body, "symbol");
-                        assert_eq!(svals.len(), 1, "allowed sized order w/o single symbol: {body}");
+                        assert_eq!(
+                            svals.len(),
+                            1,
+                            "allowed sized order w/o single symbol: {body}"
+                        );
                         // SAFETY: enforce_asterdex_size_cap returned Ok with a
                         // quantity present ⟹ the symbol resolved to a capped
                         // entry and cmp_positive_decimals(qty, max_qty) was Ok
@@ -8501,14 +11116,34 @@ mod tests {
         #[test]
         fn binance_request_allowlist_is_deny_by_default() {
             const OPS: &[&str] = &[
-                "order", "cancel", "account", "openOrders", "leverage",
+                "order",
+                "cancel",
+                "account",
+                "openOrders",
+                "leverage",
                 // denied ops (withdraw/transfer/sub-account family)
-                "withdraw", "transfer", "universalTransfer", "sapiWithdraw", "",
+                "withdraw",
+                "transfer",
+                "universalTransfer",
+                "sapiWithdraw",
+                "",
             ];
             const NAMES: &[&str] = &[
-                "symbol", "quantity", "side", "type", "price", "recvWindow", "timestamp",
+                "symbol",
+                "quantity",
+                "side",
+                "type",
+                "price",
+                "recvWindow",
+                "timestamp",
                 // hostile names the whitelist must reject
-                "amount", "address", "coin", "%71uantity", "quantity ", "wapi", "sub",
+                "amount",
+                "address",
+                "coin",
+                "%71uantity",
+                "quantity ",
+                "wapi",
+                "sub",
             ];
             let mut rng = Rng::new(0xA1F1_0000_0003);
             for _ in 0..40_000 {
@@ -8633,7 +11268,9 @@ mod tests {
                 }
                 let decoded: serde_json::Value =
                     rmp_serde::from_slice(&buf).expect("msgpack round-trips");
-                let dec_orders = decoded["orders"].as_array().expect("orders survive msgpack");
+                let dec_orders = decoded["orders"]
+                    .as_array()
+                    .expect("orders survive msgpack");
                 assert_eq!(orig_orders.len(), dec_orders.len());
                 for (orig, dec) in orig_orders.iter().zip(dec_orders.iter()) {
                     assert_eq!(
@@ -8777,8 +11414,7 @@ mod tests {
             // Exponent / sign / leading-space / hex are NOT plain decimals: the
             // cap comparison errors → the order is refused, never signed.
             for edge in ["1e3", "+6", " 6", "0x6", "6 ", "1_0"] {
-                let r =
-                    enforce_order_cap(Some(&capped_policy()), "BTCUSDT", Some(edge), None);
+                let r = enforce_order_cap(Some(&capped_policy()), "BTCUSDT", Some(edge), None);
                 assert!(r.is_err(), "number-edge qty {edge} was not fail-closed");
             }
         }
@@ -8821,12 +11457,24 @@ mod tests {
             // through the generic verbatim-sign route (order caps aren't parsed
             // there). Pins the extracted guard directly.
             let capped = capped_policy();
-            assert!(binance_request_order_denied_for_capped("order", Some(&capped)));
+            assert!(binance_request_order_denied_for_capped(
+                "order",
+                Some(&capped)
+            ));
             // Reads/cancels stay available for a capped key.
-            assert!(!binance_request_order_denied_for_capped("cancel", Some(&capped)));
-            assert!(!binance_request_order_denied_for_capped("account", Some(&capped)));
+            assert!(!binance_request_order_denied_for_capped(
+                "cancel",
+                Some(&capped)
+            ));
+            assert!(!binance_request_order_denied_for_capped(
+                "account",
+                Some(&capped)
+            ));
             // An UNCAPPED key (no order_caps) signs every op incl. order.
-            assert!(!binance_request_order_denied_for_capped("order", Some(&Policy::default())));
+            assert!(!binance_request_order_denied_for_capped(
+                "order",
+                Some(&Policy::default())
+            ));
             assert!(!binance_request_order_denied_for_capped("order", None));
         }
 
@@ -8877,17 +11525,23 @@ mod tests {
             };
             // limit, 5 × 50 = 250 ≤ 500 → allowed.
             assert_eq!(
-                act(r#"{"type":"order","orders":[{"a":0,"b":true,"p":"50","s":"5","r":false,"t":{"limit":{"tif":"Gtc"}}}]}"#),
+                act(
+                    r#"{"type":"order","orders":[{"a":0,"b":true,"p":"50","s":"5","r":false,"t":{"limit":{"tif":"Gtc"}}}]}"#
+                ),
                 None
             );
             // limit, 5 × 150 = 750 > 500 → denied.
             assert_eq!(
-                act(r#"{"type":"order","orders":[{"a":0,"b":true,"p":"150","s":"5","r":false,"t":{"limit":{"tif":"Gtc"}}}]}"#),
+                act(
+                    r#"{"type":"order","orders":[{"a":0,"b":true,"p":"150","s":"5","r":false,"t":{"limit":{"tif":"Gtc"}}}]}"#
+                ),
                 Some(err_code::POLICY_DENIED.to_owned())
             );
             // trigger order (no t.limit) under a notional cap → unboundable → denied.
             assert_eq!(
-                act(r#"{"type":"order","orders":[{"a":0,"b":true,"p":"50","s":"5","r":false,"t":{"trigger":{"isMarket":true,"triggerPx":"50","tpsl":"tp"}}}]}"#),
+                act(
+                    r#"{"type":"order","orders":[{"a":0,"b":true,"p":"50","s":"5","r":false,"t":{"trigger":{"isMarket":true,"triggerPx":"50","tpsl":"tp"}}}]}"#
+                ),
                 Some(err_code::POLICY_DENIED.to_owned())
             );
         }
@@ -8909,5 +11563,4 @@ mod tests {
             );
         }
     }
-
 }

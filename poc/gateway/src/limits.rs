@@ -6,12 +6,31 @@
 //!
 //!  (б) **Daily order counter, fail-closed.** Bounds the CUMULATIVE number of
 //!      order-placing signatures a single bearer token can obtain per UTC day.
-//!      B2's `max_notional` bounds a single signature; this bounds the burst:
-//!      worst-case exposure = per-order cap × daily cap until kill-switch.
+//!      B2's `max_notional` bounds a single signature; this bounds the burst.
 //!      Fail-closed means exactly what the checklist says: counter store
 //!      unavailable (I/O error, corrupt state file) OR limit exhausted → DENY.
 //!      The counter is persisted to disk so a gateway restart does not reset
 //!      the day's spend (systemd restarts must not multiply the cap).
+//!
+//!      **What one increment buys, stated exactly (ROT-1 round-3).** This doc
+//!      used to read "worst-case exposure = per-order cap × daily cap", which
+//!      was true only where a request carries exactly one order. A Hyperliquid
+//!      `order` action carries a BATCH — `orders[]` — and the counter charges
+//!      the batch as ONE increment (see the `sign_hyperliquid_*_order` gate in
+//!      `handlers.rs`), so the old arithmetic understated the burst by the
+//!      batch length. The enclave now bounds a batch from the inside: sizes and
+//!      notionals are summed PER ASSET against the same cap — EVERY entry
+//!      counts, reduce-only included, because such an order still executes a
+//!      trade at a requester-chosen price — and an action may carry at most
+//!      `HL_MAX_ENTRIES_PER_ACTION` entries. So on the Hyperliquid routes one
+//!      increment buys at most the sum of the per-asset caps the policy grants,
+//!      not that figure multiplied by however many orders fit in a vsock frame.
+//!
+//!      Two things this does NOT say. `/hedge` still buys TWO legs per
+//!      increment — its legs are bounded individually by the enclave per-order
+//!      caps, exactly as the `/hedge` note above states, and nothing here
+//!      changes that; size the cap accordingly. And cancels remain uncounted
+//!      and carry no size, so the entry ceiling is their only bound.
 //!
 //!  (в) **Per-token rate limit** (requests/minute, fixed window). In-memory
 //!      only: a restart forgives at most one 60-second window, operationally
@@ -45,14 +64,37 @@
 //!   - `POST /sign` with an order-`kind` (Hyperliquid order actions)
 //!   - `/sign/binance-request` with `op == "order"`
 //!
-//! Deliberately NOT counted: cancels / cancel-all / reads (exposure-REDUCING
-//! or read-only — exhausting the day's quota must never lock an operator out
-//! of cleaning up open orders), `/sign-x402` (its own MANDATORY enclave spend
-//! cap; the aggregate x402 cap is CR096, UPL/mainnet scope by CTO decision),
-//! and opaque generic-`/sign` HMAC bodies (bybit/kucoin/asterdex legacy
-//! flows; on the mainnet profile money-venue keys are policy-capped, and
-//! CR051 already denies capped keys order-shaped generic signing — the
-//! uncounted paths cannot place orders there).
+//! Deliberately NOT counted by the DAILY ORDER counter: cancels / cancel-all /
+//! reads (exposure-REDUCING or read-only — exhausting the day's quota must
+//! never lock an operator out of cleaning up open orders), `/sign-x402` (it has
+//! its OWN cumulative spend cap — see H2 below — plus the mandatory enclave
+//! per-signature cap), and opaque generic-`/sign` HMAC bodies
+//! (bybit/kucoin/asterdex legacy flows; on the mainnet profile money-venue keys
+//! are policy-capped, and CR051 already denies capped keys order-shaped generic
+//! signing — the uncounted paths cannot place orders there).
+//!
+//! **H2 (CR096) — cumulative x402 spend cap.** A THIRD control, same shape as
+//! the daily order counter but accumulating VALUE, not count: `/sign-x402`
+//! charges each EIP-3009 transfer's `value` against a per-payer-key per-UTC-day
+//! running sum (`SIGNER_X402_PERIOD_CAP` / `SIGNER_X402_SPEND_PATH`): fail-closed,
+//! atomic-persisted, and attempt-counted before the signature. The enclave
+//! already enforces a PER-SIGNATURE ceiling (`X402Policy.max_value`, CR050);
+//! this bounds the SUM across many signatures — the aggregate the stateless
+//! enclave cannot track — turning "mainnet x402 = fully denied" into a bounded
+//! allow. Dormant rail (0 payers today) → shipped dark (`SIGNER_LIMITS_DRY_RUN`)
+//! as pure hardening, NOT a live requirement; unset ⇒ off (default deny holds).
+//!
+//! **Residual (gateway-side, by design).** Like the daily counter, this is a
+//! GATEWAY compensating control: an ON-BOX attacker can reset/fudge the
+//! accumulator file (zero barrier — same threat framing as above). It bounds a
+//! REMOTE attacker / compromised agent draining a payer key via many
+//! sub-per-sig-cap transfers. The real fix — an enclave-STATEFUL spend ledger
+//! (UPL) that survives a hostile gateway — stays roadmap; the interim exposure
+//! is bounded by the in-enclave per-signature `max_value` (CR050) × the small
+//! dormant-rail balance, and by the KMS/registry kill-switch on duration.
+//! Scope OUT (CR096 WONTFIX): an x402 `to` allow-list — the recipient is
+//! inherently dynamic. v1 applies ONE cap per payer key; per-token/chain-
+//! granular caps are a follow-up if a live rail needs them.
 //!
 //! The counter increments BEFORE the signature is produced (attempt-counted,
 //! fail-closed): a request that later fails in the enclave still burns quota.
@@ -99,6 +141,18 @@ pub const ORDERS_PER_MIN_ENV: &str = "SIGNER_ORDERS_PER_MIN";
 /// cancel budget than orders — that separation is the whole point). See
 /// `ORDERS_PER_MIN_ENV`.
 pub const CANCELS_PER_MIN_ENV: &str = "SIGNER_CANCELS_PER_MIN";
+/// H2 (CR096): per-payer-key per-UTC-day CUMULATIVE x402/EIP-3009 `value` cap
+/// (u128 > 0, raw token units). The enclave enforces a PER-SIGNATURE ceiling
+/// (`X402Policy.max_value`, CR050); this bounds the SUM across many signatures
+/// a single payer key can obtain per day — the aggregate the stateless enclave
+/// cannot track. Unset = disabled (the x402 rail is dormant; this is a default-
+/// deny-backed hardening control, not a live requirement). Same fail-closed +
+/// dry-run + atomic-persist + attempt-counted discipline as the daily counter.
+pub const X402_PERIOD_CAP_ENV: &str = "SIGNER_X402_PERIOD_CAP";
+/// Env: state-file path for the x402 spend accumulator. REQUIRED when the cap
+/// is set — same rule as the daily counter (never guess a writable directory
+/// for a security control).
+pub const X402_SPEND_PATH_ENV: &str = "SIGNER_X402_SPEND_PATH";
 /// Env: dark-phase observation mode — evaluate + log, never deny.
 pub const DRY_RUN_ENV: &str = "SIGNER_LIMITS_DRY_RUN";
 /// Env: the CR097 strict/mainnet profile flag (owned by auth.rs; read here to
@@ -124,6 +178,8 @@ pub enum LimitsConfigError {
     /// the two together are contradictory — fail loud rather than silently
     /// ignore the blanket value.
     BlanketAndSplitBothSet,
+    /// H2: `SIGNER_X402_PERIOD_CAP` set without `SIGNER_X402_SPEND_PATH`.
+    X402SpendPathRequired,
 }
 
 impl std::fmt::Display for LimitsConfigError {
@@ -149,6 +205,12 @@ impl std::fmt::Display for LimitsConfigError {
                  {CANCELS_PER_MIN_ENV}) are set — split mode replaces the blanket \
                  rate limit; set one OR the other, not both"
             ),
+            LimitsConfigError::X402SpendPathRequired => write!(
+                f,
+                "{X402_PERIOD_CAP_ENV} is set but {X402_SPEND_PATH_ENV} is not — the \
+                 x402 spend accumulator is fail-closed and needs an explicit \
+                 state-file path (e.g. /var/lib/signer-gateway/x402-spend.json)"
+            ),
         }
     }
 }
@@ -162,9 +224,19 @@ impl std::error::Error for LimitsConfigError {}
 pub enum LimitDecision {
     Allow,
     /// Per-minute window exhausted → 429, retry next window.
-    RateLimited { retry_after_secs: u64 },
+    RateLimited {
+        retry_after_secs: u64,
+    },
     /// Daily order cap exhausted → 429, retry at next UTC midnight.
-    DailyCapExhausted { retry_after_secs: u64 },
+    DailyCapExhausted {
+        retry_after_secs: u64,
+    },
+    /// H2: per-key cumulative x402 spend cap exhausted for the day → 429, retry
+    /// at next UTC midnight. Same wire shape as `DailyCapExhausted` (reuses the
+    /// `rate_limited` code + `Retry-After`, no new CR037 allow-list entry).
+    X402CapExhausted {
+        retry_after_secs: u64,
+    },
     /// Counter store unreadable/unwritable → 500 (fail-closed deny; this is
     /// a server-side failure, not client throttling).
     CounterUnavailable,
@@ -181,6 +253,18 @@ type RateWindows = HashMap<[u8; 32], (u64, u32)>;
 struct DailyState {
     day: u64,
     counts: HashMap<String, u64>,
+}
+
+/// H2: on-disk shape of the x402 spend accumulator. `day` = unix days since
+/// epoch (UTC, same forward-only rollover rule as `DailyState`); `spend` keyed
+/// by SHA-256(scope) hex where scope = `customer_id/key_id` (the payer key) —
+/// hashed on disk for uniformity with the token discipline. Value = cumulative
+/// signed `value` for the day in raw token units (u128: comfortably holds any
+/// USDC 6-decimal amount; oversized inputs are rejected before they reach here).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct X402SpendState {
+    day: u64,
+    spend: HashMap<String, u128>,
 }
 
 pub struct Limits {
@@ -219,6 +303,14 @@ pub struct Limits {
     /// on the blocking pool (`order_gate`), so the async executor
     /// never blocks on it. Reads/cancels never touch this lock.
     daily_state: Mutex<Option<DailyState>>,
+    /// H2: per-key per-day x402 spend cap (raw token units) + its state file.
+    /// Both `None` ⇒ the x402 aggregate cap is off (dormant-rail default).
+    x402_period_cap: Option<u128>,
+    x402_spend_path: Option<PathBuf>,
+    /// H2: in-memory x402 spend accumulator, write-through to disk on every
+    /// charge (same discipline + lock semantics as `daily_state`: the mutex is
+    /// held across the persist so two racing charges can't both under-persist).
+    x402_spend_state: Mutex<Option<X402SpendState>>,
 }
 
 impl Limits {
@@ -235,6 +327,9 @@ impl Limits {
             orders_rate: Mutex::new(HashMap::new()),
             cancels_rate: Mutex::new(HashMap::new()),
             daily_state: Mutex::new(None),
+            x402_period_cap: None,
+            x402_spend_path: None,
+            x402_spend_state: Mutex::new(None),
         }
     }
 
@@ -260,10 +355,21 @@ impl Limits {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let x402_period_cap = parse_positive_u128(X402_PERIOD_CAP_ENV)?;
+        let x402_spend_path = std::env::var(X402_SPEND_PATH_ENV)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         let dry_run = env_flag_enabled(DRY_RUN_ENV);
 
         if daily_cap.is_some() && counter_path.is_none() {
             return Err(LimitsConfigError::CounterPathRequired);
+        }
+        // H2: same fail-closed rule as the daily counter — a cap without an
+        // explicit state-file path is a misconfig, not "no path = memory only".
+        if x402_period_cap.is_some() && x402_spend_path.is_none() {
+            return Err(LimitsConfigError::X402SpendPathRequired);
         }
         // B3.1: SPLIT mode iff either split bucket is set. In split mode the
         // blanket `rate_per_min` is ignored (the split buckets replace it) — a
@@ -309,6 +415,8 @@ impl Limits {
             rate_mode = if split_mode { "split" } else { "blanket" },
             dry_run = dry_run,
             counter_path = ?counter_path,
+            x402_period_cap = ?x402_period_cap,
+            x402_spend_path = ?x402_spend_path,
             "B3 gateway limits loaded"
         );
         Ok(Self {
@@ -322,6 +430,9 @@ impl Limits {
             orders_rate: Mutex::new(HashMap::new()),
             cancels_rate: Mutex::new(HashMap::new()),
             daily_state: Mutex::new(None),
+            x402_period_cap,
+            x402_spend_path,
+            x402_spend_state: Mutex::new(None),
         })
     }
 
@@ -336,14 +447,30 @@ impl Limits {
     /// loudly instead of denying every order at runtime) and prime the
     /// in-memory cache so even the first request skips the disk read.
     pub fn boot_probe(&self) -> std::io::Result<()> {
-        let (Some(_), Some(path)) = (self.daily_cap, self.counter_path.as_deref()) else {
-            return Ok(());
-        };
-        let mut guard = self.daily_state.lock().expect("daily_state mutex poisoned");
-        let state = load_daily_state(path, today(now_unix_secs()))?;
-        store_daily_state(path, &state)?;
-        *guard = Some(state);
+        if let (Some(_), Some(path)) = (self.daily_cap, self.counter_path.as_deref()) {
+            let mut guard = self.daily_state.lock().expect("daily_state mutex poisoned");
+            let state = load_daily_state(path, today(now_unix_secs()))?;
+            store_daily_state(path, &state)?;
+            *guard = Some(state);
+        }
+        // H2: same load-or-init-and-write-back so an unwritable x402 spend path
+        // fails the BOOT loudly instead of denying every x402 sign at runtime.
+        if let (Some(_), Some(path)) = (self.x402_period_cap, self.x402_spend_path.as_deref()) {
+            let mut guard = self
+                .x402_spend_state
+                .lock()
+                .expect("x402_spend_state mutex poisoned");
+            let state = load_x402_spend_state(path, today(now_unix_secs()))?;
+            store_x402_spend_state(path, &state)?;
+            *guard = Some(state);
+        }
         Ok(())
+    }
+
+    /// True iff the x402 spend cap is configured — the handler uses it to skip
+    /// the `spawn_blocking` hop entirely when the cap is off.
+    pub fn x402_spend_enabled(&self) -> bool {
+        self.x402_period_cap.is_some()
     }
 
     /// B3.1: SPLIT mode iff either split bucket is configured. In split mode the
@@ -379,7 +506,10 @@ impl Limits {
         // every request in window 0; deny rather than guess (fail-closed, and
         // a box with a broken clock must not sign timestamped requests anyway).
         if now_secs == 0 {
-            tracing::error!(event = "limits_clock_invalid", "system clock reads 0 — deny");
+            tracing::error!(
+                event = "limits_clock_invalid",
+                "system clock reads 0 — deny"
+            );
             return if self.dry_run {
                 LimitDecision::Allow
             } else {
@@ -429,7 +559,13 @@ impl Limits {
     /// backward-compat path. In split mode the middleware skips this and the
     /// order/cancel handlers call `check_orders_rate` / `check_cancels_rate`.
     pub fn check_rate(&self, token: &str, now_secs: u64) -> LimitDecision {
-        self.check_bucket(self.rate_per_min, &self.rate, token, now_secs, "rate_per_min")
+        self.check_bucket(
+            self.rate_per_min,
+            &self.rate,
+            token,
+            now_secs,
+            "rate_per_min",
+        )
     }
 
     /// B3.1: order-placing per-token per-minute bucket. Called by order handlers
@@ -468,7 +604,10 @@ impl Limits {
         // Broken clock (see check_rate): day 0 would mismatch the stored day
         // and RESET the counts on every call — a fail-OPEN path. Deny instead.
         if now_secs == 0 {
-            tracing::error!(event = "limits_clock_invalid", "system clock reads 0 — deny");
+            tracing::error!(
+                event = "limits_clock_invalid",
+                "system clock reads 0 — deny"
+            );
             return if self.dry_run {
                 LimitDecision::Allow
             } else {
@@ -488,7 +627,10 @@ impl Limits {
         // `load_daily_state` applies the same forward-only day rule.
         let mut state = match guard.take() {
             Some(s) if s.day == day => s,
-            Some(s) if s.day < day => DailyState { day, counts: HashMap::new() },
+            Some(s) if s.day < day => DailyState {
+                day,
+                counts: HashMap::new(),
+            },
             Some(s) => {
                 // s.day > day — clock rollback.
                 tracing::error!(
@@ -547,6 +689,125 @@ impl Limits {
         LimitDecision::Allow
     }
 
+    /// H2: charge `value` against `key`'s x402 spend for the current UTC day and
+    /// decide. Mirrors `check_and_count_order` but ACCUMULATES a value sum (not
+    /// a +1 count). Attempt-counted: the charge is persisted BEFORE the enclave
+    /// signs, so a concurrent/retried request cannot push the day's sum past the
+    /// cap. `key` is the SHA-256(scope) hex identifying the payer key.
+    pub fn check_and_count_x402_spend(
+        &self,
+        scope: &str,
+        value: u128,
+        now_secs: u64,
+    ) -> LimitDecision {
+        let (Some(cap), Some(path)) = (self.x402_period_cap, self.x402_spend_path.as_deref())
+        else {
+            return LimitDecision::Allow;
+        };
+        // Hash the payer-key scope (customer_id/key_id) the same way tokens are
+        // hashed — the on-disk accumulator + logs never carry the raw scope.
+        let key_hex = hex::encode(token_key(scope));
+        // Broken clock (day 0) would reset the day on every call — fail-OPEN. Deny.
+        if now_secs == 0 {
+            tracing::error!(
+                event = "limits_clock_invalid",
+                "system clock reads 0 — deny"
+            );
+            return if self.dry_run {
+                LimitDecision::Allow
+            } else {
+                LimitDecision::CounterUnavailable
+            };
+        }
+        let day = today(now_secs);
+        let retry_after_secs = SECS_PER_DAY - (now_secs % SECS_PER_DAY);
+
+        let mut guard = self
+            .x402_spend_state
+            .lock()
+            .expect("x402_spend_state mutex poisoned");
+        // Same forward-only day resolution as the daily counter: cache hit /
+        // UTC rollover reset / FUTURE-day clock-rollback deny / disk load.
+        let mut state = match guard.take() {
+            Some(s) if s.day == day => s,
+            Some(s) if s.day < day => X402SpendState {
+                day,
+                spend: HashMap::new(),
+            },
+            Some(s) => {
+                tracing::error!(
+                    event = "limits_clock_invalid",
+                    cached_day = s.day,
+                    now_day = day,
+                    "system clock moved backwards across a day boundary — deny"
+                );
+                *guard = Some(s);
+                return if self.dry_run {
+                    LimitDecision::Allow
+                } else {
+                    LimitDecision::CounterUnavailable
+                };
+            }
+            None => match load_x402_spend_state(path, day) {
+                Ok(s) => s,
+                Err(e) => return self.x402_spend_error("x402_load", path, &e),
+            },
+        };
+        let current = *state.spend.get(&key_hex).unwrap_or(&0);
+        // Overflow guard: never wrap. A value that would overflow the u128 sum
+        // is adversarial (real token units never approach u128::MAX) → fail-closed.
+        let Some(new_total) = current.checked_add(value) else {
+            tracing::error!(
+                event = "x402_spend_overflow",
+                key_sha256 = %key_hex,
+                "x402 spend sum would overflow u128 — deny"
+            );
+            *guard = Some(state);
+            return if self.dry_run {
+                LimitDecision::Allow
+            } else {
+                LimitDecision::CounterUnavailable
+            };
+        };
+        if new_total > cap {
+            if self.dry_run {
+                tracing::warn!(
+                    event = "limits_dry_run_would_deny",
+                    limit = "x402_period_cap",
+                    cap = %cap,
+                    current = %current,
+                    value = %value,
+                    would_total = %new_total,
+                    key_sha256 = %key_hex,
+                    "dry-run: x402 sign WOULD be denied (period spend cap exceeded)"
+                );
+                // Fall through and STILL charge, so the soak shows the real curve.
+            } else {
+                tracing::warn!(
+                    event = "x402_period_cap_exhausted",
+                    cap = %cap,
+                    current = %current,
+                    value = %value,
+                    key_sha256 = %key_hex,
+                    "x402 period spend cap exhausted for payer key"
+                );
+                // Deny WITHOUT charging — the transfer is rejected, no spend.
+                *guard = Some(state);
+                return LimitDecision::X402CapExhausted { retry_after_secs };
+            }
+        }
+        // Charge the spend and write-through BEFORE releasing the decision. On
+        // store failure the charged state STAYS cached (conservative: the
+        // attempt burned quota) and the request is denied fail-closed.
+        state.spend.insert(key_hex, new_total);
+        let store_result = store_x402_spend_state(path, &state);
+        *guard = Some(state);
+        if let Err(e) = store_result {
+            return self.x402_spend_error("x402_store", path, &e);
+        }
+        LimitDecision::Allow
+    }
+
     /// Counter-store failure → fail-closed deny (enforce) / loud pass (dry-run).
     fn counter_error(&self, op: &str, path: &Path, e: &std::io::Error) -> LimitDecision {
         tracing::error!(
@@ -562,6 +823,24 @@ impl Limits {
             LimitDecision::CounterUnavailable
         }
     }
+
+    /// H2: x402 spend-state load/store failure → fail-closed deny (enforce) /
+    /// loud pass (dry-run). Same shape as `counter_error` but with x402-specific
+    /// logging (it is transfers, not orders, that get denied — Gemini).
+    fn x402_spend_error(&self, op: &str, path: &Path, e: &std::io::Error) -> LimitDecision {
+        tracing::error!(
+            event = "x402_spend_error",
+            op = op,
+            path = %path.display(),
+            error = %e,
+            "x402 spend state persistence failed — fail-closed (transfers denied until fixed)"
+        );
+        if self.dry_run {
+            LimitDecision::Allow
+        } else {
+            LimitDecision::CounterUnavailable
+        }
+    }
 }
 
 /// Wire code for a deny decision (for `finish_log` outcome accounting).
@@ -570,9 +849,9 @@ impl Limits {
 pub fn deny_code(decision: LimitDecision) -> &'static str {
     match decision {
         LimitDecision::Allow => unreachable!("deny_code called on Allow"),
-        LimitDecision::RateLimited { .. } | LimitDecision::DailyCapExhausted { .. } => {
-            crate::proto::err_code::RATE_LIMITED
-        }
+        LimitDecision::RateLimited { .. }
+        | LimitDecision::DailyCapExhausted { .. }
+        | LimitDecision::X402CapExhausted { .. } => crate::proto::err_code::RATE_LIMITED,
         LimitDecision::CounterUnavailable => crate::proto::err_code::INTERNAL_ERROR,
     }
 }
@@ -588,7 +867,8 @@ pub fn deny_response(decision: LimitDecision) -> Option<axum::response::Response
     let (code, retry_after) = match decision {
         LimitDecision::Allow => return None,
         LimitDecision::RateLimited { retry_after_secs }
-        | LimitDecision::DailyCapExhausted { retry_after_secs } => {
+        | LimitDecision::DailyCapExhausted { retry_after_secs }
+        | LimitDecision::X402CapExhausted { retry_after_secs } => {
             (crate::proto::err_code::RATE_LIMITED, Some(retry_after_secs))
         }
         LimitDecision::CounterUnavailable => (crate::proto::err_code::INTERNAL_ERROR, None),
@@ -599,7 +879,8 @@ pub fn deny_response(decision: LimitDecision) -> Option<axum::response::Response
     let mut resp = (status, body).into_response();
     if let Some(secs) = retry_after {
         if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
         }
     }
     Some(resp)
@@ -668,7 +949,10 @@ fn load_daily_state(path: &Path, day: u64) -> std::io::Result<DailyState> {
     let raw = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DailyState { day, counts: HashMap::new() })
+            return Ok(DailyState {
+                day,
+                counts: HashMap::new(),
+            })
         }
         Err(e) => return Err(e),
     };
@@ -676,7 +960,10 @@ fn load_daily_state(path: &Path, day: u64) -> std::io::Result<DailyState> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     match state.day.cmp(&day) {
         std::cmp::Ordering::Less => {
-            state = DailyState { day, counts: HashMap::new() };
+            state = DailyState {
+                day,
+                counts: HashMap::new(),
+            };
         }
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Greater => {
@@ -702,12 +989,25 @@ fn load_daily_state(path: &Path, day: u64) -> std::io::Result<DailyState> {
 fn store_daily_state(path: &Path, state: &DailyState) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    atomic_write_bytes(path, &bytes)
+}
+
+/// Shared atomic write for the fail-closed state files: temp file in the same
+/// directory + fsync + rename + parent-directory fsync, so a crash mid-write
+/// never leaves a truncated JSON and the rename itself is durable (file fsync
+/// alone persists contents, not the directory entry — CodeRabbit #223). The
+/// temp name APPENDS `.tmp` to the full filename instead of
+/// `Path::with_extension` (which would REPLACE an existing extension: a
+/// configured `x.tmp` would make tmp == target and truncate it in place,
+/// breaking the atomicity — Gemini #223). Used by BOTH the daily counter and
+/// the H2 x402 spend accumulator.
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = PathBuf::from(tmp_name);
     let write_then_rename = (|| {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)
@@ -723,19 +1023,19 @@ fn store_daily_state(path: &Path, state: &DailyState) -> std::io::Result<()> {
     // Parent-dir fsync is BEST-EFFORT (Gemini #223 round-2): it only makes
     // the rename itself crash-durable. Some environments (certain Docker
     // storage drivers / network filesystems) cannot open-or-sync a
-    // directory — propagating that failure would hard-deny every order for
+    // directory — propagating that failure would hard-deny every request for
     // zero security gain: the tmp-file fsync above already guards the
     // fail-closed case (corrupt/truncated state), and a rename lost to a
     // host crash only means the post-crash restart resumes from the
     // previous write (a bounded under-count that a remote attacker cannot
     // trigger). Log loudly and continue. Unix-only (Gemini #223): opening a
-    // directory ALWAYS fails on Windows — a per-order warning there would be
+    // directory ALWAYS fails on Windows — a per-request warning there would be
     // pure log pollution for a sync that platform cannot express anyway.
     #[cfg(unix)]
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
             tracing::warn!(
-                event = "daily_counter_dirsync_failed",
+                event = "limits_state_dirsync_failed",
                 path = %path.display(),
                 error = %e,
                 "parent-dir fsync failed — continuing (rename durability is best-effort)"
@@ -743,6 +1043,51 @@ fn store_daily_state(path: &Path, state: &DailyState) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// H2: load the x402 spend accumulator. Same FORWARD-ONLY day handling as
+/// `load_daily_state` (older day = normal UTC rollover → reset; a FUTURE day =
+/// clock rolled backwards after the file was written → `InvalidData` so the
+/// caller denies fail-closed; missing file = empty; any parse error surfaces).
+fn load_x402_spend_state(path: &Path, day: u64) -> std::io::Result<X402SpendState> {
+    let raw = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(X402SpendState {
+                day,
+                spend: HashMap::new(),
+            })
+        }
+        Err(e) => return Err(e),
+    };
+    let mut state: X402SpendState = serde_json::from_slice(&raw)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    match state.day.cmp(&day) {
+        std::cmp::Ordering::Less => {
+            state = X402SpendState {
+                day,
+                spend: HashMap::new(),
+            };
+        }
+        std::cmp::Ordering::Equal => {}
+        std::cmp::Ordering::Greater => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "x402 spend file day {} is in the future (today {}) — clock rollback?",
+                    state.day, day
+                ),
+            ));
+        }
+    }
+    Ok(state)
+}
+
+/// H2: atomic write for the x402 spend accumulator (mirrors `store_daily_state`).
+fn store_x402_spend_state(path: &Path, state: &X402SpendState) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    atomic_write_bytes(path, &bytes)
 }
 
 /// True iff `var` is set to an explicit truthy value (`1`/`true`/`yes`,
@@ -763,12 +1108,30 @@ fn env_flag_enabled(var: &str) -> bool {
 /// operator wants that, the kill-switch inventory is the right tool, not a
 /// degenerate limit that reads like a typo).
 fn parse_positive_u64(var: &'static str) -> Result<Option<u64>, LimitsConfigError> {
-    let Ok(raw) = std::env::var(var) else { return Ok(None) };
+    let Ok(raw) = std::env::var(var) else {
+        return Ok(None);
+    };
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
     }
     match raw.parse::<u64>() {
+        Ok(v) if v > 0 => Ok(Some(v)),
+        _ => Err(LimitsConfigError::BadValue(var, raw.to_owned())),
+    }
+}
+
+/// H2: parse an env var as a positive `u128` (the x402 spend cap — raw token
+/// units, which can exceed `u64`). Same rules as `parse_positive_u64`.
+fn parse_positive_u128(var: &'static str) -> Result<Option<u128>, LimitsConfigError> {
+    let Ok(raw) = std::env::var(var) else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match raw.parse::<u128>() {
         Ok(v) if v > 0 => Ok(Some(v)),
         _ => Err(LimitsConfigError::BadValue(var, raw.to_owned())),
     }
@@ -794,13 +1157,8 @@ mod tests {
             daily_cap: daily,
             counter_path: path.map(|p| p.to_path_buf()),
             rate_per_min: rate,
-            orders_per_min: None,
-            cancels_per_min: None,
             dry_run: dry,
-            rate: Mutex::new(HashMap::new()),
-            orders_rate: Mutex::new(HashMap::new()),
-            cancels_rate: Mutex::new(HashMap::new()),
-            daily_state: Mutex::new(None),
+            ..Limits::disabled()
         }
     }
 
@@ -809,6 +1167,16 @@ mod tests {
         Limits {
             orders_per_min: orders,
             cancels_per_min: cancels,
+            dry_run: dry,
+            ..Limits::disabled()
+        }
+    }
+
+    /// H2 x402 spend-cap test builder.
+    fn x402_limits(cap: Option<u128>, path: Option<&Path>, dry: bool) -> Limits {
+        Limits {
+            x402_period_cap: cap,
+            x402_spend_path: path.map(|p| p.to_path_buf()),
             dry_run: dry,
             ..Limits::disabled()
         }
@@ -839,7 +1207,9 @@ mod tests {
         }
         assert_eq!(
             l.check_rate("tok", t0 + 30),
-            LimitDecision::RateLimited { retry_after_secs: 30 }
+            LimitDecision::RateLimited {
+                retry_after_secs: 30
+            }
         );
         // Next fixed window → counter resets.
         assert_eq!(l.check_rate("tok", t0 + 60), LimitDecision::Allow);
@@ -889,7 +1259,9 @@ mod tests {
         assert_eq!(l.check_orders_rate("tok", t), LimitDecision::Allow);
         assert_eq!(
             l.check_orders_rate("tok", t + 30),
-            LimitDecision::RateLimited { retry_after_secs: 30 }
+            LimitDecision::RateLimited {
+                retry_after_secs: 30
+            }
         );
         // next window resets.
         assert_eq!(l.check_orders_rate("tok", t + 60), LimitDecision::Allow);
@@ -970,7 +1342,9 @@ mod tests {
             assert_eq!(l.check_and_count_order("tok", now), LimitDecision::Allow);
             assert_eq!(
                 l.check_and_count_order("tok", now),
-                LimitDecision::DailyCapExhausted { retry_after_secs: SECS_PER_DAY - 100 }
+                LimitDecision::DailyCapExhausted {
+                    retry_after_secs: SECS_PER_DAY - 100
+                }
             );
         }
         // A NEW Limits (≈ gateway restart) reads the same file — the day's
@@ -1006,15 +1380,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let now = 20_002 * SECS_PER_DAY;
         let l = limits(Some(1), Some(&path), None, false);
-        assert_eq!(l.check_and_count_order("secret-token-a", now), LimitDecision::Allow);
-        assert_eq!(l.check_and_count_order("secret-token-b", now), LimitDecision::Allow);
+        assert_eq!(
+            l.check_and_count_order("secret-token-a", now),
+            LimitDecision::Allow
+        );
+        assert_eq!(
+            l.check_and_count_order("secret-token-b", now),
+            LimitDecision::Allow
+        );
         assert!(matches!(
             l.check_and_count_order("secret-token-a", now),
             LimitDecision::DailyCapExhausted { .. }
         ));
         // The raw token never touches disk — only its SHA-256 hex.
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("secret-token-a"), "raw token leaked to disk: {raw}");
+        assert!(
+            !raw.contains("secret-token-a"),
+            "raw token leaked to disk: {raw}"
+        );
         assert!(raw.contains(&hex::encode(token_key("secret-token-a"))));
     }
 
@@ -1072,7 +1455,11 @@ mod tests {
         let day = 20_010u64;
         std::fs::write(
             &path,
-            serde_json::to_vec(&DailyState { day: day + 1, counts: HashMap::new() }).unwrap(),
+            serde_json::to_vec(&DailyState {
+                day: day + 1,
+                counts: HashMap::new(),
+            })
+            .unwrap(),
         )
         .unwrap();
         let l = limits(Some(5), Some(&path), None, false);
@@ -1131,7 +1518,10 @@ mod tests {
         assert_eq!(l.check_and_count_order("tok", now), LimitDecision::Allow);
         std::fs::write(&path, b"{corrupt").unwrap();
         // Cache hit → still served; the write-through repairs the file.
-        assert_eq!(l.check_and_count_order("tok", now + 1), LimitDecision::Allow);
+        assert_eq!(
+            l.check_and_count_order("tok", now + 1),
+            LimitDecision::Allow
+        );
         assert!(matches!(
             l.check_and_count_order("tok", now + 2),
             LimitDecision::DailyCapExhausted { .. }
@@ -1346,5 +1736,201 @@ mod tests {
                 Err(LimitsConfigError::BadValue(..))
             ));
         }
+    }
+
+    // ── H2: x402 cumulative per-key spend cap ───────────────────────────────
+    const X402_DAY0: u64 = 20_000 * SECS_PER_DAY + 100;
+
+    #[test]
+    fn h2_x402_disabled_allows_any_spend() {
+        let l = x402_limits(None, None, false);
+        assert_eq!(
+            l.check_and_count_x402_spend("cust/key", 10_u128.pow(30), X402_DAY0),
+            LimitDecision::Allow
+        );
+    }
+
+    #[test]
+    fn h2_x402_accumulates_denies_over_cap_and_persists() {
+        let path = tmpfile("x402-persist.json");
+        let _ = std::fs::remove_file(&path);
+        {
+            let l = x402_limits(Some(100), Some(&path), false);
+            // 40 + 40 = 80 ≤ 100 → allowed.
+            assert_eq!(
+                l.check_and_count_x402_spend("A", 40, X402_DAY0),
+                LimitDecision::Allow
+            );
+            assert_eq!(
+                l.check_and_count_x402_spend("A", 40, X402_DAY0),
+                LimitDecision::Allow
+            );
+            // +40 would make 120 > 100 → denied (and NOT charged).
+            assert!(matches!(
+                l.check_and_count_x402_spend("A", 40, X402_DAY0),
+                LimitDecision::X402CapExhausted { .. }
+            ));
+            // A charge that still fits (80 + 20 = 100) → allowed; now exactly at cap.
+            assert_eq!(
+                l.check_and_count_x402_spend("A", 20, X402_DAY0),
+                LimitDecision::Allow
+            );
+            assert!(matches!(
+                l.check_and_count_x402_spend("A", 1, X402_DAY0),
+                LimitDecision::X402CapExhausted { .. }
+            ));
+        }
+        // Restart-equivalent: a fresh Limits reads the file — the day's spend
+        // (100) survives, the cap stays exhausted (systemd restart must not refill).
+        let l2 = x402_limits(Some(100), Some(&path), false);
+        assert!(matches!(
+            l2.check_and_count_x402_spend("A", 1, X402_DAY0 + 1),
+            LimitDecision::X402CapExhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn h2_x402_per_key_isolation() {
+        let path = tmpfile("x402-iso.json");
+        let _ = std::fs::remove_file(&path);
+        let l = x402_limits(Some(50), Some(&path), false);
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 50, X402_DAY0),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            l.check_and_count_x402_spend("A", 1, X402_DAY0),
+            LimitDecision::X402CapExhausted { .. }
+        ));
+        // Key B has its own accumulator — A's exhaustion doesn't touch it.
+        assert_eq!(
+            l.check_and_count_x402_spend("B", 50, X402_DAY0),
+            LimitDecision::Allow
+        );
+    }
+
+    #[test]
+    fn h2_x402_dry_run_allows_but_keeps_accumulating() {
+        let path = tmpfile("x402-dry.json");
+        let _ = std::fs::remove_file(&path);
+        let l = x402_limits(Some(100), Some(&path), true); // dry-run
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 80, X402_DAY0),
+            LimitDecision::Allow
+        );
+        // 80 + 80 = 160 > 100, but dry-run ALLOWS (would-deny logged) and STILL charges.
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 80, X402_DAY0),
+            LimitDecision::Allow
+        );
+        // The soak accumulator reflects the real 160: a fresh ENFORCING Limits
+        // reading the same file sees the key already over cap.
+        let l2 = x402_limits(Some(100), Some(&path), false);
+        assert!(matches!(
+            l2.check_and_count_x402_spend("A", 1, X402_DAY0),
+            LimitDecision::X402CapExhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn h2_x402_utc_rollover_resets_spend() {
+        let path = tmpfile("x402-rollover.json");
+        let _ = std::fs::remove_file(&path);
+        let l = x402_limits(Some(100), Some(&path), false);
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 100, X402_DAY0),
+            LimitDecision::Allow
+        );
+        assert!(matches!(
+            l.check_and_count_x402_spend("A", 1, X402_DAY0),
+            LimitDecision::X402CapExhausted { .. }
+        ));
+        // Next UTC day → fresh budget.
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 100, X402_DAY0 + SECS_PER_DAY),
+            LimitDecision::Allow
+        );
+    }
+
+    #[test]
+    fn h2_x402_clock_rollback_fails_closed() {
+        let path = tmpfile("x402-rollback.json");
+        let _ = std::fs::remove_file(&path);
+        // A state file dated in the FUTURE = the clock moved backwards → deny,
+        // never re-zero (a backwards clock must not refill quota).
+        let future = X402SpendState {
+            day: today(X402_DAY0) + 5,
+            spend: HashMap::new(),
+        };
+        store_x402_spend_state(&path, &future).unwrap();
+        let l = x402_limits(Some(100), Some(&path), false);
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 1, X402_DAY0),
+            LimitDecision::CounterUnavailable
+        );
+    }
+
+    #[test]
+    fn h2_x402_corrupt_state_denies_enforce_passes_dry_run() {
+        let path = tmpfile("x402-corrupt.json");
+        std::fs::write(&path, b"{ not valid json").unwrap();
+        // Enforce: corrupt state → fail-closed deny (never a silent reset).
+        let l = x402_limits(Some(100), Some(&path), false);
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 1, X402_DAY0),
+            LimitDecision::CounterUnavailable
+        );
+        // Dry-run: same corrupt state → loud pass, never blocks the soak.
+        let ld = x402_limits(Some(100), Some(&path), true);
+        assert_eq!(
+            ld.check_and_count_x402_spend("A", 1, X402_DAY0),
+            LimitDecision::Allow
+        );
+    }
+
+    #[test]
+    fn h2_x402_sum_overflow_fails_closed() {
+        let path = tmpfile("x402-overflow.json");
+        let _ = std::fs::remove_file(&path);
+        // Cap = u128::MAX so the cap itself never denies — only the overflow guard.
+        let l = x402_limits(Some(u128::MAX), Some(&path), false);
+        assert_eq!(
+            l.check_and_count_x402_spend("A", u128::MAX - 10, X402_DAY0),
+            LimitDecision::Allow
+        );
+        // (MAX-10) + 20 overflows u128 → fail-closed deny, never wrap.
+        assert_eq!(
+            l.check_and_count_x402_spend("A", 20, X402_DAY0),
+            LimitDecision::CounterUnavailable
+        );
+    }
+
+    #[test]
+    fn h2_x402_u128_value_roundtrips_through_persist() {
+        let path = tmpfile("x402-u128.json");
+        let _ = std::fs::remove_file(&path);
+        // A value well beyond u64::MAX (~1.8e19) to prove the accumulator + JSON
+        // persistence are truly u128 — a silent u64 truncation would corrupt this.
+        let big: u128 = 1_000_000_000_000_000_000_000_000_000_000; // 1e30
+        let cap: u128 = big + 5;
+        {
+            let l = x402_limits(Some(cap), Some(&path), false);
+            assert_eq!(
+                l.check_and_count_x402_spend("A", big, X402_DAY0),
+                LimitDecision::Allow
+            );
+        }
+        // Reload: current == big (survived the round-trip). +10 exceeds cap
+        // (big+5) via the CAP path (no overflow); +5 exactly fills it.
+        let l2 = x402_limits(Some(cap), Some(&path), false);
+        assert!(matches!(
+            l2.check_and_count_x402_spend("A", 10, X402_DAY0 + 1),
+            LimitDecision::X402CapExhausted { .. }
+        ));
+        let l3 = x402_limits(Some(cap), Some(&path), false);
+        assert_eq!(
+            l3.check_and_count_x402_spend("A", 5, X402_DAY0 + 1),
+            LimitDecision::Allow
+        );
     }
 }

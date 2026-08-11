@@ -37,8 +37,8 @@ pub const ALLOWED_EXCHANGES: &[&str] = &[
     "bybit",
     "okx",
     "hyperliquid_main",
-    // HL TESTNET (source="b", api.hyperliquid-testnet.xyz) — separate venue from
-    // mainnet (which the enclave hard-denies); its own sealed agent-wallet blob.
+    // HL TESTNET (source="b", api.hyperliquid-testnet.xyz) — a separate venue
+    // from mainnet, with its own sealed agent-wallet blob and its own grant.
     "hyperliquid_testnet",
     "asterdex",
 ];
@@ -177,7 +177,10 @@ pub struct SignHttpResponse {
 impl std::fmt::Debug for SignHttpResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignHttpResponse")
-            .field("headers", &format!("[REDACTED {} headers]", self.headers.len()))
+            .field(
+                "headers",
+                &format!("[REDACTED {} headers]", self.headers.len()),
+            )
             .field("signature", &self.signature.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -763,11 +766,25 @@ pub fn denial_meta(code: &str) -> (bool, &'static str, &'static str) {
 }
 
 /// Response for `GET /healthz` on success.
+///
+/// The `sign_*` fields (E3) publish live-signature health from the periodic
+/// self-sign probe. `sign_checked=false` on venue-only boxes where the
+/// attested-data key isn't provisioned — a monitor must ignore `sign_ok` /
+/// `sign_age_s` then. The 200/503 status of `/healthz` itself stays purely a
+/// function of the enclave vsock `ping`; a stale/failed sign probe is surfaced
+/// here for alerting but does NOT flip the liveness code (a signing outage must
+/// page an operator, not make a load balancer kill/restart the gateway).
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
     pub enclave_cid: u32,
     pub enclave_port: u32,
+    /// Whether the periodic self-sign probe is active (attested-data provisioned).
+    pub sign_checked: bool,
+    /// Whether the most recent self-sign probe passed (meaningful only if `sign_checked`).
+    pub sign_ok: bool,
+    /// Seconds since the last SUCCESSFUL self-sign; `null` if it never succeeded yet.
+    pub sign_age_s: Option<u64>,
 }
 
 /// Generic error codes returned to HTTP clients.
@@ -781,7 +798,7 @@ pub mod err_code {
     pub const KMS_DECRYPT_DENIED: &str = "kms_decrypt_denied";
     pub const INTERNAL_ERROR: &str = "internal_error";
     pub const ENCLAVE_UNREACHABLE: &str = "enclave_unreachable";
-    /// C22 (adversarial review 2026-05-18): bearer token missing, malformed, or unknown.
+    /// C22 (ZLODEY 2026-05-18): bearer token missing, malformed, or unknown.
     /// Returned with HTTP 401. We do not distinguish "missing" vs "wrong"
     /// to avoid an oracle that lets attackers tell whether tokens are
     /// enforced at all.
@@ -938,6 +955,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn health_response_serializes_sign_liveness_fields() {
+        // Provisioned + healthy.
+        let ok = HealthResponse {
+            status: "ok",
+            enclave_cid: 16,
+            enclave_port: 5005,
+            sign_checked: true,
+            sign_ok: true,
+            sign_age_s: Some(42),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["sign_checked"], serde_json::json!(true));
+        assert_eq!(v["sign_ok"], serde_json::json!(true));
+        assert_eq!(v["sign_age_s"], serde_json::json!(42));
+
+        // Never-succeeded → sign_age_s is JSON null (monitor treats as stale).
+        let never = HealthResponse {
+            status: "ok",
+            enclave_cid: 16,
+            enclave_port: 5005,
+            sign_checked: true,
+            sign_ok: false,
+            sign_age_s: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&never).unwrap();
+        assert!(v["sign_age_s"].is_null());
+
+        // Venue-only box (data key not provisioned) → sign_checked false.
+        let venue_only = HealthResponse {
+            status: "ok",
+            enclave_cid: 16,
+            enclave_port: 5005,
+            sign_checked: false,
+            sign_ok: false,
+            sign_age_s: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&venue_only).unwrap();
+        assert_eq!(v["sign_checked"], serde_json::json!(false));
+    }
+
+    #[test]
     fn http_status_mapping_covers_known_codes() {
         assert_eq!(http_status_for(err_code::BAD_REQUEST), 400);
         assert_eq!(http_status_for(err_code::PAYLOAD_TOO_LARGE), 413);
@@ -1002,7 +1060,10 @@ mod tests {
             let coerced = safe_wire_code(dynamic);
             assert_eq!(coerced, err_code::ACTION_NOT_ALLOWED, "coerce {dynamic}");
             assert_eq!(http_status_for(coerced), 403);
-            assert!(!coerced.contains(':'), "coerced wire code must drop the suffix");
+            assert!(
+                !coerced.contains(':'),
+                "coerced wire code must drop the suffix"
+            );
             let body = ErrorResponse::new(coerced);
             assert!(!body.reason_code.contains(':') && !body.error.contains(':'));
         }
@@ -1027,18 +1088,46 @@ mod tests {
     #[test]
     fn explainable_body_denial_meta_is_typed_and_consistent() {
         for (code, denied, rc, class) in [
-            (err_code::SIZE_OVER_CAP, true, err_code::SIZE_OVER_CAP, "policy"),
-            (err_code::WITHDRAWAL_NOT_SIGNABLE, true, err_code::WITHDRAWAL_NOT_SIGNABLE, "policy"),
+            (
+                err_code::SIZE_OVER_CAP,
+                true,
+                err_code::SIZE_OVER_CAP,
+                "policy",
+            ),
+            (
+                err_code::WITHDRAWAL_NOT_SIGNABLE,
+                true,
+                err_code::WITHDRAWAL_NOT_SIGNABLE,
+                "policy",
+            ),
             (err_code::DAILY_CAP, true, err_code::DAILY_CAP, "rate"),
             (err_code::UNAUTHORIZED, true, err_code::UNAUTHORIZED, "auth"),
-            (err_code::KMS_DECRYPT_DENIED, true, err_code::KMS_DECRYPT_DENIED, "attestation"),
-            (err_code::BAD_REQUEST, false, err_code::BAD_REQUEST, "request"),
-            (err_code::INTERNAL_ERROR, false, err_code::INTERNAL_ERROR, "infra"),
+            (
+                err_code::KMS_DECRYPT_DENIED,
+                true,
+                err_code::KMS_DECRYPT_DENIED,
+                "attestation",
+            ),
+            (
+                err_code::BAD_REQUEST,
+                false,
+                err_code::BAD_REQUEST,
+                "request",
+            ),
+            (
+                err_code::INTERNAL_ERROR,
+                false,
+                err_code::INTERNAL_ERROR,
+                "infra",
+            ),
         ] {
             assert_eq!(denial_meta(code), (denied, rc, class), "meta for {code}");
         }
         // Tier-2 fail-closed: unmapped code → generic policy denial, denied=true.
-        assert_eq!(denial_meta("future_code"), (true, err_code::POLICY_DENIED, "policy"));
+        assert_eq!(
+            denial_meta("future_code"),
+            (true, err_code::POLICY_DENIED, "policy")
+        );
     }
 
     #[test]
@@ -1047,7 +1136,12 @@ mod tests {
         // never a numeric threshold, cap, or allow-list value. Assert every
         // reason_code/rule_class is lowercase-ascii with no digits.
         for code in WIRE_OK_ERROR_CODES.iter().chain(["future_code"].iter()) {
-            let ErrorResponse { denied: _, reason_code, rule_class, error } = ErrorResponse::new(code);
+            let ErrorResponse {
+                denied: _,
+                reason_code,
+                rule_class,
+                error,
+            } = ErrorResponse::new(code);
             for field in [&reason_code, &rule_class, &error] {
                 assert!(
                     field.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
@@ -1099,7 +1193,10 @@ mod tests {
 
     #[test]
     fn safe_wire_code_collapses_unknown_to_internal_error() {
-        assert_eq!(safe_wire_code("something_diag_leak"), err_code::INTERNAL_ERROR);
+        assert_eq!(
+            safe_wire_code("something_diag_leak"),
+            err_code::INTERNAL_ERROR
+        );
         assert_eq!(safe_wire_code(""), err_code::INTERNAL_ERROR);
     }
 
@@ -1108,7 +1205,10 @@ mod tests {
         // Regression: if anyone removes VERIFY_FAILED from the allow-list,
         // the verify_blob path would collapse it to internal_error and
         // start re-leaking the oracle. Catch that in CI.
-        assert_eq!(safe_wire_code(err_code::VERIFY_FAILED), err_code::VERIFY_FAILED);
+        assert_eq!(
+            safe_wire_code(err_code::VERIFY_FAILED),
+            err_code::VERIFY_FAILED
+        );
     }
 
     #[test]

@@ -31,12 +31,12 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::auth::{RawToken, ResolvedCustomer};
 use crate::handlers::{
-    binance_base_url, build_binance_signed_qs, okx_base_url, okx_is_demo,
-    sign_structured_request, AgentIntentForward,
+    binance_base_url, build_binance_signed_qs, okx_base_url, okx_is_demo, sign_structured_request,
+    AgentIntentForward,
 };
 use crate::proto::OrderParams;
-use crate::auth::{RawToken, ResolvedCustomer};
 use crate::state::AppState;
 
 /// Venue HTTP timeout. Generous vs the venues' p99 (~400 ms) but short enough
@@ -442,7 +442,14 @@ async fn execute_leg(mut leg: SignedLeg) -> HedgeLegResult {
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(parsed) => {
                     let outcome = classify_receipt(leg.venue, &parsed);
-                    leg_result(&leg, outcome, Some(http_status), Some(parsed), None, duration_ms)
+                    leg_result(
+                        &leg,
+                        outcome,
+                        Some(http_status),
+                        Some(parsed),
+                        None,
+                        duration_ms,
+                    )
                 }
                 // Non-JSON 2xx from a JSON API = edge/WAF page. The request
                 // made it THROUGH to something — state is unknown, never
@@ -542,7 +549,11 @@ pub async fn post_hedge(
     Json(req): Json<HedgeRequest>,
 ) -> Response {
     let started = Instant::now();
-    info!(event = "hedge_received", legs = req.legs.len(), "POST /hedge");
+    info!(
+        event = "hedge_received",
+        legs = req.legs.len(),
+        "POST /hedge"
+    );
 
     if let Err(hint) = validate_hedge_shape(&req) {
         return (
@@ -720,7 +731,10 @@ mod tests {
             assert_eq!(classify_receipt("binance", &receipt), LegOutcome::Rejected);
         }
         assert_eq!(
-            classify_receipt("binance", &serde_json::json!({"orderId": 1, "status": "FILLED"})),
+            classify_receipt(
+                "binance",
+                &serde_json::json!({"orderId": 1, "status": "FILLED"})
+            ),
             LegOutcome::Ok
         );
     }
@@ -732,7 +746,10 @@ mod tests {
             LegOutcome::Ok
         );
         assert_eq!(
-            classify_receipt("okx", &serde_json::json!({"code": "51000", "msg": "param error"})),
+            classify_receipt(
+                "okx",
+                &serde_json::json!({"code": "51000", "msg": "param error"})
+            ),
             LegOutcome::Rejected
         );
         // Numeric 0 (wrong type) must not pass — OKX always sends strings.
@@ -822,7 +839,9 @@ mod tests {
         let req = HedgeRequest {
             legs: vec![leg("binance", "BTCUSDT", "buy", "market")],
         };
-        assert!(validate_hedge_shape(&req).unwrap_err().contains("exactly 2"));
+        assert!(validate_hedge_shape(&req)
+            .unwrap_err()
+            .contains("exactly 2"));
     }
 
     #[test]

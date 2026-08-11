@@ -43,7 +43,7 @@
 //! }
 //! ```
 //!
-//! Policy schema (must stay aligned with `enclave/src/proto.rs`
+//! Policy schema (must stay aligned with `_signer/poc/enclave/src/proto.rs`
 //! `pub struct Policy`):
 //!   - allowed_actions:          Option<Vec<String>>
 //!   - allowed_methods:          Option<Vec<String>>
@@ -69,11 +69,12 @@
 //! belt-and-suspenders companion.
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 mod registry;
+mod shamir;
 
 /// Local Policy schema. MUST stay in sync with the enclave's
 /// `proto::Policy` — field-for-field. Drift used to be tolerated and would
@@ -214,6 +215,22 @@ struct Cli {
     /// Skip the policy sanity check.
     #[arg(long, default_value_t = false, global = true)]
     skip_sanity_check: bool,
+    /// Target network for this blob. Defaults to `mainnet` (fail-closed): a
+    /// mainnet blob for an order-capable key MUST carry order caps, so
+    /// forgetting this flag can never silently produce an uncapped mainnet key.
+    /// Pass `--profile testnet` for demo/dogfood keys (e.g. keyless-Hummingbot)
+    /// where uncapped is acceptable. This gate is ALWAYS on — `--skip-sanity-check`
+    /// does NOT bypass it.
+    #[arg(long, value_enum, default_value_t = Profile::Mainnet, global = true)]
+    profile: Profile,
+}
+
+/// Which network a wrapped blob is destined for. `mainnet` is the strict,
+/// fail-closed default: an order-capable mainnet key without caps is refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Profile {
+    Mainnet,
+    Testnet,
 }
 
 #[derive(Debug, Subcommand)]
@@ -263,9 +280,59 @@ enum Commands {
         /// File holding the 64-hex private seed (alternative to $SIGNER_POLICY_PRIVKEY).
         #[arg(long)]
         priv_key_file: Option<PathBuf>,
+        /// §E6 2-of-3 ceremony: reconstruct the policy-authority seed from at
+        /// least `threshold` Shamir share files instead of $SIGNER_POLICY_PRIVKEY /
+        /// --priv-key-file. Repeat `--shares <file>` per share. The seed is
+        /// reconstructed in-memory (pubkey-verified) and zeroized after signing;
+        /// the full key is never written to disk. Mutually exclusive with
+        /// --priv-key-file.
+        #[arg(long)]
+        shares: Vec<PathBuf>,
         /// Path to write the signed policy JSON (with `policy_authority_sig`).
         #[arg(long)]
         out: PathBuf,
+    },
+    /// §E6: Shamir-share the control-plane authority seeds (m-of-n redundancy).
+    Authority {
+        #[command(subcommand)]
+        action: AuthorityAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthorityAction {
+    /// Split an authority seed into N Shamir shares, any `threshold` of which
+    /// reconstruct it. Writes one share file per holder. The seed comes from the
+    /// key's env var ($SIGNER_POLICY_PRIVKEY / $SIGNER_REGISTRY_PRIVKEY) or
+    /// --priv-key-file — never a CLI arg.
+    ///
+    /// ⚠️ MAINNET CEREMONY ONLY. Do NOT run this on a live authority seed on
+    /// testnet/demo. Building + unit-testing the tooling does not require it; the
+    /// live re-split is a supervised mainnet step (see the ceremony runbook).
+    Split {
+        /// Which authority seed: `policy-authority` or `registry-authority`.
+        #[arg(long)]
+        key_label: String,
+        /// File holding the 64-hex private seed (alternative to the key's env var).
+        #[arg(long)]
+        priv_key_file: Option<PathBuf>,
+        /// Reconstruction threshold (default 2).
+        #[arg(long, default_value_t = 2)]
+        threshold: u8,
+        /// Holder labels, one per share (default: primary second escrow).
+        #[arg(long)]
+        holder: Vec<String>,
+        /// Directory to write `<key_label>.<holder>.share.json` files.
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Verify a set of shares reconstructs a valid authority key WITHOUT exposing
+    /// the seed: reconstructs in-memory, prints ONLY the recovered public key, and
+    /// zeroizes. Use this to prove shares are good + agree before a grant ceremony.
+    Verify {
+        /// Share files (repeat `--shares <file>`); need at least `threshold` of them.
+        #[arg(long)]
+        shares: Vec<PathBuf>,
     },
 }
 
@@ -299,6 +366,13 @@ enum RegistryAction {
         /// File holding the 64-hex private seed (alternative to $SIGNER_REGISTRY_PRIVKEY).
         #[arg(long)]
         priv_key_file: Option<PathBuf>,
+        /// §E6 2-of-3 ceremony: reconstruct the registry-authority seed from at
+        /// least `threshold` Shamir share files instead of $SIGNER_REGISTRY_PRIVKEY /
+        /// --priv-key-file. Repeat `--shares <file>` per share. Reconstructed
+        /// in-memory (pubkey-verified) and zeroized. Mutually exclusive with
+        /// --priv-key-file.
+        #[arg(long)]
+        shares: Vec<PathBuf>,
         /// Directory to write `registry_entries.json` (the bytes to KMS-encrypt)
         /// and `refresh.json` (the params the parent forwards to the enclave).
         #[arg(long)]
@@ -337,7 +411,11 @@ fn policy_canonical_signable(policy: &Policy) -> Result<Vec<u8>> {
 /// collide with `{cust:"ab",venue:"c"}`), then the canonical policy.
 fn policy_authority_message(customer_id: &str, venue: &str, canonical_policy: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(
-        POLICY_AUTHORITY_DOMAIN.len() + 12 + customer_id.len() + venue.len() + canonical_policy.len(),
+        POLICY_AUTHORITY_DOMAIN.len()
+            + 12
+            + customer_id.len()
+            + venue.len()
+            + canonical_policy.len(),
     );
     msg.extend_from_slice(POLICY_AUTHORITY_DOMAIN);
     msg.extend_from_slice(&(customer_id.len() as u32).to_be_bytes());
@@ -375,33 +453,40 @@ fn cmd_policy_sign(
     customer_id: &str,
     venue: &str,
     priv_key_file: Option<&std::path::Path>,
+    shares: &[PathBuf],
     out: &std::path::Path,
+    profile: Profile,
 ) -> Result<()> {
     use zeroize::Zeroizing;
 
-    let priv_hex: Zeroizing<String> = if let Some(p) = priv_key_file {
-        // Gemini #217 HIGH: wrap the RAW file read in Zeroizing BEFORE `.trim()`
-        // — otherwise the original `String` (holding the un-trimmed private seed)
-        // is dropped without zeroizing and its plaintext lingers in freed heap.
-        let raw = Zeroizing::new(
-            std::fs::read_to_string(p)
-                .with_context(|| format!("reading private-key file {}", p.display()))?,
+    // §E6 seed source: --shares (2-of-3 Shamir, reconstruct in-memory) takes
+    // precedence; otherwise the historical env/--priv-key-file path is UNCHANGED.
+    let seed: Zeroizing<[u8; 32]> = if !shares.is_empty() {
+        anyhow::ensure!(
+            priv_key_file.is_none(),
+            "pass EITHER --shares or --priv-key-file, not both"
         );
-        Zeroizing::new(raw.trim().to_owned())
+        shamir::reconstruct_seed(shares, Some("policy-authority"))?
     } else {
-        Zeroizing::new(
-            std::env::var("SIGNER_POLICY_PRIVKEY")
-                .context("set $SIGNER_POLICY_PRIVKEY (64-hex seed) or pass --priv-key-file")?,
-        )
+        let priv_hex: Zeroizing<String> = if let Some(p) = priv_key_file {
+            // Gemini #217 HIGH: wrap the RAW file read in Zeroizing BEFORE `.trim()`
+            // — otherwise the original `String` (holding the un-trimmed private seed)
+            // is dropped without zeroizing and its plaintext lingers in freed heap.
+            let raw = Zeroizing::new(
+                std::fs::read_to_string(p)
+                    .with_context(|| format!("reading private-key file {}", p.display()))?,
+            );
+            Zeroizing::new(raw.trim().to_owned())
+        } else {
+            Zeroizing::new(
+                std::env::var("SIGNER_POLICY_PRIVKEY")
+                    .context("set $SIGNER_POLICY_PRIVKEY (64-hex seed) or pass --priv-key-file")?,
+            )
+        };
+        // Reuse the shared, non-allocating (decode_to_slice) seed parser — same
+        // validation + error messages as before, one hardened decode path.
+        shamir::parse_seed_hex(&priv_hex)?
     };
-    let seed_bytes =
-        Zeroizing::new(hex::decode(priv_hex.trim()).context("private seed is not valid hex")?);
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
-        seed_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("private seed must be exactly 32 bytes (64 hex chars)"))?,
-    );
 
     let policy_bytes = std::fs::read(policy_path)
         .with_context(|| format!("reading policy file {}", policy_path.display()))?;
@@ -424,6 +509,12 @@ fn cmd_policy_sign(
     assert_policy_round_trip(&policy_bytes, &policy)
         .with_context(|| format!("policy round-trip check: {}", policy_path.display()))?;
     sanity_check_policy(&policy, &serde_json::json!({}), Some(policy_path))?;
+    // PROVISIONING GUARD (Path B): an authority-signed template is destined for
+    // the strict money path — a partner KMS-encrypts their own secret against it,
+    // so our wrap-time guard never runs on their side. Refuse to authority-sign
+    // an uncapped order-capable mainnet template here too. Gemini review #266.
+    enforce_provisioning_profile_invariant(&policy, profile)
+        .with_context(|| format!("provisioning guard: {}", policy_path.display()))?;
 
     let sig = sign_policy_authority(&policy, customer_id, venue, &seed)?;
     policy.policy_authority_sig = Some(sig);
@@ -441,9 +532,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Envelope { ref out_dir }) => {
-            cmd_envelope(&cli, out_dir)
-        }
+        Some(Commands::Envelope { ref out_dir }) => cmd_envelope(&cli, out_dir),
         Some(Commands::Seal {
             ref envelope,
             ref wrapped_dek_b64,
@@ -455,10 +544,155 @@ fn main() -> Result<()> {
             ref customer_id,
             ref venue,
             ref priv_key_file,
+            ref shares,
             ref out,
-        }) => cmd_policy_sign(policy_file, customer_id, venue, priv_key_file.as_deref(), out),
+        }) => cmd_policy_sign(
+            policy_file,
+            customer_id,
+            venue,
+            priv_key_file.as_deref(),
+            shares,
+            out,
+            cli.profile,
+        ),
+        Some(Commands::Authority { ref action }) => cmd_authority(action),
         None => cmd_wrap_legacy(&cli),
     }
+}
+
+/// §E6 dispatch: Shamir split / verify of the control-plane authority seeds.
+fn cmd_authority(action: &AuthorityAction) -> Result<()> {
+    match action {
+        AuthorityAction::Split {
+            key_label,
+            priv_key_file,
+            threshold,
+            holder,
+            out_dir,
+        } => cmd_authority_split(
+            key_label,
+            priv_key_file.as_deref(),
+            *threshold,
+            holder,
+            out_dir,
+        ),
+        AuthorityAction::Verify { shares } => cmd_authority_verify(shares),
+    }
+}
+
+/// Map an authority key_label → the env var carrying its 64-hex seed.
+fn authority_env_var(key_label: &str) -> Result<&'static str> {
+    match key_label {
+        "policy-authority" => Ok("SIGNER_POLICY_PRIVKEY"),
+        "registry-authority" => Ok("SIGNER_REGISTRY_PRIVKEY"),
+        other => {
+            bail!("unknown --key-label {other:?} (expected policy-authority or registry-authority)")
+        }
+    }
+}
+
+/// `authority split`: split an authority seed into Shamir shares.
+///
+/// ⚠️ MAINNET CEREMONY ONLY — do NOT run on a live seed on testnet/demo. The seed
+/// is read from the key's env var or --priv-key-file, split into `holder.len()`
+/// shares (threshold-of-n), and one share file per holder is written. The seed is
+/// reconstructed once in-memory for the split self-check, then zeroized.
+fn cmd_authority_split(
+    key_label: &str,
+    priv_key_file: Option<&std::path::Path>,
+    threshold: u8,
+    holders: &[String],
+    out_dir: &std::path::Path,
+) -> Result<()> {
+    use zeroize::Zeroizing;
+
+    // key_label + holder labels flow into share FILENAMES — validate them so an
+    // unexpected label (esp. when --priv-key-file bypasses the env-var lookup)
+    // can't traverse out of out_dir or produce a surprising filename.
+    shamir::validate_key_label(key_label)?;
+    let holders: Vec<String> = if holders.is_empty() {
+        shamir::default_holders()
+    } else {
+        holders.to_vec()
+    };
+    for h in &holders {
+        shamir::validate_holder(h)?;
+    }
+
+    // Seed source: --priv-key-file (raw read wrapped in Zeroizing BEFORE trim,
+    // matching cmd_policy_sign / cmd_registry_sign) else the key's env var.
+    let priv_hex: Zeroizing<String> = if let Some(p) = priv_key_file {
+        let raw = Zeroizing::new(
+            std::fs::read_to_string(p)
+                .with_context(|| format!("reading private-key file {}", p.display()))?,
+        );
+        Zeroizing::new(raw.trim().to_owned())
+    } else {
+        let env = authority_env_var(key_label)?;
+        Zeroizing::new(
+            std::env::var(env)
+                .with_context(|| format!("set ${env} (64-hex seed) or pass --priv-key-file"))?,
+        )
+    };
+    let seed = shamir::parse_seed_hex(&priv_hex)?;
+
+    let shares = shamir::split_seed(&seed, key_label, threshold, &holders)?;
+
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating out-dir {}", out_dir.display()))?;
+    for sh in &shares {
+        let path = out_dir.join(shamir::share_filename(key_label, &sh.holder));
+        // The serialized JSON carries the share — zeroize the in-memory buffer
+        // after it hits disk. Create the file 0600 (owner-only) and REFUSE to
+        // overwrite an existing path (create_new): shares are the most sensitive
+        // material this tool touches, and a clobber could destroy a distributed
+        // share or silently mix generations.
+        let json = Zeroizing::new(serde_json::to_vec_pretty(sh)?);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path).with_context(|| {
+            format!(
+                "creating share {} (refusing to overwrite an existing file)",
+                path.display()
+            )
+        })?;
+        std::io::Write::write_all(&mut f, &json)
+            .with_context(|| format!("writing share {}", path.display()))?;
+        eprintln!(
+            "# wrote share holder={:?} x={} → {} (mode 0600)",
+            sh.holder,
+            sh.x,
+            path.display()
+        );
+    }
+    eprintln!(
+        "# split {key_label}: {}-of-{} shares, pubkey={}",
+        shares[0].threshold, shares[0].shares_total, shares[0].pubkey
+    );
+    eprintln!(
+        "# Distribute the shares to their holders + the offline escrow, then \
+         DESTROY the original whole seed. Verify with `authority verify`."
+    );
+    Ok(())
+}
+
+/// `authority verify`: reconstruct in-memory and print ONLY the recovered pubkey,
+/// proving a set of shares is valid + agrees WITHOUT exposing the seed.
+fn cmd_authority_verify(shares: &[PathBuf]) -> Result<()> {
+    let seed = shamir::reconstruct_seed(shares, None)?;
+    let pubkey = {
+        use ed25519_dalek::SigningKey;
+        hex::encode(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
+    };
+    // seed drops (zeroized) here; only the public key is surfaced.
+    println!("# {} shares reconstruct authority pubkey:", shares.len());
+    println!("{pubkey}");
+    Ok(())
 }
 
 /// Dispatch the `registry` subcommand group (control-plane keypair + signer).
@@ -470,8 +704,16 @@ fn cmd_registry(action: &RegistryAction) -> Result<()> {
             nonce,
             version,
             priv_key_file,
+            shares,
             out_dir,
-        } => cmd_registry_sign(entries, nonce, *version, priv_key_file.as_deref(), out_dir),
+        } => cmd_registry_sign(
+            entries,
+            nonce,
+            *version,
+            priv_key_file.as_deref(),
+            shares,
+            out_dir,
+        ),
     }
 }
 
@@ -501,7 +743,9 @@ fn cmd_registry_keygen(show_private: bool) -> Result<()> {
         );
         eprintln!("SIGNER_REGISTRY_PRIVKEY={}", priv_hex.as_str());
     } else {
-        eprintln!("# (re-run with --show-private on an interactive terminal to reveal the private seed)");
+        eprintln!(
+            "# (re-run with --show-private on an interactive terminal to reveal the private seed)"
+        );
     }
     Ok(())
 }
@@ -511,39 +755,42 @@ fn cmd_registry_sign(
     nonce_hex: &str,
     version: u64,
     priv_key_file: Option<&std::path::Path>,
+    shares: &[PathBuf],
     out_dir: &std::path::Path,
 ) -> Result<()> {
     use zeroize::Zeroizing;
 
-    // Private seed: prefer the file (if given), else $SIGNER_REGISTRY_PRIVKEY.
+    // §E6 seed source: --shares (2-of-3 Shamir, reconstruct in-memory) takes
+    // precedence; otherwise the historical env/--priv-key-file path is UNCHANGED.
     // Never a CLI arg — that would leak the trust-root key via `ps`/shell history.
-    let priv_hex: Zeroizing<String> = if let Some(p) = priv_key_file {
-        // Gemini #217 HIGH: wrap the RAW file read in Zeroizing BEFORE `.trim()`
-        // — otherwise the original `String` (holding the un-trimmed registry
-        // trust-root seed) is dropped without zeroizing and its plaintext lingers
-        // in freed heap. This key is the control-plane trust root, so it matters
-        // MORE than the policy-authority seed fixed identically in cmd_policy_sign.
-        let raw = Zeroizing::new(
-            std::fs::read_to_string(p)
-                .with_context(|| format!("reading private-key file {}", p.display()))?,
+    let seed: Zeroizing<[u8; 32]> = if !shares.is_empty() {
+        anyhow::ensure!(
+            priv_key_file.is_none(),
+            "pass EITHER --shares or --priv-key-file, not both"
         );
-        Zeroizing::new(raw.trim().to_owned())
+        shamir::reconstruct_seed(shares, Some("registry-authority"))?
     } else {
-        Zeroizing::new(
-            std::env::var("SIGNER_REGISTRY_PRIVKEY")
-                .context("set $SIGNER_REGISTRY_PRIVKEY (64-hex seed) or pass --priv-key-file")?,
-        )
+        let priv_hex: Zeroizing<String> =
+            if let Some(p) = priv_key_file {
+                // Gemini #217 HIGH: wrap the RAW file read in Zeroizing BEFORE `.trim()`
+                // — otherwise the original `String` (holding the un-trimmed registry
+                // trust-root seed) is dropped without zeroizing and its plaintext lingers
+                // in freed heap. This key is the control-plane trust root, so it matters
+                // MORE than the policy-authority seed fixed identically in cmd_policy_sign.
+                let raw = Zeroizing::new(
+                    std::fs::read_to_string(p)
+                        .with_context(|| format!("reading private-key file {}", p.display()))?,
+                );
+                Zeroizing::new(raw.trim().to_owned())
+            } else {
+                Zeroizing::new(std::env::var("SIGNER_REGISTRY_PRIVKEY").context(
+                    "set $SIGNER_REGISTRY_PRIVKEY (64-hex seed) or pass --priv-key-file",
+                )?)
+            };
+        // Reuse the shared, non-allocating (decode_to_slice) seed parser — same
+        // validation + error messages, no transient unzeroized decode buffer.
+        shamir::parse_seed_hex(&priv_hex)?
     };
-    // Zeroizing on the decoded Vec too — the raw seed bytes must not linger in
-    // freed heap after the copy into the fixed array (crypto review M).
-    let seed_bytes =
-        Zeroizing::new(hex::decode(priv_hex.trim()).context("private seed is not valid hex")?);
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
-        seed_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("private seed must be exactly 32 bytes (64 hex chars)"))?,
-    );
 
     // The entries file carries plaintext bearer tokens — Zeroizing the raw bytes
     // so they don't linger in freed heap (review F6). (The parsed
@@ -574,7 +821,10 @@ fn cmd_registry_sign(
     std::fs::write(&refresh_out, serde_json::to_vec_pretty(&refresh)?)
         .with_context(|| format!("writing {}", refresh_out.display()))?;
 
-    eprintln!("registry refresh signed: version={version} entries={}", entries.len());
+    eprintln!(
+        "registry refresh signed: version={version} entries={}",
+        entries.len()
+    );
     eprintln!("  signed bytes  -> {}", entries_out.display());
     eprintln!("  refresh params-> {}", refresh_out.display());
     eprintln!("  content_hash  =  {}", signed.content_hash_hex);
@@ -629,8 +879,8 @@ fn strip_json_nulls(v: serde_json::Value) -> serde_json::Value {
 fn assert_policy_round_trip(policy_bytes: &[u8], policy: &Policy) -> Result<()> {
     let raw: serde_json::Value = serde_json::from_slice(policy_bytes)
         .context("re-parsing policy bytes for round-trip check")?;
-    let reserialized =
-        serde_json::to_value(policy).context("re-serializing parsed policy for round-trip check")?;
+    let reserialized = serde_json::to_value(policy)
+        .context("re-serializing parsed policy for round-trip check")?;
     let raw_normalized = strip_json_nulls(raw);
     if raw_normalized != reserialized {
         bail!(
@@ -640,6 +890,299 @@ fn assert_policy_round_trip(policy_bytes: &[u8], policy: &Policy) -> Result<()> 
              field this tool is too old to understand.\n  input(normalized): {}\n  wrapped:          {}",
             raw_normalized,
             reserialized
+        );
+    }
+    Ok(())
+}
+
+/// CEX actions that can obtain an order-placement signature. The generic HMAC
+/// actions (`sign`, `sign_kucoin`, `sign_binance`, `sign_bybit`, `sign_okx`,
+/// `sign_binance_request`) sign a caller-supplied request that CAN be an order,
+/// and for an UNCAPPED key the enclave does not deny `op=order` (CR051 only
+/// constrains CAPPED keys). The structured `_order` routes place orders by
+/// definition. So any of these on mainnet requires `order_caps`.
+const ORDER_CAPABLE_CEX_ACTIONS: &[&str] = &[
+    "sign",
+    "sign_kucoin",
+    "sign_binance",
+    "sign_bybit",
+    "sign_okx",
+    "sign_binance_request",
+    "sign_binance_order",
+    "sign_okx_order",
+    // Asterdex is a money venue that reuses `order_caps` — the enclave's
+    // strict-mode floor (`asterdex_floor_denies`) refuses `sign_asterdex` when
+    // `order_caps` is absent. Mirror that requirement at provisioning time.
+    "sign_asterdex",
+];
+
+/// Hyperliquid actions that place orders — these require `hl_order_caps`.
+const ORDER_CAPABLE_HL_ACTIONS: &[&str] = &[
+    "sign_hyperliquid_main_order",
+    "sign_hyperliquid_testnet_order",
+];
+
+/// Actions that CANNOT place an order, and therefore need no `order_caps` /
+/// `hl_order_caps` to exist on a mainnet key.
+///
+/// This list exists to close a fail-open in the guard's shape: the cap checks
+/// are allow-lists, so an action absent from BOTH order-capable lists is waved
+/// through by default. Categorising every known action explicitly — and pinning
+/// it with `every_known_action_is_categorised` — means a newly added venue
+/// action cannot silently inherit "order-incapable" (Gemini review #266; the
+/// `sign_asterdex` miss earlier in this same PR is exactly that failure mode).
+///
+/// NOTE on `sign_x402_eip3009`: order-incapable is not the same as harmless —
+/// it is the EIP-3009 withdrawal primitive. It carries no ORDER caps because it
+/// places no orders; it is gated separately and fail-closed in the enclave,
+/// which demands both `max_value` and a non-empty `allowed_recipients` and
+/// returns `policy_required` when either is absent (CR050).
+const ORDER_INCAPABLE_ACTIONS: &[&str] = &[
+    "ping",
+    // Cancels move no size — they cannot open or increase a position.
+    "sign_binance_cancel",
+    "sign_okx_cancel",
+    "sign_hyperliquid_main_cancel",
+    "sign_hyperliquid_testnet_cancel",
+    // Withdrawal primitive — capped by x402 `max_value` + `allowed_recipients`,
+    // not by `order_caps` (see NOTE above).
+    "sign_x402_eip3009",
+    // Attested-data signing — moves no funds.
+    "sign_data",
+    // Operator pre-flight: decrypt + SHA-256 + zeroize.
+    "verify_blob",
+];
+
+/// Does this decimal-string cap actually BIND anything in the enclave?
+///
+/// Mirrors the operand-validity rules of the enclave's
+/// `signer::cmp_positive_decimals` (digits and at most one dot, at least one
+/// digit — see its `split`, incl. the Gemini #78 `"."` case) and additionally
+/// requires the value to be strictly positive.
+///
+/// Gemini review #266 called a dummy entry a way to "bypass" the guard; it is
+/// NOT — the enclave is fail-closed on every such shape: a blank symbol never
+/// matches (`order_cap_symbol_denied` → `POLICY_DENIED`), an unparseable
+/// `max_qty` fails the compare and is attributed to the policy
+/// (`order_cap_max_qty_malformed` → `INTERNAL_ERROR`), and `"0"` denies every
+/// positive qty (`SIZE_OVER_CAP`). So a dummy cap yields a key that cannot
+/// sign at all, never an uncapped one. We refuse it here anyway because the
+/// failure otherwise surfaces in production instead of at provisioning time,
+/// where the operator can still fix the typo.
+/// The enclave's strictest decimal parser (`signer::decimal_digits`, used by the
+/// notional check and by the ROT-1 aggregate caps) refuses an operand longer
+/// than this. The per-order size comparator has no such bound, so a longer cap
+/// would work for single orders and fail for batches — a policy that half-works
+/// is worse than one refused here, where the operator can still fix it.
+const MAX_CAP_OPERAND_LEN: usize = 64;
+
+fn cap_binds(decimal: &str) -> bool {
+    !decimal.is_empty()
+        && decimal.len() <= MAX_CAP_OPERAND_LEN
+        && decimal.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+        && decimal.bytes().filter(|c| *c == b'.').count() <= 1
+        // Strictly positive ⇒ at least one non-zero digit (this also satisfies
+        // the enclave's "at least one digit" rule).
+        && decimal.bytes().any(|c| c.is_ascii_digit() && c != b'0')
+}
+
+/// PROVISIONING GUARD — the invariant "a mainnet key without order caps cannot
+/// physically exist". ALWAYS-ON: called from every wrap path OUTSIDE the
+/// `--skip-sanity-check` gate, so it cannot be bypassed. Fail-closed.
+///
+/// `--profile testnet` is a no-op (demo/dogfood keys may be uncapped;
+/// keyless-Hummingbot is the intended case).
+///
+/// `--profile mainnet` (the default) requires that a policy able to place an
+/// order on a money venue carries the matching non-empty caps: any order-capable
+/// CEX action (or an AF-2 `intent_pubkey`) requires `order_caps`; any
+/// order-capable Hyperliquid action requires `hl_order_caps`. Additionally a
+/// mainnet policy must EXPLICITLY scope `allowed_actions` (non-empty) — a
+/// permissive-by-omission policy can't be proven order-incapable, so it is
+/// refused rather than silently trusted.
+fn enforce_provisioning_profile_invariant(p: &Policy, profile: Profile) -> Result<()> {
+    // ROT-1 round-3: this one runs on BOTH profiles, deliberately, and is
+    // therefore ABOVE the testnet early-return.
+    //
+    // Every other rule here is a risk judgement about real funds, which is what
+    // `--profile testnet` is allowed to waive. This one is not: the enclave
+    // refuses an AF-2 policy on `is_hl_venue`, which matches Hyperliquid TESTNET
+    // as well. Waiving it for testnet would not produce a laxer key, it would
+    // produce a key that mints cleanly and then fails every signature — the
+    // provisioning guard's whole purpose is to make that impossible.
+    if p.intent_pubkey.is_some() {
+        // ABSENT `allowed_actions` permits everything, Hyperliquid included, so
+        // it must trip this guard exactly like an explicit HL entry does
+        // (CodeRabbit). Only listing explicit entries would let the most
+        // permissive policy of all through the gate that exists to catch it —
+        // the same "unscoped is not the same as none" reasoning as the
+        // empty/absent rule below. `Some(vec![])` is the opposite case and stays
+        // out: an empty list denies every action, so it can reach no HL path.
+        let hl_actions: Vec<&str> = p
+            .allowed_actions
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|a| a.starts_with("sign_hyperliquid_"))
+            .collect();
+        let unscoped = p.allowed_actions.is_none();
+        if unscoped || !hl_actions.is_empty() {
+            let which = if unscoped {
+                "an ABSENT allowed_actions (which permits every action, Hyperliquid \
+                 included)"
+                    .to_owned()
+            } else {
+                format!("Hyperliquid actions {hl_actions:?}")
+            };
+            bail!(
+                "PROVISIONING GUARD: policy carries intent_pubkey (AF-2) together with \
+                 {which}, but the enclave does not verify agent intent on the Hyperliquid \
+                 path — those orders would be signed with NO intent check while the policy \
+                 advertises one, and the enclave refuses to load such a policy on mainnet \
+                 AND testnet alike. Split the AF-2 key from the Hyperliquid key (one policy \
+                 each), or drop intent_pubkey. AF-2 for Hyperliquid needs its own signed \
+                 canonical over the index-keyed action and is not implemented."
+            );
+        }
+    }
+
+    if profile == Profile::Testnet {
+        return Ok(());
+    }
+    // Mainnet from here.
+    let actions = match p.allowed_actions.as_ref() {
+        Some(a) if !a.is_empty() => a,
+        _ => bail!(
+            "PROVISIONING GUARD (mainnet): policy.allowed_actions is empty/absent. A \
+             mainnet policy MUST explicitly scope its actions so it can be proven \
+             order-incapable or carry the required caps. Add allowed_actions (and \
+             order_caps for any order-capable action), or pass --profile testnet for \
+             a demo/dogfood key."
+        ),
+    };
+    // Fail-closed on anything this wrapper cannot categorise. The cap checks
+    // below are allow-lists, so an unrecognised action would otherwise be waved
+    // through UNCAPPED — the same fail-open that let `sign_asterdex` slip. Same
+    // reasoning as the empty-allowed_actions rule above: if we cannot prove it
+    // order-incapable, we refuse rather than silently trust it.
+    let uncategorised: Vec<&str> = actions
+        .iter()
+        .map(String::as_str)
+        .filter(|a| {
+            !ORDER_CAPABLE_CEX_ACTIONS.contains(a)
+                && !ORDER_CAPABLE_HL_ACTIONS.contains(a)
+                && !ORDER_INCAPABLE_ACTIONS.contains(a)
+        })
+        .collect();
+    if !uncategorised.is_empty() {
+        bail!(
+            "PROVISIONING GUARD (mainnet): allowed_actions {uncategorised:?} are not \
+             categorised by this wrapper, so they cannot be proven order-incapable. Fix \
+             the typo, or upgrade signer-policy-wrap and categorise the action \
+             (ORDER_CAPABLE_CEX_ACTIONS / ORDER_CAPABLE_HL_ACTIONS if it can place an \
+             order, else ORDER_INCAPABLE_ACTIONS). Or pass --profile testnet for a \
+             demo/dogfood key."
+        );
+    }
+
+    let has_order_caps = p.order_caps.as_ref().is_some_and(|c| !c.is_empty());
+    let has_hl_caps = p.hl_order_caps.as_ref().is_some_and(|c| !c.is_empty());
+
+    // Every cap entry that IS present must bind something (see `cap_binds`).
+    // A present-but-vacuous cap is not a bypass — the enclave refuses to sign
+    // under it — but it ships a key that bricks in production, so it dies here.
+    for c in p.order_caps.iter().flatten() {
+        if c.symbol.trim().is_empty() {
+            bail!(
+                "PROVISIONING GUARD (mainnet): an order_caps entry has a blank symbol. It \
+                 can never match a venue symbol, so the enclave would deny every order \
+                 under it (order_cap_symbol_denied). Set the exact venue symbol, e.g. \
+                 BTCUSDT."
+            );
+        }
+        if !cap_binds(&c.max_qty) {
+            bail!(
+                "PROVISIONING GUARD (mainnet): order_caps[{}].max_qty = {:?} is not a \
+                 strictly-positive decimal the enclave can compare (digits, at most one \
+                 dot). Such a cap bounds nothing and the enclave denies every order under \
+                 it. Set a real per-asset bound, e.g. \"0.01\".",
+                c.symbol,
+                c.max_qty
+            );
+        }
+        if let Some(n) = c.max_notional.as_deref() {
+            if !cap_binds(n) {
+                bail!(
+                    "PROVISIONING GUARD (mainnet): order_caps[{}].max_notional = {:?} is \
+                     not a strictly-positive decimal. Drop the field to leave the notional \
+                     unbounded, or set a real bound — a vacuous one only breaks signing.",
+                    c.symbol,
+                    n
+                );
+            }
+        }
+    }
+    for c in p.hl_order_caps.iter().flatten() {
+        if !cap_binds(&c.max_size) {
+            bail!(
+                "PROVISIONING GUARD (mainnet): hl_order_caps[asset={}].max_size = {:?} is \
+                 not a strictly-positive decimal the enclave can compare. Set a real \
+                 per-asset bound, e.g. \"1\".",
+                c.asset,
+                c.max_size
+            );
+        }
+        if let Some(n) = c.max_notional.as_deref() {
+            if !cap_binds(n) {
+                bail!(
+                    "PROVISIONING GUARD (mainnet): hl_order_caps[asset={}].max_notional = \
+                     {:?} is not a strictly-positive decimal. Drop the field to leave the \
+                     notional unbounded, or set a real bound.",
+                    c.asset,
+                    n
+                );
+            }
+        }
+    }
+
+    // (The AF-2-on-Hyperliquid refusal runs at the TOP of this function, on both
+    // profiles — see the comment there for why it is not a mainnet-only rule:
+    // the enclave rejects that shape on HL testnet too, so waiving it for the
+    // testnet profile would mint a key that cannot sign.)
+
+    let cex_order_actions: Vec<&str> = actions
+        .iter()
+        .map(String::as_str)
+        .filter(|a| ORDER_CAPABLE_CEX_ACTIONS.contains(a))
+        .collect();
+    // An AF-2 intent key is order-capable by construction — treat it like an
+    // order action for the caps requirement (defence in depth).
+    let needs_order_caps = !cex_order_actions.is_empty() || p.intent_pubkey.is_some();
+    if needs_order_caps && !has_order_caps {
+        let why = if cex_order_actions.is_empty() {
+            "intent_pubkey (AF-2 trading key)".to_owned()
+        } else {
+            format!("order-capable actions {cex_order_actions:?}")
+        };
+        bail!(
+            "PROVISIONING GUARD (mainnet): {why} can place orders, but policy carries \
+             no non-empty order_caps. A mainnet key without caps is exactly the \
+             cap-bypass risk this gate exists to prevent. Add order_caps (per-asset \
+             max_qty / max_notional), OR pass --profile testnet for a demo/dogfood key."
+        );
+    }
+
+    let hl_order_actions: Vec<&str> = actions
+        .iter()
+        .map(String::as_str)
+        .filter(|a| ORDER_CAPABLE_HL_ACTIONS.contains(a))
+        .collect();
+    if !hl_order_actions.is_empty() && !has_hl_caps {
+        bail!(
+            "PROVISIONING GUARD (mainnet): Hyperliquid order actions {hl_order_actions:?} \
+             can place orders, but policy carries no non-empty hl_order_caps. Add \
+             hl_order_caps (per-asset-index max_size / max_notional), OR pass \
+             --profile testnet for a demo/dogfood key."
         );
     }
     Ok(())
@@ -660,11 +1203,15 @@ fn load_policy_and_secret(cli: &Cli) -> Result<(Vec<u8>, Policy, serde_json::Val
     assert_policy_round_trip(&policy_bytes, &policy)
         .with_context(|| format!("policy round-trip check: {}", policy_path.display()))?;
 
+    // PROVISIONING GUARD: always-on (like the round-trip check above), NOT gated
+    // by --skip-sanity-check. Refuses an uncapped order-capable mainnet blob.
+    enforce_provisioning_profile_invariant(&policy, cli.profile)
+        .with_context(|| format!("provisioning guard: {}", policy_path.display()))?;
+
     let secret_bytes = std::fs::read(secret_path)
         .with_context(|| format!("reading secret file: {}", secret_path.display()))?;
-    let secret: serde_json::Value = serde_json::from_slice(&secret_bytes).with_context(|| {
-        format!("parsing secret file as JSON: {}", secret_path.display())
-    })?;
+    let secret: serde_json::Value = serde_json::from_slice(&secret_bytes)
+        .with_context(|| format!("parsing secret file as JSON: {}", secret_path.display()))?;
     if !secret.is_object() {
         bail!(
             "secret file must be a JSON object (got {}): {}",
@@ -722,16 +1269,15 @@ fn cmd_wrap_legacy(cli: &Cli) -> Result<()> {
 }
 
 fn cmd_envelope(cli: &Cli, out_dir: &std::path::Path) -> Result<()> {
-    use aes_gcm::{aead::Aead, aead::KeyInit, aead::OsRng, Aes256Gcm, AeadCore};
+    use aes_gcm::{aead::Aead, aead::KeyInit, aead::OsRng, AeadCore, Aes256Gcm};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use zeroize::Zeroizing;
 
     let (_, policy, secret) = load_policy_and_secret(cli)?;
 
     let wrapped = PolicyWrappedSecret { policy, secret };
-    let plaintext = Zeroizing::new(
-        serde_json::to_vec(&wrapped).context("serializing wrapped blob")?,
-    );
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(&wrapped).context("serializing wrapped blob")?);
 
     // One fresh DEK + nonce per envelope. DEK MUST NOT be reused across envelopes.
     let dek = Zeroizing::new(Aes256Gcm::generate_key(OsRng).to_vec());
@@ -793,7 +1339,11 @@ fn cmd_envelope(cli: &Cli, out_dir: &std::path::Path) -> Result<()> {
     }
 
     eprintln!("Envelope created:");
-    eprintln!("  {} (AES-GCM encrypted secret, {} bytes ciphertext)", env_path.display(), ciphertext.len());
+    eprintln!(
+        "  {} (AES-GCM encrypted secret, {} bytes ciphertext)",
+        env_path.display(),
+        ciphertext.len()
+    );
     eprintln!("  {} (32-byte DEK, PROTECT THIS FILE)", dek_path.display());
     eprintln!();
     eprintln!("Next steps:");
@@ -867,8 +1417,7 @@ fn cmd_seal(
         }
     }
 
-    std::fs::write(output, &sealed)
-        .with_context(|| format!("writing {}", output.display()))?;
+    std::fs::write(output, &sealed).with_context(|| format!("writing {}", output.display()))?;
 
     let dek_path = envelope_path.with_file_name("dek.bin");
     if dek_path.exists() {
@@ -1104,7 +1653,7 @@ fn sanity_check_policy(
         }
     }
 
-    // ─── C19 (adversarial review 2026-05-18): EIP-712 method/path skip warning ─────
+    // ─── C19 (ZLODEY 2026-05-18): EIP-712 method/path skip warning ─────
     //
     // EIP-712 venues (Hyperliquid, Asterdex) sign typed-data structs, not
     // HTTP requests. They carry no method/path on the wire. The enclave's
@@ -1115,13 +1664,11 @@ fn sanity_check_policy(
     // We warn at wrap time so the customer either (a) understands the gap
     // and accepts it, or (b) tightens `allowed_actions` to exclude EIP-712
     // venues.
-    let has_method_or_path =
-        p.allowed_methods.is_some() || p.allowed_path_prefixes.is_some();
+    let has_method_or_path = p.allowed_methods.is_some() || p.allowed_path_prefixes.is_some();
     if has_method_or_path && policy_permits_any_eip712(p) {
         let scope = match &p.allowed_actions {
             None => {
-                "allowed_actions is None (implicit allow-all, includes EIP-712 actions)"
-                    .to_string()
+                "allowed_actions is None (implicit allow-all, includes EIP-712 actions)".to_string()
             }
             Some(actions) => {
                 let eip712: Vec<&str> = actions
@@ -1141,12 +1688,11 @@ fn sanity_check_policy(
              Asterdex). Current policy: {}. If you need to restrict these venues, \
              narrow allowed_actions to exclude them or accept that method/path \
              constraints don't apply.",
-            tag,
-            scope
+            tag, scope
         );
     }
 
-    // ─── C27 (adversarial review 2026-05-18): fail-loud on max_requests_per_minute ──
+    // ─── C27 (ZLODEY 2026-05-18): fail-loud on max_requests_per_minute ──
     //
     // Schema field is accepted but the enclave does NOT enforce it
     // (stateful rate-limiting deferred). We reject at wrap time so the
@@ -1212,19 +1758,30 @@ fn sanity_check_policy(
     // first sign. Validate the format here so a typo is caught at wrap. Lenient
     // (optional 0x + 40 hex) so we never reject an address the enclave accepts.
     fn is_evm_address(s: &str) -> bool {
-        let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+        let h = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
         h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
     }
     if let Some(ref x) = p.x402 {
         if let Some(ref tok) = x.token_address {
             if !is_evm_address(tok) {
-                anyhow::bail!("{}: policy.x402.token_address is not a valid EVM address: {}", tag, tok);
+                anyhow::bail!(
+                    "{}: policy.x402.token_address is not a valid EVM address: {}",
+                    tag,
+                    tok
+                );
             }
         }
         if let Some(ref recips) = x.allowed_recipients {
             for r in recips {
                 if !is_evm_address(r) {
-                    anyhow::bail!("{}: policy.x402.allowed_recipients contains a non-EVM-address: {}", tag, r);
+                    anyhow::bail!(
+                        "{}: policy.x402.allowed_recipients contains a non-EVM-address: {}",
+                        tag,
+                        r
+                    );
                 }
             }
         }
@@ -1232,12 +1789,16 @@ fn sanity_check_policy(
     if let Some(ref vaults) = p.allowed_vaults {
         for v in vaults {
             if !is_evm_address(v) {
-                anyhow::bail!("{}: policy.allowed_vaults contains a non-EVM-address: {}", tag, v);
+                anyhow::bail!(
+                    "{}: policy.allowed_vaults contains a non-EVM-address: {}",
+                    tag,
+                    v
+                );
             }
         }
     }
 
-    // ─── C29 (adversarial review 2026-05-18): cross-venue PK reuse hygiene ─────────
+    // ─── C29 (ZLODEY 2026-05-18): cross-venue PK reuse hygiene ─────────
     //
     // EIP-712 secrets carry a `private_key` field (secp256k1 hex). The
     // same private key valid on Hyperliquid is also valid on Asterdex
@@ -1304,6 +1865,448 @@ mod tests {
         let p: Policy = serde_json::from_str(json).expect("parse");
         assert!(p.allowed_actions.is_none());
         assert!(p.label.is_none());
+    }
+
+    // ── PROVISIONING GUARD (mainnet: no uncapped order-capable key) ──
+
+    fn actions(a: &[&str]) -> Option<Vec<String>> {
+        Some(a.iter().map(|s| (*s).to_owned()).collect())
+    }
+    fn btc_cap() -> Option<Vec<OrderAssetCap>> {
+        Some(vec![OrderAssetCap {
+            symbol: "BTCUSDT".to_owned(),
+            max_qty: "0.01".to_owned(),
+            max_notional: None,
+        }])
+    }
+    fn hl_cap() -> Option<Vec<HlOrderCap>> {
+        Some(vec![HlOrderCap {
+            asset: 0,
+            max_size: "1".to_owned(),
+            max_notional: None,
+        }])
+    }
+    fn guard(p: &Policy, prof: Profile) -> Result<()> {
+        enforce_provisioning_profile_invariant(p, prof)
+    }
+
+    #[test]
+    fn testnet_uncapped_order_capable_is_allowed() {
+        // keyless-Hummingbot dogfood: uncapped is fine on testnet.
+        let p = Policy {
+            allowed_actions: actions(&["sign_binance_request"]),
+            ..Policy::default()
+        };
+        assert!(guard(&p, Profile::Testnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_uncapped_order_capable_is_refused() {
+        // Every order-capable CEX action must be refused uncapped on mainnet.
+        for a in ORDER_CAPABLE_CEX_ACTIONS {
+            let p = Policy {
+                allowed_actions: actions(&[a]),
+                ..Policy::default()
+            };
+            let e = guard(&p, Profile::Mainnet).expect_err(a);
+            assert!(format!("{e}").contains("PROVISIONING GUARD"), "{a}");
+        }
+    }
+
+    #[test]
+    fn mainnet_order_capable_with_caps_is_allowed() {
+        let p = Policy {
+            allowed_actions: actions(&["sign_binance_request"]),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&p, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_empty_order_caps_is_still_refused() {
+        // A present-but-empty caps list must NOT satisfy the invariant.
+        let p = Policy {
+            allowed_actions: actions(&["sign_binance"]),
+            order_caps: Some(vec![]),
+            ..Policy::default()
+        };
+        assert!(guard(&p, Profile::Mainnet).is_err());
+    }
+
+    #[test]
+    fn mainnet_read_only_policy_needs_no_caps() {
+        // Explicitly scoped, order-incapable actions → allowed uncapped.
+        let p = Policy {
+            allowed_actions: actions(&["sign_binance_cancel", "verify_blob", "sign_data"]),
+            ..Policy::default()
+        };
+        assert!(guard(&p, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_absent_or_empty_actions_is_refused() {
+        // Permissive-by-omission can't be proven order-incapable → fail closed.
+        assert!(guard(&Policy::default(), Profile::Mainnet).is_err());
+        let empty = Policy {
+            allowed_actions: Some(vec![]),
+            ..Policy::default()
+        };
+        assert!(guard(&empty, Profile::Mainnet).is_err());
+        // …but on testnet an empty/absent action set is not this gate's business.
+        assert!(guard(&Policy::default(), Profile::Testnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_intent_key_without_caps_is_refused() {
+        // AF-2 intent key is order-capable by construction even with no CEX
+        // order action listed.
+        let p = Policy {
+            allowed_actions: actions(&["sign_data"]),
+            intent_pubkey: Some("deadbeef".to_owned()),
+            ..Policy::default()
+        };
+        let e = guard(&p, Profile::Mainnet).expect_err("intent");
+        assert!(format!("{e}").contains("intent_pubkey"));
+        // with caps it is fine
+        let ok = Policy {
+            order_caps: btc_cap(),
+            ..p
+        };
+        assert!(guard(&ok, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_intent_key_with_hyperliquid_actions_is_refused() {
+        // ROT-1 round-3: AF-2 is not wired on the HL path, so a policy that
+        // carries intent_pubkey together with any HL action advertises a check
+        // the enclave will not run. Refuse it at mint — including the shape that
+        // would otherwise SATISFY every other gate (both cap kinds present).
+        for a in [
+            "sign_hyperliquid_main_order",
+            "sign_hyperliquid_main_cancel",
+            "sign_hyperliquid_testnet_order",
+            "sign_hyperliquid_testnet_cancel",
+        ] {
+            let p = Policy {
+                allowed_actions: actions(&[a]),
+                intent_pubkey: Some("deadbeef".to_owned()),
+                hl_order_caps: hl_cap(),
+                order_caps: btc_cap(), // the decorative cap that hides the hole
+                ..Policy::default()
+            };
+            let e = guard(&p, Profile::Mainnet).expect_err("HL + intent_pubkey must be refused");
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("intent_pubkey") && msg.contains("Hyperliquid"),
+                "{a}: message must name both halves of the conflict, got: {msg}"
+            );
+            // …and on TESTNET too. The enclave's refusal keys on `is_hl_venue`,
+            // which matches hyperliquid_testnet, so a testnet-profile waiver
+            // would mint a key that cannot sign a single request.
+            assert!(
+                guard(&p, Profile::Testnet).is_err(),
+                "{a}: the testnet profile must not waive a shape the enclave rejects"
+            );
+        }
+        // A MIXED policy is refused too: AF-2-protected on the CEX half and
+        // silently unprotected on the HL half is exactly the half-true
+        // guarantee this exists to stop.
+        let mixed = Policy {
+            allowed_actions: actions(&["sign_binance_order", "sign_hyperliquid_main_order"]),
+            intent_pubkey: Some("deadbeef".to_owned()),
+            hl_order_caps: hl_cap(),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&mixed, Profile::Mainnet).is_err());
+
+        // Falsification handles — the rule must not be a blanket refusal:
+        // (a) HL WITHOUT intent_pubkey still mints;
+        let hl_only = Policy {
+            allowed_actions: actions(&["sign_hyperliquid_main_order"]),
+            hl_order_caps: hl_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&hl_only, Profile::Mainnet).is_ok());
+        // (b) intent_pubkey WITHOUT HL actions still mints.
+        let cex_only = Policy {
+            allowed_actions: actions(&["sign_binance_order"]),
+            intent_pubkey: Some("deadbeef".to_owned()),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&cex_only, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn intent_key_with_unscoped_actions_is_refused_on_both_profiles() {
+        // CodeRabbit: an ABSENT allowed_actions permits every action, so it
+        // permits Hyperliquid — the most permissive policy of all must not slip
+        // through the guard that exists to catch HL+AF-2. This matters most on
+        // `--profile testnet`, where the mainnet "scope your actions" rule never
+        // runs, so this guard is the ONLY thing between an unscoped AF-2 policy
+        // and a key whose HL requests the enclave rejects on every call.
+        let unscoped = Policy {
+            allowed_actions: None,
+            intent_pubkey: Some("deadbeef".to_owned()),
+            hl_order_caps: hl_cap(),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        for profile in [Profile::Testnet, Profile::Mainnet] {
+            let e = guard(&unscoped, profile).expect_err("unscoped AF-2 must be refused");
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("intent_pubkey") && msg.contains("ABSENT allowed_actions"),
+                "{profile:?}: the message must name the unscoped list, got: {msg}"
+            );
+        }
+
+        // `Some(vec![])` is the OPPOSITE case: an empty list denies every action,
+        // so it can reach no Hyperliquid path and this guard must not fire.
+        // (Mainnet refuses it later for being unscoped-by-emptiness; testnet is
+        // where the distinction is observable.)
+        let deny_all = Policy {
+            allowed_actions: Some(vec![]),
+            intent_pubkey: Some("deadbeef".to_owned()),
+            ..Policy::default()
+        };
+        assert!(
+            guard(&deny_all, Profile::Testnet).is_ok(),
+            "an empty action list denies everything — the HL guard must not fire on it"
+        );
+
+        // And an unscoped policy WITHOUT intent_pubkey is untouched by this rule
+        // on testnet — the refusal is about the AF-2 claim, not about scoping.
+        let unscoped_no_af2 = Policy {
+            allowed_actions: None,
+            hl_order_caps: hl_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&unscoped_no_af2, Profile::Testnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_asterdex_requires_order_caps() {
+        // Asterdex reuses order_caps (enclave asterdex_floor_denies) — the guard
+        // must mirror it, else a mainnet asterdex key could ship uncapped.
+        let p = Policy {
+            allowed_actions: actions(&["sign_asterdex"]),
+            ..Policy::default()
+        };
+        assert!(guard(&p, Profile::Mainnet).is_err());
+        let ok = Policy {
+            order_caps: btc_cap(),
+            ..p
+        };
+        assert!(guard(&ok, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn every_known_action_is_categorised() {
+        // Drift guard (Gemini review #266). The cap checks are allow-lists, so
+        // an action in NEITHER order-capable list is waved through. Forcing an
+        // explicit category for every known action means adding a venue action
+        // without deciding its cap requirement fails HERE, not in production.
+        for a in KNOWN_SIGN_ACTIONS {
+            let cex = ORDER_CAPABLE_CEX_ACTIONS.contains(a);
+            let hl = ORDER_CAPABLE_HL_ACTIONS.contains(a);
+            let incapable = ORDER_INCAPABLE_ACTIONS.contains(a);
+            assert!(
+                cex || hl || incapable,
+                "{a} is in KNOWN_SIGN_ACTIONS but categorised nowhere — add it to \
+                 ORDER_CAPABLE_CEX_ACTIONS / ORDER_CAPABLE_HL_ACTIONS if it can place an \
+                 order, else to ORDER_INCAPABLE_ACTIONS"
+            );
+            assert!(
+                u8::from(cex) + u8::from(hl) + u8::from(incapable) == 1,
+                "{a} is categorised more than once (cex={cex} hl={hl} incapable={incapable})"
+            );
+        }
+        // And nothing is categorised that the wrapper does not even know about.
+        for a in ORDER_CAPABLE_CEX_ACTIONS
+            .iter()
+            .chain(ORDER_CAPABLE_HL_ACTIONS)
+            .chain(ORDER_INCAPABLE_ACTIONS)
+        {
+            assert!(
+                KNOWN_SIGN_ACTIONS.contains(a),
+                "{a} is categorised but missing from KNOWN_SIGN_ACTIONS"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_uncategorised_action_is_refused() {
+        // The fail-open this closes: an action in no category (new venue, or a
+        // typo) previously passed the guard uncapped, because both cap checks
+        // are allow-lists.
+        for a in ["sign_newvenue_order", "sign_binance_ordr", "totally_bogus"] {
+            let p = Policy {
+                allowed_actions: actions(&[a]),
+                ..Policy::default()
+            };
+            let e = guard(&p, Profile::Mainnet).expect_err(a);
+            assert!(format!("{e}").contains("PROVISIONING GUARD"), "{a}: {e}");
+            // Testnet stays permissive.
+            assert!(guard(&p, Profile::Testnet).is_ok(), "{a}");
+        }
+        // Caps do NOT buy an uncategorised action a pass — we still cannot say
+        // which cap dimension would bound it.
+        let with_caps = Policy {
+            allowed_actions: actions(&["sign_newvenue_order"]),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&with_caps, Profile::Mainnet).is_err());
+    }
+
+    #[test]
+    fn order_incapable_actions_need_no_caps_on_mainnet() {
+        // The other half of the invariant: an explicitly order-incapable action
+        // must still be provisionable uncapped on mainnet (a cancel-only or
+        // attested-data key is a legitimate production key).
+        for a in ORDER_INCAPABLE_ACTIONS {
+            let p = Policy {
+                allowed_actions: actions(&[a]),
+                ..Policy::default()
+            };
+            assert!(
+                guard(&p, Profile::Mainnet).is_ok(),
+                "{a} should need no caps"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_binds_matches_enclave_operand_rules() {
+        // Mirrors enclave signer.rs `cmp_positive_decimals` vectors, plus "> 0".
+        for good in ["1", "0.01", "0.5", ".5", "5.", "10", "1.500"] {
+            assert!(cap_binds(good), "should bind: {good:?}");
+        }
+        // "" / "." / non-digit / multi-dot are unparseable for the enclave;
+        // "0" / "0.0" parse but bound nothing.
+        for bad in [
+            "", ".", "0", "0.0", "00.000", "-1", "1e5", "1.2.3", "1 ", "abc",
+        ] {
+            assert!(!cap_binds(bad), "should not bind: {bad:?}");
+        }
+        // ROT-1 round-3: length. The enclave's aggregate caps parse the POLICY
+        // operand with a 64-byte bound that the per-order comparator does not
+        // have, so a longer cap yields a key that works for one order and fails
+        // for a batch. Refuse it here, where it is still a typo and not an
+        // incident.
+        let at_limit = "1".repeat(MAX_CAP_OPERAND_LEN);
+        assert!(cap_binds(&at_limit), "exactly the limit must bind");
+        let over_limit = "1".repeat(MAX_CAP_OPERAND_LEN + 1);
+        assert!(
+            !cap_binds(&over_limit),
+            "one byte over the limit must not bind"
+        );
+    }
+
+    #[test]
+    fn mainnet_vacuous_order_cap_entry_is_refused() {
+        // Gemini review #266. NOT a cap bypass: the enclave is fail-closed on
+        // each shape below (blank symbol never matches → POLICY_DENIED,
+        // malformed max_qty → INTERNAL_ERROR, "0" → SIZE_OVER_CAP). It is an
+        // operator footgun — the key would brick at sign time — so the guard
+        // refuses it at provisioning, where the message is actionable.
+        for (sym, qty) in [
+            ("", "0.01"),
+            ("   ", "0.01"),
+            ("BTCUSDT", ""),
+            ("BTCUSDT", "0"),
+            ("BTCUSDT", "."),
+            ("BTCUSDT", "1e5"),
+        ] {
+            let p = Policy {
+                allowed_actions: actions(&["sign_binance_order"]),
+                order_caps: Some(vec![OrderAssetCap {
+                    symbol: sym.to_owned(),
+                    max_qty: qty.to_owned(),
+                    max_notional: None,
+                }]),
+                ..Policy::default()
+            };
+            let e = guard(&p, Profile::Mainnet).expect_err(&format!("{sym:?}/{qty:?}"));
+            assert!(
+                format!("{e}").contains("PROVISIONING GUARD"),
+                "{sym:?}/{qty:?}: {e}"
+            );
+            // Testnet stays a no-op — demo keys are allowed to be sloppy.
+            assert!(guard(&p, Profile::Testnet).is_ok(), "{sym:?}/{qty:?}");
+        }
+        // A present-but-empty list is "no caps at all" and already refused.
+        let empty = Policy {
+            allowed_actions: actions(&["sign_binance_order"]),
+            order_caps: Some(vec![]),
+            ..Policy::default()
+        };
+        assert!(guard(&empty, Profile::Mainnet).is_err());
+        // Positive control: a real bound still passes.
+        let ok = Policy {
+            allowed_actions: actions(&["sign_binance_order"]),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&ok, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_vacuous_notional_and_hl_size_are_refused() {
+        // An optional bound that is PRESENT must still bind (absent = unbounded
+        // by design, and stays allowed).
+        let notional = Policy {
+            allowed_actions: actions(&["sign_binance_order"]),
+            order_caps: Some(vec![OrderAssetCap {
+                symbol: "BTCUSDT".to_owned(),
+                max_qty: "0.01".to_owned(),
+                max_notional: Some("0".to_owned()),
+            }]),
+            ..Policy::default()
+        };
+        assert!(guard(&notional, Profile::Mainnet).is_err());
+
+        let hl_bad = Policy {
+            allowed_actions: actions(&["sign_hyperliquid_main_order"]),
+            hl_order_caps: Some(vec![HlOrderCap {
+                asset: 0,
+                max_size: "0".to_owned(),
+                max_notional: None,
+            }]),
+            ..Policy::default()
+        };
+        assert!(guard(&hl_bad, Profile::Mainnet).is_err());
+
+        let hl_ok = Policy {
+            allowed_actions: actions(&["sign_hyperliquid_main_order"]),
+            hl_order_caps: hl_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&hl_ok, Profile::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn mainnet_hl_order_requires_hl_caps() {
+        let p = Policy {
+            allowed_actions: actions(&["sign_hyperliquid_main_order"]),
+            ..Policy::default()
+        };
+        assert!(guard(&p, Profile::Mainnet).is_err());
+        let ok = Policy {
+            hl_order_caps: hl_cap(),
+            ..p
+        };
+        assert!(guard(&ok, Profile::Mainnet).is_ok());
+        // CEX order_caps do NOT satisfy an HL order requirement.
+        let wrong = Policy {
+            allowed_actions: actions(&["sign_hyperliquid_main_order"]),
+            order_caps: btc_cap(),
+            ..Policy::default()
+        };
+        assert!(guard(&wrong, Profile::Mainnet).is_err());
     }
 
     // ── PR-D2: policy-authority template signing ──
@@ -1464,7 +2467,8 @@ mod tests {
         // deny_unknown_fields propagates into OrderAssetCap. (This test used
         // `max_notional` as its unknown-field example before B2 made that a
         // real field — a typo'd variant keeps the guarantee pinned.)
-        let json = r#"{"order_caps": [{"symbol": "BTCUSDT", "max_qty": "0.01", "max_notionall": "5"}]}"#;
+        let json =
+            r#"{"order_caps": [{"symbol": "BTCUSDT", "max_qty": "0.01", "max_notionall": "5"}]}"#;
         assert!(serde_json::from_str::<Policy>(json).is_err());
     }
 
@@ -1494,7 +2498,10 @@ mod tests {
         let pre_b2: Policy =
             serde_json::from_str(r#"{"order_caps":[{"symbol":"B","max_qty":"1"}]}"#).unwrap();
         let s = serde_json::to_string(&pre_b2).unwrap();
-        assert!(!s.contains("max_notional"), "absent field must be omitted: {s}");
+        assert!(
+            !s.contains("max_notional"),
+            "absent field must be omitted: {s}"
+        );
     }
 
     #[test]
@@ -1531,7 +2538,10 @@ mod tests {
             ..Policy::default()
         };
         let err = sanity_check_policy(&p, &eip712_secret(), None).unwrap_err();
-        assert!(err.to_string().contains("x402"), "error should mention x402, got: {err}");
+        assert!(
+            err.to_string().contains("x402"),
+            "error should mention x402, got: {err}"
+        );
     }
 
     #[test]
@@ -1569,9 +2579,7 @@ mod tests {
                 chain_id: Some(8453),
                 token_address: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
                 max_value: Some("1000000".into()),
-                allowed_recipients: Some(vec![
-                    "0x000000000000000000000000000000000000bEEF".into()
-                ]),
+                allowed_recipients: Some(vec!["0x000000000000000000000000000000000000bEEF".into()]),
             }),
             ..Policy::default()
         };
@@ -1603,9 +2611,7 @@ mod tests {
                 chain_id: Some(8453),
                 token_address: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
                 max_value: Some("1000000".into()),
-                allowed_recipients: Some(vec![
-                    "0x000000000000000000000000000000000000bEEF".into()
-                ]),
+                allowed_recipients: Some(vec!["0x000000000000000000000000000000000000bEEF".into()]),
             }),
             ..Policy::default()
         };
@@ -1622,9 +2628,7 @@ mod tests {
                 chain_id: Some(8453),
                 token_address: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
                 max_value: Some("1000000".into()),
-                allowed_recipients: Some(vec![
-                    "0x000000000000000000000000000000000000bEEF".into()
-                ]),
+                allowed_recipients: Some(vec!["0x000000000000000000000000000000000000bEEF".into()]),
             }),
             ..Policy::default()
         };
@@ -1667,7 +2671,10 @@ mod tests {
         };
         assert!(sanity_check_policy(&p2, &empty_secret(), None).is_err());
         // bad vault
-        let pv = Policy { allowed_vaults: Some(vec!["nope".into()]), ..Policy::default() };
+        let pv = Policy {
+            allowed_vaults: Some(vec!["nope".into()]),
+            ..Policy::default()
+        };
         assert!(sanity_check_policy(&pv, &empty_secret(), None).is_err());
     }
 
@@ -1680,7 +2687,10 @@ mod tests {
             "sign_okx_order",
             "sign_okx_cancel",
         ] {
-            assert!(KNOWN_SIGN_ACTIONS.contains(&a), "{a} must be a known action");
+            assert!(
+                KNOWN_SIGN_ACTIONS.contains(&a),
+                "{a} must be a known action"
+            );
         }
         assert!(is_eip712_action("sign_x402_eip3009"));
     }
@@ -1734,7 +2744,11 @@ mod tests {
         // Control-plane ops stay unknown on purpose (they dispatch before the
         // tenant-identity gate; their presence in a customer policy is a
         // mistake the warning should surface).
-        for a in ["registry_challenge", "registry_refresh", "provision_data_key"] {
+        for a in [
+            "registry_challenge",
+            "registry_refresh",
+            "provision_data_key",
+        ] {
             assert!(!KNOWN_SIGN_ACTIONS.contains(&a), "{a} must stay unknown");
         }
     }
@@ -1758,7 +2772,10 @@ mod tests {
         assert_eq!(caps[0].max_size, "5");
         let back = serde_json::to_value(&p).unwrap();
         assert_eq!(back["hl_order_caps"][0]["max_size"], "5");
-        assert_eq!(back["allowed_vaults"][0], "0x00000000000000000000000000000000000000A1");
+        assert_eq!(
+            back["allowed_vaults"][0],
+            "0x00000000000000000000000000000000000000A1"
+        );
     }
 
     #[test]

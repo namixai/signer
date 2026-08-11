@@ -65,7 +65,7 @@ impl fmt::Debug for AwsCredentials {
 /// enclave side and we omit them on the wire (they're optional, default to
 /// None on the enclave).
 ///
-/// C21 (adversarial review 2026-05-18, Gemini round-1 PR #30): the struct now derives
+/// C21 (ZLODEY 2026-05-18, Gemini round-1 PR #30): the struct now derives
 /// Zeroize + ZeroizeOnDrop so the in-memory plaintext fields (body, query,
 /// vault_address, ciphertext_blob_base64) are wiped from heap when the
 /// struct drops. AwsCredentials was already ZeroizeOnDrop from earlier
@@ -171,7 +171,7 @@ pub struct VsockRequest {
 
 /// Vsock-side response shape.
 ///
-/// C21 (adversarial review 2026-05-18, Gemini round-1 PR #30): response carries signed
+/// C21 (ZLODEY 2026-05-18, Gemini round-1 PR #30): response carries signed
 /// material (HMAC headers, EIP-712 r,s,v). Although KMS plaintext is not
 /// here, signatures are sensitive in transit on a parent VM that may be
 /// memory-dumped. Derive Zeroize + ZeroizeOnDrop so the struct's strings
@@ -321,7 +321,7 @@ pub async fn round_trip(cid: u32, port: u32, req: &VsockRequest) -> Result<Vsock
         .map_err(|_| anyhow!("vsock connect timed out"))?
         .with_context(|| format!("vsock connect to (cid={cid}, port={port})"))?;
 
-    // C21 (adversarial review 2026-05-18) partial mitigation: wrap the serialized vsock
+    // C21 (ZLODEY 2026-05-18) partial mitigation: wrap the serialized vsock
     // payload in Zeroizing so the plaintext (which contains AwsCredentials
     // and HL action JSON) does not linger in heap memory after the send.
     // This does NOT protect against an attacker reading the vsock socket
@@ -329,9 +329,7 @@ pub async fn round_trip(cid: u32, port: u32, req: &VsockRequest) -> Result<Vsock
     // proposed in DESIGN-C21-VSOCK-ENCRYPTION.md, deferred work. This is a
     // narrow defense-in-depth against post-send memory residue on the
     // parent VM (e.g., if a swap dump or core dump captures the heap).
-    let body = zeroize::Zeroizing::new(
-        serde_json::to_vec(req).context("serialize vsock request")?,
-    );
+    let body = zeroize::Zeroizing::new(serde_json::to_vec(req).context("serialize vsock request")?);
     if body.len() > MAX_MESSAGE_BYTES {
         return Err(anyhow!(
             "vsock request body exceeds {} bytes",

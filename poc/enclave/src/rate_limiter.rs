@@ -267,7 +267,7 @@ mod tests {
         // Gemini PR #46 round-2 catch: re-inserting an evicted key must
         // NOT grant a fresh full bucket — restore tokens from ghost cache.
         let rl = RateLimiter::new(5, 1); // cap=5, refill 1/sec
-        // Drain "target" down to 0 tokens.
+                                         // Drain "target" down to 0 tokens.
         for _ in 0..5 {
             assert!(rl.check("target"));
         }
@@ -303,7 +303,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn ghost_order_bounded_under_frequent_restores() {
         // Gemini PR #46 round-3 SEC-HIGH regression: previously, ghost_order
         // grew unbounded when keys were frequently restored (because ghost

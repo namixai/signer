@@ -125,11 +125,7 @@ pub fn binance_canonical(query: &str, body: &str) -> String {
 }
 
 /// Sign a Binance request and return the lowercase-hex signature.
-pub fn sign_binance(
-    secret: &Zeroizing<Vec<u8>>,
-    query: &str,
-    body: &str,
-) -> Result<String> {
+pub fn sign_binance(secret: &Zeroizing<Vec<u8>>, query: &str, body: &str) -> Result<String> {
     let canonical = binance_canonical(query, body);
     let tag = hmac_sha256(secret, canonical.as_bytes())?;
     Ok(hex::encode(tag))
@@ -158,52 +154,29 @@ fn is_safe_binance_param_value(v: &str) -> bool {
 }
 
 /// Numerically compare two non-negative decimal strings without floating point.
-/// `Ok(Less|Equal|Greater)` mirrors `Ord::cmp`. Empty strings or non-digit/dot
-/// bytes are errors. Used for policy `max_qty` checks where f64 precision near
-/// the tail (`"0.00000001"` vs `"0.00000002"`) would matter.
+/// `Ok(Less|Equal|Greater)` mirrors `Ord::cmp`. Empty strings, non-digit/dot
+/// bytes, a second dot, no digit at all, or an operand longer than
+/// `MAX_NOTIONAL_OPERAND_LEN` are errors. Used for policy `max_qty` / `max_size`
+/// checks where f64 precision near the tail (`"0.00000001"` vs `"0.00000002"`)
+/// would matter.
+///
+/// ROT-1 round-3 (CodeRabbit): this had its OWN validator, identical to
+/// `decimal_digits` except that it accepted operands of unbounded length. The
+/// divergence was observable — a 65-byte `orders[].s` passed the per-order cap
+/// check and failed only in the aggregate, and only when the asset carried more
+/// than one order. Fail-closed either way, so not a bypass, but "which decimals
+/// does the enclave accept" had two answers, and the shorter path to a real bug
+/// is always two validators that agree today. One parser now, one length rule.
+///
+/// The behaviour change is a NARROWING, which is the only direction that is safe
+/// to make here without re-auditing every caller: an operand over 64 bytes that
+/// used to be compared exactly now errors, and every caller already treats an
+/// error as fail-closed with blame attribution (`enforce_order_cap`,
+/// `enforce_hl_caps`). Nothing that was denied becomes allowed.
 pub fn cmp_positive_decimals(a: &str, b: &str) -> Result<std::cmp::Ordering> {
-    fn split(s: &str) -> Result<(&str, &str)> {
-        if s.is_empty() {
-            anyhow::bail!("decimal is empty");
-        }
-        if s.bytes().any(|c| !c.is_ascii_digit() && c != b'.') {
-            anyhow::bail!("decimal has non-digit/non-dot byte");
-        }
-        // splitn(2, ...) silently caps at 2 elements; count first.
-        if s.bytes().filter(|c| *c == b'.').count() > 1 {
-            anyhow::bail!("decimal has more than one dot");
-        }
-        // Gemini #78: require at least one digit. Without this `"."` parses to
-        // ("", "") → compares Equal to 0 → a malformed qty="." would silently
-        // slip past the per-asset cap check. `.5` / `5.` / `5` / `0.5` stay valid.
-        if !s.bytes().any(|c| c.is_ascii_digit()) {
-            anyhow::bail!("decimal has no digits");
-        }
-        let (int, frac) = match s.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (s, ""),
-        };
-        Ok((int.trim_start_matches('0'), frac.trim_end_matches('0')))
-    }
-    let (ai, af) = split(a)?;
-    let (bi, bf) = split(b)?;
-    // Integer parts: longer (after leading-zero strip) wins, else lex.
-    let int_ord = ai.len().cmp(&bi.len()).then_with(|| ai.cmp(bi));
-    if int_ord != std::cmp::Ordering::Equal {
-        return Ok(int_ord);
-    }
-    // Fractional parts: compare digit-by-digit with virtual right-zero-padding
-    // (lex == numeric once both sides are the same length). Gemini #78 (wave-2):
-    // the previous `af_padded`/`bf_padded` `String`s left order-quantity digits
-    // lingering in enclave heap on drop (`String` doesn't zeroize) AND allocated
-    // on a hot policy-check path. `af`/`bf` are ASCII digits only (split
-    // validated), so a byte-wise iterator compare with `b'0'` padding is exact
-    // and allocation-free. Both iterators yield exactly `max` bytes, so this is
-    // a pure element-wise compare equivalent to comparing the padded strings.
-    let max = af.len().max(bf.len());
-    let af_iter = af.bytes().chain(std::iter::repeat(b'0')).take(max);
-    let bf_iter = bf.bytes().chain(std::iter::repeat(b'0')).take(max);
-    Ok(af_iter.cmp(bf_iter))
+    let (ad, a_scale) = decimal_digits(a)?;
+    let (bd, b_scale) = decimal_digits(b)?;
+    Ok(cmp_scaled(&ad, a_scale, &bd, b_scale))
 }
 
 /// Hard bound on a single decimal operand for `notional_exceeds`. Venue
@@ -211,6 +184,126 @@ pub fn cmp_positive_decimals(a: &str, b: &str) -> Result<std::cmp::Ordering> {
 /// while keeping the schoolbook multiply O(64²) worst-case — a crafted
 /// megabyte-long "decimal" must not buy CPU inside the enclave.
 const MAX_NOTIONAL_OPERAND_LEN: usize = 64;
+
+/// Parse a non-negative decimal string into (digit vector most-significant-first,
+/// fractional scale). Value = digits-as-integer / 10^scale. Leading zeros are
+/// stripped across the WHOLE vector (not just the int part: `"0.05"` must become
+/// `[5]`, not `[0,5]`) so the digit-length integer compare in `cmp_scaled` is
+/// sound. All-zero input drains to empty (= zero).
+///
+/// Validation matches `cmp_positive_decimals` (ASCII digits + at most one dot +
+/// at least one digit) plus the `MAX_NOTIONAL_OPERAND_LEN` length bound.
+///
+/// ROT-1: lifted out of `notional_exceeds` so the aggregate helpers below share
+/// ONE parser with it. Two decimal parsers on a money path drift, and the one
+/// that drifts is the one nobody is reading.
+fn decimal_digits(s: &str) -> Result<(Vec<u8>, usize)> {
+    if s.is_empty() {
+        anyhow::bail!("decimal is empty");
+    }
+    if s.len() > MAX_NOTIONAL_OPERAND_LEN {
+        anyhow::bail!("decimal operand too long");
+    }
+    if s.bytes().any(|c| !c.is_ascii_digit() && c != b'.') {
+        anyhow::bail!("decimal has non-digit/non-dot byte");
+    }
+    if s.bytes().filter(|c| *c == b'.').count() > 1 {
+        anyhow::bail!("decimal has more than one dot");
+    }
+    if !s.bytes().any(|c| c.is_ascii_digit()) {
+        anyhow::bail!("decimal has no digits");
+    }
+    let (int, frac) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+    let nz = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
+    digits.drain(..nz);
+    Ok((digits, frac.len()))
+}
+
+/// Schoolbook multiply of two most-significant-first digit vectors.
+fn mul_digits(a: &[u8], b: &[u8]) -> Vec<u8> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new(); // zero
+    }
+    let mut acc = vec![0u32; a.len() + b.len()];
+    for (i, da) in a.iter().rev().enumerate() {
+        for (j, db) in b.iter().rev().enumerate() {
+            acc[i + j] += u32::from(*da) * u32::from(*db);
+        }
+    }
+    let mut carry = 0u32;
+    for cell in acc.iter_mut() {
+        let v = *cell + carry;
+        *cell = v % 10;
+        carry = v / 10;
+    }
+    debug_assert_eq!(carry, 0, "acc is sized a.len()+b.len(); no overflow");
+    let mut out: Vec<u8> = acc.iter().rev().map(|d| *d as u8).collect();
+    let nz = out.iter().position(|d| *d != 0).unwrap_or(out.len());
+    out.drain(..nz);
+    out
+}
+
+/// Exact addition of two scaled digit vectors. The smaller-scale side is
+/// multiplied by 10^diff (append zeros) so both sides are integers at the same
+/// scale, then added digit-wise. An EMPTY vector is zero and stays zero — it is
+/// deliberately NOT zero-extended, since 0 × 10^n is still 0 and extending it
+/// would break the digit-length compare.
+fn add_digits(a: &[u8], a_scale: usize, b: &[u8], b_scale: usize) -> (Vec<u8>, usize) {
+    let scale = a_scale.max(b_scale);
+    let mut x = a.to_vec();
+    if !x.is_empty() {
+        x.extend(std::iter::repeat_n(0, scale - a_scale));
+    }
+    let mut y = b.to_vec();
+    if !y.is_empty() {
+        y.extend(std::iter::repeat_n(0, scale - b_scale));
+    }
+    let n = x.len().max(y.len());
+    let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+    let mut carry = 0u8;
+    let mut xi = x.iter().rev();
+    let mut yi = y.iter().rev();
+    for _ in 0..n {
+        // Each operand digit is ≤ 9 and carry ≤ 1, so the sum is ≤ 19 — u8 is
+        // sufficient and cannot overflow.
+        let s = xi.next().copied().unwrap_or(0) + yi.next().copied().unwrap_or(0) + carry;
+        out.push(s % 10);
+        carry = s / 10;
+    }
+    if carry > 0 {
+        out.push(carry);
+    }
+    out.reverse();
+    let nz = out.iter().position(|d| *d != 0).unwrap_or(out.len());
+    out.drain(..nz);
+    (out, scale)
+}
+
+/// Compare two scaled digit vectors numerically. Scales are aligned first (the
+/// smaller-scale side is multiplied by 10^diff), then the comparison is
+/// digit-length-then-lexicographic, which equals the numeric order once both
+/// sides are leading-zero-stripped integers at the same scale.
+fn cmp_scaled(l: &[u8], l_scale: usize, r: &[u8], r_scale: usize) -> std::cmp::Ordering {
+    let (mut left, mut right) = (l.to_vec(), r.to_vec());
+    match l_scale.cmp(&r_scale) {
+        std::cmp::Ordering::Less => {
+            if !left.is_empty() {
+                left.extend(std::iter::repeat_n(0, r_scale - l_scale));
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            if !right.is_empty() {
+                right.extend(std::iter::repeat_n(0, l_scale - r_scale));
+            }
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+    left.len().cmp(&right.len()).then_with(|| left.cmp(&right))
+}
 
 /// B2 (mainnet-gate notional cap): exact `qty × price > max_notional` on
 /// non-negative decimal strings — schoolbook digit multiplication, no floating
@@ -225,84 +318,53 @@ const MAX_NOTIONAL_OPERAND_LEN: usize = 64;
 /// The product digits are derived, non-secret values (they are about to be
 /// signed into a venue-visible canonical), so plain `Vec<u8>` scratch is fine.
 pub fn notional_exceeds(qty: &str, price: &str, max_notional: &str) -> Result<bool> {
-    /// Parse into (digit vector most-significant-first, fractional scale).
-    /// Value = digits-as-integer / 10^scale. Leading integer zeros stripped.
-    fn parse(s: &str) -> Result<(Vec<u8>, usize)> {
-        if s.is_empty() {
-            anyhow::bail!("decimal is empty");
-        }
-        if s.len() > MAX_NOTIONAL_OPERAND_LEN {
-            anyhow::bail!("decimal operand too long");
-        }
-        if s.bytes().any(|c| !c.is_ascii_digit() && c != b'.') {
-            anyhow::bail!("decimal has non-digit/non-dot byte");
-        }
-        if s.bytes().filter(|c| *c == b'.').count() > 1 {
-            anyhow::bail!("decimal has more than one dot");
-        }
-        if !s.bytes().any(|c| c.is_ascii_digit()) {
-            anyhow::bail!("decimal has no digits");
-        }
-        let (int, frac) = match s.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (s, ""),
-        };
-        let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
-        // Strip leading zeros across the WHOLE vector (not just the int part:
-        // "0.05" must become [5], not [0,5]) so the digit-length integer
-        // compare below is sound. All-zero input drains to empty (= zero).
-        let nz = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
-        digits.drain(..nz);
-        Ok((digits, frac.len()))
+    let (qd, qs) = decimal_digits(qty)?;
+    let (pd, ps) = decimal_digits(price)?;
+    let (cd, cs) = decimal_digits(max_notional)?;
+    Ok(cmp_scaled(&mul_digits(&qd, &pd), qs + ps, &cd, cs) == std::cmp::Ordering::Greater)
+}
+
+/// ROT-1 aggregate: is `Σ values > cap`?
+///
+/// Why this exists. A per-ITEM cap check bounds one element of a batch; the
+/// signature covers the WHOLE batch, and the gateway's daily counter charges it
+/// as ONE request. So a per-item-only check states a bound the system does not
+/// actually have: N items each at the cap ride out under one signature. This is
+/// the aggregate half — same arithmetic, same inclusive-on-the-cap semantics
+/// (`Σ == cap` ⇒ `Ok(false)`, allowed).
+///
+/// An EMPTY slice sums to zero and therefore never exceeds a cap (cap operands
+/// are validated non-negative), which is the correct answer for an action that
+/// carries nothing to bound.
+pub fn sum_exceeds(values: &[&str], cap: &str) -> Result<bool> {
+    let (cd, cs) = decimal_digits(cap)?;
+    let (mut acc, mut acc_scale) = (Vec::new(), 0usize);
+    for v in values {
+        let (d, s) = decimal_digits(v)?;
+        let (next, next_scale) = add_digits(&acc, acc_scale, &d, s);
+        acc = next;
+        acc_scale = next_scale;
     }
-    /// Schoolbook multiply of two most-significant-first digit vectors.
-    fn mul(a: &[u8], b: &[u8]) -> Vec<u8> {
-        if a.is_empty() || b.is_empty() {
-            return Vec::new(); // zero
-        }
-        let mut acc = vec![0u32; a.len() + b.len()];
-        for (i, da) in a.iter().rev().enumerate() {
-            for (j, db) in b.iter().rev().enumerate() {
-                acc[i + j] += u32::from(*da) * u32::from(*db);
-            }
-        }
-        let mut carry = 0u32;
-        for cell in acc.iter_mut() {
-            let v = *cell + carry;
-            *cell = v % 10;
-            carry = v / 10;
-        }
-        debug_assert_eq!(carry, 0, "acc is sized a.len()+b.len(); no overflow");
-        let mut out: Vec<u8> = acc.iter().rev().map(|d| *d as u8).collect();
-        let nz = out.iter().position(|d| *d != 0).unwrap_or(out.len());
-        out.drain(..nz);
-        out
+    Ok(cmp_scaled(&acc, acc_scale, &cd, cs) == std::cmp::Ordering::Greater)
+}
+
+/// ROT-1 aggregate, notional flavour: is `Σ (qty × price) > max_notional`?
+///
+/// The notional cap had exactly the same per-item-only defect as the size cap
+/// (`notional_exceeds` bounds ONE order), and the two are independent bounds —
+/// keeping the size aggregate while leaving notional per-item would close half
+/// the hole. Same inclusive-on-the-cap semantics.
+pub fn notional_sum_exceeds(pairs: &[(&str, &str)], max_notional: &str) -> Result<bool> {
+    let (cd, cs) = decimal_digits(max_notional)?;
+    let (mut acc, mut acc_scale) = (Vec::new(), 0usize);
+    for (qty, price) in pairs {
+        let (qd, qs) = decimal_digits(qty)?;
+        let (pd, ps) = decimal_digits(price)?;
+        let (next, next_scale) = add_digits(&acc, acc_scale, &mul_digits(&qd, &pd), qs + ps);
+        acc = next;
+        acc_scale = next_scale;
     }
-    let (qd, qs) = parse(qty)?;
-    let (pd, ps) = parse(price)?;
-    let (cd, cs) = parse(max_notional)?;
-    let nd = mul(&qd, &pd);
-    let ns = qs + ps;
-    // Compare notional (nd, ns) vs cap (cd, cs) as integers after aligning
-    // scales: the smaller-scale side is multiplied by 10^diff (append zeros).
-    let (mut left, mut right) = (nd, cd);
-    match ns.cmp(&cs) {
-        std::cmp::Ordering::Less => {
-            if !left.is_empty() {
-                left.extend(std::iter::repeat_n(0, cs - ns));
-            }
-        }
-        std::cmp::Ordering::Greater => {
-            if !right.is_empty() {
-                right.extend(std::iter::repeat_n(0, ns - cs));
-            }
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-    Ok(matches!(
-        left.len().cmp(&right.len()).then_with(|| left.cmp(&right)),
-        std::cmp::Ordering::Greater
-    ))
+    Ok(cmp_scaled(&acc, acc_scale, &cd, cs) == std::cmp::Ordering::Greater)
 }
 
 /// Build the Binance USD-M Futures `POST /fapi/v1/order` form-urlencoded
@@ -328,7 +390,10 @@ pub fn build_binance_order_query(req: &crate::proto::OrderRequest) -> Result<Str
         "limit" => ("LIMIT", true),
         // Reserved in OrderRequest but explicitly unsupported on Binance v0.
         "fok" | "ioc" | "post_only" => {
-            anyhow::bail!("ord_type {} not supported in v0 (limit/market only)", req.ord_type)
+            anyhow::bail!(
+                "ord_type {} not supported in v0 (limit/market only)",
+                req.ord_type
+            )
         }
         _ => anyhow::bail!("unknown ord_type: {}", req.ord_type),
     };
@@ -435,7 +500,10 @@ pub fn build_okx_order_body(req: &crate::proto::OrderRequest) -> Result<String> 
         "limit" => ("limit", true),
         // Reserved in OrderRequest, intentionally unsupported in v0.
         "fok" | "ioc" | "post_only" => {
-            anyhow::bail!("ord_type {} not supported in v0 (limit/market only)", req.ord_type)
+            anyhow::bail!(
+                "ord_type {} not supported in v0 (limit/market only)",
+                req.ord_type
+            )
         }
         _ => anyhow::bail!("unknown ord_type: {}", req.ord_type),
     };
@@ -533,7 +601,11 @@ pub fn compute_binance_headers(
         full_query.push('&');
     }
     use std::fmt::Write as _;
-    let _ = write!(&mut full_query, "timestamp={}&recvWindow={}", timestamp_ms, recv_window);
+    let _ = write!(
+        &mut full_query,
+        "timestamp={}&recvWindow={}",
+        timestamp_ms, recv_window
+    );
 
     let sign_hex = sign_binance(secret, &full_query, body)?;
 
@@ -759,7 +831,9 @@ pub fn compute_okx_headers(
         // through their UI cannot contain these characters anyway, but we
         // refuse to forward them just in case.
         if !(b == b'\t' || (0x20..=0x7e).contains(&b)) {
-            return Err(anyhow::anyhow!("okx passphrase: illegal byte in header value"));
+            return Err(anyhow::anyhow!(
+                "okx passphrase: illegal byte in header value"
+            ));
         }
     }
 
@@ -767,10 +841,7 @@ pub fn compute_okx_headers(
     headers.insert("OK-ACCESS-KEY".to_owned(), key.to_owned());
     headers.insert("OK-ACCESS-SIGN".to_owned(), sign_b64);
     headers.insert("OK-ACCESS-TIMESTAMP".to_owned(), timestamp_iso);
-    headers.insert(
-        "OK-ACCESS-PASSPHRASE".to_owned(),
-        passphrase_str.to_owned(),
-    );
+    headers.insert("OK-ACCESS-PASSPHRASE".to_owned(), passphrase_str.to_owned());
     Ok(headers)
 }
 
@@ -978,10 +1049,7 @@ pub fn eip712_digest(domain_separator: &[u8; 32], struct_hash: &[u8; 32]) -> [u8
 /// RFC 6979 deterministic nonce derivation, so signing the same digest
 /// twice yields bit-identical bytes. This is essential for our reproducible
 /// EIF build contract (Finding J).
-pub fn sign_eip712_digest(
-    private_key_bytes: &[u8; 32],
-    digest: &[u8; 32],
-) -> Result<HlSignature> {
+pub fn sign_eip712_digest(private_key_bytes: &[u8; 32], digest: &[u8; 32]) -> Result<HlSignature> {
     let signing_key = SigningKey::from_bytes(private_key_bytes.into())
         .map_err(|_| anyhow::anyhow!("invalid secp256k1 private key"))?;
     let (sig, recid) = signing_key
@@ -1027,8 +1095,7 @@ pub fn parse_evm_address(s: &str) -> Result<[u8; 20]> {
     if stripped.len() != 40 {
         anyhow::bail!("address must be 20 bytes (40 hex chars)");
     }
-    let bytes =
-        hex::decode(stripped).map_err(|_| anyhow::anyhow!("address is not valid hex"))?;
+    let bytes = hex::decode(stripped).map_err(|_| anyhow::anyhow!("address is not valid hex"))?;
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
     Ok(out)
@@ -1450,10 +1517,7 @@ pub fn asterdex_message_struct_hash(msg: &str) -> [u8; 32] {
 /// Encoding format of the returned signature:
 ///   `0x` || hex(r 32 bytes) || hex(s 32 bytes) || hex(v 1 byte)
 ///   where v ∈ {27, 28} (Ethereum convention; v = recovery_id + 27).
-pub fn sign_asterdex(
-    private_key_bytes: &[u8; 32],
-    msg: &str,
-) -> Result<String> {
+pub fn sign_asterdex(private_key_bytes: &[u8; 32], msg: &str) -> Result<String> {
     let struct_hash = asterdex_message_struct_hash(msg);
     let domain_separator = asterdex_domain_separator();
     let digest = eip712_digest(&domain_separator, &struct_hash);
@@ -1580,7 +1644,12 @@ pub fn sign_x402_eip3009(
     let domain_separator =
         x402_domain_separator(token_name, token_version, chain_id, token_address);
     let struct_hash = x402_transfer_with_authorization_struct_hash(
-        from, to, value, valid_after, valid_before, nonce,
+        from,
+        to,
+        value,
+        valid_after,
+        valid_before,
+        nonce,
     );
     let digest = eip712_digest(&domain_separator, &struct_hash);
     let sig = sign_eip712_digest(private_key_bytes, &digest)?;
@@ -1624,7 +1693,17 @@ mod tests {
         nonce[31] = 0x01;
 
         let sig = sign_x402_eip3009(
-            &pk, "USD Coin", "2", 8453, &usdc_base, &from, &to, &value, 0, 1_900_000_000, &nonce,
+            &pk,
+            "USD Coin",
+            "2",
+            8453,
+            &usdc_base,
+            &from,
+            &to,
+            &value,
+            0,
+            1_900_000_000,
+            &nonce,
         )
         .unwrap();
 
@@ -1651,9 +1730,10 @@ mod tests {
         value[31] = 0x01;
         let nonce = [7u8; 32];
 
-        let base =
-            sign_x402_eip3009(&pk, "USD Coin", "2", 8453, &usdc, &from, &to, &value, 0, 100, &nonce)
-                .unwrap();
+        let base = sign_x402_eip3009(
+            &pk, "USD Coin", "2", 8453, &usdc, &from, &to, &value, 0, 100, &nonce,
+        )
+        .unwrap();
         // Bump value by 1 → different authorization → different signature.
         let mut value2 = value;
         value2[31] = 0x02;
@@ -1668,7 +1748,10 @@ mod tests {
             &pk, "USD Coin", "2", 1, &usdc, &from, &to, &value, 0, 100, &nonce,
         )
         .unwrap();
-        assert_ne!(base, cross_chain, "changing chainId must change the signature");
+        assert_ne!(
+            base, cross_chain,
+            "changing chainId must change the signature"
+        );
     }
 
     #[test]
@@ -1893,19 +1976,10 @@ mod tests {
             "3df88afae4e27449e667c69a1eb683c551d5af1ffc0b1e29f5172546f83fb660";
 
         let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
-        let headers = compute_binance_headers(
-            &secret,
-            KEY,
-            1714997000000,
-            "symbol=BTCUSDT",
-            "",
-        )
-        .expect("headers");
+        let headers = compute_binance_headers(&secret, KEY, 1714997000000, "symbol=BTCUSDT", "")
+            .expect("headers");
 
-        assert_eq!(
-            headers.get("X-MBX-APIKEY").map(String::as_str),
-            Some(KEY)
-        );
+        assert_eq!(headers.get("X-MBX-APIKEY").map(String::as_str), Some(KEY));
         assert_eq!(
             headers.get("signature").map(String::as_str),
             Some(EXPECTED_SIG)
@@ -1914,10 +1988,7 @@ mod tests {
             headers.get("timestamp").map(String::as_str),
             Some("1714997000000")
         );
-        assert_eq!(
-            headers.get("recvWindow").map(String::as_str),
-            Some("5000")
-        );
+        assert_eq!(headers.get("recvWindow").map(String::as_str), Some("5000"));
         assert_eq!(headers.len(), 4);
     }
 
@@ -1961,7 +2032,9 @@ mod tests {
             reduce_only: false,
             client_order_id: coid.map(str::to_owned),
         };
-        assert!(!build_okx_order_body(&okx(None)).unwrap().contains("clOrdId"));
+        assert!(!build_okx_order_body(&okx(None))
+            .unwrap()
+            .contains("clOrdId"));
         assert!(build_okx_order_body(&okx(Some("hedgeABC123")))
             .unwrap()
             .ends_with(r#","clOrdId":"hedgeABC123"}"#));
@@ -1980,11 +2053,13 @@ mod tests {
             client_order_id: None,
         };
         let canonical = build_binance_order_query(&req).unwrap();
-        assert_eq!(canonical, "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001");
+        assert_eq!(
+            canonical,
+            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001"
+        );
 
         let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
-        let headers =
-            compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
+        let headers = compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
         assert_eq!(
             headers.get("signature").map(String::as_str),
             Some("6cbb8dba71cafef7614f26fd26c7fc995f23b73c4e6381030abfc92213279ade")
@@ -2012,8 +2087,7 @@ mod tests {
         );
 
         let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
-        let headers =
-            compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
+        let headers = compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
         assert_eq!(
             headers.get("signature").map(String::as_str),
             Some("bb907258493ad1fb840b3a962f3582bde39566bfdfe5a2bb66a93505631ce455")
@@ -2032,8 +2106,7 @@ mod tests {
         assert_eq!(canonical, "symbol=BTCUSDT&orderId=12345");
 
         let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
-        let headers =
-            compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
+        let headers = compute_binance_headers(&secret, "k", 1714997000000, &canonical, "").unwrap();
         assert_eq!(
             headers.get("signature").map(String::as_str),
             Some("de82c2d15582e4331a6a60cf114c7047bdcef9b52017fffecde4361ee26f6cf9")
@@ -2086,7 +2159,10 @@ mod tests {
         use std::cmp::Ordering::*;
         assert_eq!(cmp_positive_decimals("0.01", "0.1").unwrap(), Less);
         assert_eq!(cmp_positive_decimals("0.1", "0.10").unwrap(), Equal);
-        assert_eq!(cmp_positive_decimals("0.00000002", "0.00000001").unwrap(), Greater);
+        assert_eq!(
+            cmp_positive_decimals("0.00000002", "0.00000001").unwrap(),
+            Greater
+        );
         assert_eq!(cmp_positive_decimals("10", "2").unwrap(), Greater);
         assert_eq!(cmp_positive_decimals("1.5", "1.500").unwrap(), Equal);
         assert_eq!(cmp_positive_decimals("0", "0.0").unwrap(), Equal);
@@ -2100,7 +2176,7 @@ mod tests {
         assert!(cmp_positive_decimals(".", "1").is_err());
         assert!(cmp_positive_decimals("1", ".").is_err());
         assert!(cmp_positive_decimals("..", "1").is_err()); // also caught by dot count
-        // `.5` / `5.` ARE valid (= 0.5, = 5.0) per the at-least-one-digit rule.
+                                                            // `.5` / `5.` ARE valid (= 0.5, = 5.0) per the at-least-one-digit rule.
         assert_eq!(
             cmp_positive_decimals(".5", "0.5").unwrap(),
             std::cmp::Ordering::Equal
@@ -2119,7 +2195,7 @@ mod tests {
         assert!(notional_exceeds("2", "3", "5").unwrap()); // 6 > 5
         assert!(!notional_exceeds("2", "3", "6").unwrap()); // 6 == 6 → allowed
         assert!(!notional_exceeds("2", "3", "7").unwrap()); // 6 < 7
-        // Fractional scales multiply exactly: 0.1 × 0.1 = 0.01.
+                                                            // Fractional scales multiply exactly: 0.1 × 0.1 = 0.01.
         assert!(!notional_exceeds("0.1", "0.1", "0.01").unwrap());
         assert!(notional_exceeds("0.1", "0.1", "0.009999999999").unwrap());
         // Leading-zero normalization: 0.05 × 100 = 5, NOT "05"-vs-"6" length-trap.
@@ -2137,8 +2213,18 @@ mod tests {
         assert!(!notional_exceeds("1.50", "2.0", "3").unwrap());
         assert!(notional_exceeds("1.50", "2.0", "2.999999").unwrap());
         // Large-digit products stay exact (near u64 territory).
-        assert!(notional_exceeds("99999999999999", "99999999999999", "9999999999999700000000000001").unwrap());
-        assert!(!notional_exceeds("99999999999999", "99999999999999", "9999999999999800000000000001").unwrap());
+        assert!(notional_exceeds(
+            "99999999999999",
+            "99999999999999",
+            "9999999999999700000000000001"
+        )
+        .unwrap());
+        assert!(!notional_exceeds(
+            "99999999999999",
+            "99999999999999",
+            "9999999999999800000000000001"
+        )
+        .unwrap());
         // Invalid operands are errors (same alphabet rules as cmp).
         assert!(notional_exceeds("", "1", "1").is_err());
         assert!(notional_exceeds("1", ".", "1").is_err());
@@ -2150,6 +2236,112 @@ mod tests {
         assert!(notional_exceeds(&long, "1", "1").is_err());
         let ok64 = "1".repeat(64);
         assert!(notional_exceeds(&ok64, "0", "1").is_ok()); // 64 chars fine
+    }
+
+    /// ROT-1 aggregate: `sum_exceeds`. The property that matters is that the
+    /// sum is EXACT at every scale — a float accumulator would pass the coarse
+    /// cases below and fail the fractional ones.
+    #[test]
+    fn sum_exceeds_vectors() {
+        // Empty and single-element behave like the per-item check.
+        assert!(!sum_exceeds(&[], "0").unwrap());
+        assert!(!sum_exceeds(&["5"], "5").unwrap());
+        assert!(sum_exceeds(&["5.0001"], "5").unwrap());
+        // The batching case: each within cap, the sum over it.
+        assert!(sum_exceeds(&["3", "3"], "5").unwrap());
+        assert!(!sum_exceeds(&["2", "3"], "5").unwrap()); // inclusive on the cap
+                                                          // Fractional scales must align, not truncate.
+        assert!(!sum_exceeds(&["2.5", "2.5"], "5").unwrap());
+        assert!(sum_exceeds(&["2.5", "2.5000001"], "5").unwrap());
+        assert!(!sum_exceeds(&["0.1", "0.2"], "0.3").unwrap()); // exact: 0.1+0.2 == 0.3
+                                                                // Carry propagation across many terms and across the decimal point.
+        assert!(!sum_exceeds(&["0.9", "0.1"], "1").unwrap());
+        let nines: Vec<&str> = vec!["9.99"; 10];
+        assert!(!sum_exceeds(&nines, "99.9").unwrap());
+        assert!(sum_exceeds(&nines, "99.89").unwrap());
+        // Zeros contribute nothing and never trip the cap.
+        assert!(!sum_exceeds(&["0", "0.0", "0.00"], "0").unwrap());
+        // Scale-mixing with a leading-zero operand ("0.05" parses to [5]).
+        assert!(!sum_exceeds(&["0.05", "0.05"], "0.1").unwrap());
+        assert!(sum_exceeds(&["0.05", "0.051"], "0.1").unwrap());
+        // Invalid operands are errors — same alphabet as the rest of the module.
+        assert!(sum_exceeds(&["1", ""], "1").is_err());
+        assert!(sum_exceeds(&["1", "1e5"], "1").is_err());
+        assert!(sum_exceeds(&["1"], "").is_err());
+        let long = "1".repeat(65);
+        assert!(sum_exceeds(&["1", &long], "1").is_err());
+        // The accumulator itself may exceed the operand length bound — 40
+        // sixty-four-digit terms sum to 66 digits and that is not an error.
+        let big = "9".repeat(64);
+        let terms: Vec<&str> = vec![big.as_str(); 40];
+        assert!(sum_exceeds(&terms, &big).unwrap());
+    }
+
+    /// ROT-1 aggregate: `notional_sum_exceeds` — the same property over
+    /// products, so both the multiply and the add have to stay exact.
+    #[test]
+    fn notional_sum_exceeds_vectors() {
+        assert!(!notional_sum_exceeds(&[], "0").unwrap());
+        assert!(!notional_sum_exceeds(&[("2", "50")], "100").unwrap()); // inclusive
+        assert!(notional_sum_exceeds(&[("2", "50"), ("2", "50")], "150").unwrap());
+        assert!(!notional_sum_exceeds(&[("2", "50"), ("2", "50")], "200").unwrap());
+        // Fractional prices: 0.5 × 0.5 = 0.25 each, three of them = 0.75.
+        assert!(!notional_sum_exceeds(&[("0.5", "0.5"); 3], "0.75").unwrap());
+        assert!(notional_sum_exceeds(&[("0.5", "0.5"); 3], "0.7499").unwrap());
+        // A zero-size order contributes zero, not a parse failure.
+        assert!(!notional_sum_exceeds(&[("0", "50"), ("1", "50")], "50").unwrap());
+        // Errors propagate per operand.
+        assert!(notional_sum_exceeds(&[("1", "x")], "1").is_err());
+        assert!(notional_sum_exceeds(&[("1", "1")], "").is_err());
+    }
+
+    /// The aggregate helpers and `notional_exceeds` must agree with each other
+    /// on the one-element case — otherwise the batch path could allow what the
+    /// per-order path denies (or the reverse) and the two floors would drift.
+    #[test]
+    fn aggregate_helpers_agree_with_per_item_on_singletons() {
+        // The LENGTH boundary belongs here specifically (CodeRabbit): the short
+        // operands below cannot detect a divergence in the accepted-input set,
+        // which is exactly where the two validators used to disagree. Both paths
+        // must accept 64 bytes and refuse 65 — agreeing on the verdict is not
+        // enough if they disagree on what is a verdict at all.
+        let at_limit = "1".repeat(64);
+        let over_limit = "1".repeat(65);
+        assert!(cmp_positive_decimals(&at_limit, "1").is_ok());
+        assert!(sum_exceeds(&[&at_limit], "1").is_ok());
+        assert_eq!(
+            cmp_positive_decimals(&over_limit, "1").is_err(),
+            sum_exceeds(&[&over_limit], "1").is_err(),
+            "per-item and aggregate must agree on WHICH operands they accept"
+        );
+        assert!(cmp_positive_decimals(&over_limit, "1").is_err());
+        // Same on the policy side of the comparison, not just the client side.
+        assert_eq!(
+            cmp_positive_decimals("1", &over_limit).is_err(),
+            sum_exceeds(&["1"], &over_limit).is_err()
+        );
+
+        let sizes = ["0", "0.1", "1", "5", "5.0001", "99999.99999", "0.00000001"];
+        for s in sizes {
+            for cap in ["0.5", "5", "100000"] {
+                let per_item =
+                    cmp_positive_decimals(s, cap).unwrap() == std::cmp::Ordering::Greater;
+                assert_eq!(
+                    per_item,
+                    sum_exceeds(&[s], cap).unwrap(),
+                    "sum_exceeds disagrees with cmp_positive_decimals on {s} vs {cap}"
+                );
+            }
+        }
+        for (q, p) in [("2", "50"), ("0.5", "0.5"), ("3", "0.001"), ("0", "9")] {
+            for cap in ["1", "100", "0.25"] {
+                assert_eq!(
+                    notional_exceeds(q, p, cap).unwrap(),
+                    notional_sum_exceeds(&[(q, p)], cap).unwrap(),
+                    "notional_sum_exceeds disagrees with notional_exceeds on {q}×{p} vs {cap}"
+                );
+            }
+        }
     }
 
     /// OKX market-order canonical JSON body (PR #79). Field order:
@@ -2290,8 +2482,8 @@ mod tests {
     #[test]
     fn compute_binance_headers_empty_user_query() {
         let secret = Zeroizing::new(b"test-binance-secret-NEVER-REAL-2026-05-10".to_vec());
-        let headers = compute_binance_headers(&secret, "k", 1714997000000, "", "")
-            .expect("headers");
+        let headers =
+            compute_binance_headers(&secret, "k", 1714997000000, "", "").expect("headers");
         // Sanity: signature exists and is 64 hex chars.
         let sig = headers.get("signature").expect("signature").as_str();
         assert_eq!(sig.len(), 64);
@@ -2357,19 +2549,11 @@ mod tests {
         const KEY: &str = "test-bybit-key-NEVER-REAL";
         const EXPECTED_SIG: &str =
             "77fae0b1c582696da81eea82d9f16626f9b84c042ad74796dc16a2d89130b268";
-        const BODY: &str =
-            r#"{"category":"linear","symbol":"BTCUSDT","side":"Buy","orderType":"Market","qty":"0.001"}"#;
+        const BODY: &str = r#"{"category":"linear","symbol":"BTCUSDT","side":"Buy","orderType":"Market","qty":"0.001"}"#;
 
         let secret = Zeroizing::new(b"test-bybit-secret-NEVER-REAL-2026-05-10".to_vec());
-        let headers = compute_bybit_headers(
-            &secret,
-            KEY,
-            1714997000000,
-            "POST",
-            "",
-            BODY,
-        )
-        .expect("headers");
+        let headers =
+            compute_bybit_headers(&secret, KEY, 1714997000000, "POST", "", BODY).expect("headers");
 
         assert_eq!(
             headers.get("X-BAPI-SIGN").map(String::as_str),
@@ -2672,7 +2856,10 @@ mod tests {
             "/api/v5/account/config",
             "",
         );
-        assert!(r.is_err(), "passphrase with non-ASCII byte must be rejected");
+        assert!(
+            r.is_err(),
+            "passphrase with non-ASCII byte must be rejected"
+        );
     }
 
     /// Adversarial: a passphrase that's 100% ASCII printable but contains
@@ -2781,7 +2968,10 @@ mod tests {
             br#"{"a":{"x":"2","y":"1"},"z":["b","a"]}"#
         );
         // JCS minimal string escaping: quote + backslash.
-        assert_eq!(canonical_v1(&serde_json::json!("a\"b\\c")).unwrap(), br#""a\"b\\c""#);
+        assert_eq!(
+            canonical_v1(&serde_json::json!("a\"b\\c")).unwrap(),
+            br#""a\"b\\c""#
+        );
     }
 
     #[test]
@@ -2938,7 +3128,11 @@ mod tests {
         let key = parse_evm_private_key(TEST_HL_PRIVATE_KEY).unwrap();
         let digest = keccak256(b"test-digest");
         let sig = sign_eip712_digest(&key, &digest).unwrap();
-        assert!(sig.v == 27 || sig.v == 28, "v must be 27 or 28, got {}", sig.v);
+        assert!(
+            sig.v == 27 || sig.v == 28,
+            "v must be 27 or 28, got {}",
+            sig.v
+        );
         assert!(sig.r.starts_with("0x"));
         assert_eq!(sig.r.len(), 66);
         assert!(sig.s.starts_with("0x"));
@@ -2950,7 +3144,10 @@ mod tests {
     fn parse_evm_private_key_round_trip() {
         let k = parse_evm_private_key(TEST_HL_PRIVATE_KEY).unwrap();
         assert_eq!(*k, [0x01u8; 32]);
-        let k2 = parse_evm_private_key("0101010101010101010101010101010101010101010101010101010101010101").unwrap();
+        let k2 = parse_evm_private_key(
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        )
+        .unwrap();
         assert_eq!(*k2, [0x01u8; 32]);
     }
 
@@ -3004,7 +3201,10 @@ mod tests {
         });
         let sig_a = sign_hyperliquid(&key, &action_a, 1700000000000, None, "a").unwrap();
         let sig_b = sign_hyperliquid(&key, &action_b, 1700000000000, None, "a").unwrap();
-        assert_ne!(sig_a, sig_b, "mutated action must produce a different signature");
+        assert_ne!(
+            sig_a, sig_b,
+            "mutated action must produce a different signature"
+        );
     }
 
     /// Same action, different nonce → different signature (replay-protection
@@ -3020,7 +3220,10 @@ mod tests {
         });
         let sig_a = sign_hyperliquid(&key, &action, 1700000000000, None, "a").unwrap();
         let sig_b = sign_hyperliquid(&key, &action, 1700000000001, None, "a").unwrap();
-        assert_ne!(sig_a, sig_b, "nonce delta must produce a different signature");
+        assert_ne!(
+            sig_a, sig_b,
+            "nonce delta must produce a different signature"
+        );
     }
 
     /// Cross-environment-replay guard: signing the same action+nonce with
@@ -3159,8 +3362,10 @@ mod tests {
     fn invalid_private_keys_rejected() {
         let zero = [0u8; 32];
         let digest = [0u8; 32];
-        assert!(sign_eip712_digest(&zero, &digest).is_err(),
-            "zero scalar must be rejected by k256");
+        assert!(
+            sign_eip712_digest(&zero, &digest).is_err(),
+            "zero scalar must be rejected by k256"
+        );
     }
 
     /// `parse_evm_address` round-trips for the test wallet.
@@ -3191,18 +3396,36 @@ mod tests {
         // msgpack bytes must match SDK byte-for-byte
         let mp = msgpack_action(&action).unwrap();
         let expected_mp = hex::decode("83a474797065a56f72646572a66f72646572739186a16100a162c3a170a53530303030a173a5302e303031a172c2a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61").unwrap();
-        assert_eq!(mp, expected_mp, "msgpack output mismatch — check serde_json preserve_order feature");
+        assert_eq!(
+            mp, expected_mp,
+            "msgpack output mismatch — check serde_json preserve_order feature"
+        );
 
         // action_hash must match
         let ah = compute_action_hash(&action, nonce, None).unwrap();
-        let expected_ah = hex::decode("323b547050d98eb76afbf8d096d1c5340512df18a3e4179990a666cc32fba0ce").unwrap();
-        assert_eq!(ah.as_slice(), expected_ah.as_slice(), "action_hash mismatch");
+        let expected_ah =
+            hex::decode("323b547050d98eb76afbf8d096d1c5340512df18a3e4179990a666cc32fba0ce")
+                .unwrap();
+        assert_eq!(
+            ah.as_slice(),
+            expected_ah.as_slice(),
+            "action_hash mismatch"
+        );
 
         // Full signature must match SDK byte-for-byte
-        let pk = parse_evm_private_key("29fb5198ba9dfd7419723d2cf6dae53c46d7df83bd89dfb20419249432f83209").unwrap();
+        let pk = parse_evm_private_key(
+            "29fb5198ba9dfd7419723d2cf6dae53c46d7df83bd89dfb20419249432f83209",
+        )
+        .unwrap();
         let sig = sign_hyperliquid(&pk, &action, nonce, None, "a").unwrap();
-        assert_eq!(sig.r, "0x348ff44b3c53aac13989f298e0cb66050522a841a51629b027b86aa83fa964f0");
-        assert_eq!(sig.s, "0x4e69694254a8e68f47a0d7854370d596aba2c88742cf478cc1e0e34389dbca29");
+        assert_eq!(
+            sig.r,
+            "0x348ff44b3c53aac13989f298e0cb66050522a841a51629b027b86aa83fa964f0"
+        );
+        assert_eq!(
+            sig.s,
+            "0x4e69694254a8e68f47a0d7854370d596aba2c88742cf478cc1e0e34389dbca29"
+        );
         assert_eq!(sig.v, 27);
     }
 
@@ -3250,10 +3473,9 @@ mod tests {
     #[test]
     fn asterdex_domain_separator_pins_to_documented_value() {
         let sep = asterdex_domain_separator();
-        let expected = hex::decode(
-            "a95d0a7a6f3f17fcebb0c2336645385ce79cde7523f71ab147fdb7f15e9f37f9",
-        )
-        .unwrap();
+        let expected =
+            hex::decode("a95d0a7a6f3f17fcebb0c2336645385ce79cde7523f71ab147fdb7f15e9f37f9")
+                .unwrap();
         assert_eq!(
             sep.as_slice(),
             expected.as_slice(),
@@ -3268,10 +3490,9 @@ mod tests {
     #[test]
     fn asterdex_message_type_hash_correct() {
         let t = eip712_type_hash("Message(string msg)");
-        let expected = hex::decode(
-            "c4cfb57eea370ef2a92403a7e865b2de262d7ca272333665b54ad7e6a602ef68",
-        )
-        .unwrap();
+        let expected =
+            hex::decode("c4cfb57eea370ef2a92403a7e865b2de262d7ca272333665b54ad7e6a602ef68")
+                .unwrap();
         assert_eq!(t.as_slice(), expected.as_slice());
     }
 

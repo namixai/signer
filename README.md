@@ -98,8 +98,8 @@ sdk/
 > | PCR0 | `isPCR0Active` |
 > |---|---|
 > | `7c9e8b26…` (registered, no longer running) | **true** |
-> | `c16632ed…` (**currently running**) | **false** |
-> | `ff53e1fe…` (previously running) | **false** |
+> | `32d25d8c…` (**currently running**) | **false** |
+> | `ff53e1fe…` (retired 2026-08-10) | **false** |
 >
 > The registry marks an old measurement active and does not know the one actually
 > serving. The dangerous failure mode is not the obvious one: a careful verifier
@@ -213,7 +213,7 @@ clone of this repository rebuilds the measurement the production endpoint attest
 ```bash
 cd poc
 SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
-# → PCR0 c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
+# → PCR0 32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
 ```
 
 > ### The flag is part of the measurement, not a runtime switch
@@ -223,7 +223,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 >
 > | build | PCR0 |
 > |---|---|
-> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `c16632ed…` — **this is production** |
+> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `32d25d8c…` — **this is production** |
 > | `./scripts/build-eif.sh` (permissive default) | `18b6ece4…` — not deployed anywhere |
 >
 > Both values are measured, not asserted. If your build lands on `18b6ece4…` you
@@ -262,7 +262,7 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 
 **Live in production.** 5 venues signing on mainnet — 4 CEX (KuCoin, Binance, Bybit, OKX) plus the Asterdex EIP-712 DEX. Hyperliquid **mainnet is denied inside the enclave** (below); Hyperliquid **testnet** signs. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
 
-Production PCR0: `c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8`
+Production PCR0: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
 
 Check it yourself rather than taking this file's word for it — `/attestation` returns an
 NSM-signed COSE document carrying the running measurement, and it is the authority here.

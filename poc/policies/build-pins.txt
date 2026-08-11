@@ -22,7 +22,7 @@
 #
 # reproduces the production measurement
 #
-#     c16632edd9849d22e71b84c6ea1fa0f9cb35c0811f581705df962154216d681982b4cc1a78e65691386896e7a0c839a8
+#     32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
 #
 # byte-for-byte, on a machine that had never built this tree. The May history is
 # kept below deliberately — it is the honest record of how the determinism was

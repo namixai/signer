@@ -96,6 +96,27 @@ impl ResolvedIdentity {
             allowed_venues: vec!["data-signing".to_owned()],
         }
     }
+
+    /// ROT-1: the identity a freshly-minted TENANT agent key is sealed under.
+    ///
+    /// `for_data_signing` above is a fixed SERVICE identity — one customer, one
+    /// venue, both hardcoded, because there is exactly one data-signing key. An
+    /// agent key belongs to a tenant, so both halves come from the provisioning
+    /// request. The pair is what determines the KMS encryption context and the
+    /// sealed AAD, and the sign path rebuilds it from the RESOLVED tenant plus
+    /// the venue implied by the action — so a mismatch here does not produce a
+    /// weaker key, it produces an unopenable one.
+    ///
+    /// `allowed_venues` is set to exactly the one venue on purpose: this value
+    /// exists only to derive context/AAD at mint time and is never the thing
+    /// that authorises a signature — that is the registry-resolved identity at
+    /// request time.
+    pub fn for_provisioned_agent(customer_id: &str, venue: &str) -> Self {
+        ResolvedIdentity {
+            customer_id: customer_id.to_owned(),
+            allowed_venues: vec![venue.to_owned()],
+        }
+    }
 }
 
 /// One tenant: a keyed token hash + the customer id + venue ACL. The plaintext
@@ -118,7 +139,10 @@ struct Registry {
 
 impl Registry {
     fn empty() -> Self {
-        Registry { entries: Vec::new(), version: 0 }
+        Registry {
+            entries: Vec::new(),
+            version: 0,
+        }
     }
 }
 
@@ -242,7 +266,10 @@ impl std::fmt::Display for RegistryError {
             RegistryError::SignatureInvalid => write!(f, "refresh signature does not verify"),
             RegistryError::ContentHashMismatch => write!(f, "signed content hash != entries hash"),
             RegistryError::NonMonotonicVersion { got, max_known } => {
-                write!(f, "registry version {got} <= max_known {max_known} (rollback)")
+                write!(
+                    f,
+                    "registry version {got} <= max_known {max_known} (rollback)"
+                )
             }
             RegistryError::Empty => write!(f, "registry refresh carried no entries"),
             RegistryError::MalformedEntries => write!(f, "registry entries_json failed to parse"),
@@ -250,7 +277,10 @@ impl std::fmt::Display for RegistryError {
                 write!(f, "registry entry customer_id/venue has unsafe characters")
             }
             RegistryError::ReservedVenue => {
-                write!(f, "registry entry grants a reserved platform venue to a non-owner customer")
+                write!(
+                    f,
+                    "registry entry grants a reserved platform venue to a non-owner customer"
+                )
             }
         }
     }
@@ -278,10 +308,16 @@ pub struct RefreshEntry {
 /// AAD and the KMS EncryptionContext: ASCII alnum + `-`/`_`, 1..=64 bytes, and
 /// crucially NO `\n`/`=`/control chars — closing the AAD field-shift injection
 /// (review F4) at the trust boundary, not only in the bash wrap script.
-fn is_safe_id(s: &str) -> bool {
+///
+/// `pub(crate)` since ROT-1: agent provisioning takes a customer id from the
+/// request and puts it into exactly those two structured strings, so it has to
+/// apply the same rule. Re-implementing it there would be a second definition
+/// of "safe", and the two would drift.
+pub(crate) fn is_safe_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Reserved platform venues — each may be carried ONLY by its designated system
@@ -326,7 +362,10 @@ fn grants_reserved_venue_to_non_reserved(customer_id: &str, allowed_venues: &[St
 fn control_plane_vk() -> Result<VerifyingKey, RegistryError> {
     let hex = std::env::var(REGISTRY_PUBKEY_ENV).map_err(|_| RegistryError::NoPubkey)?;
     let bytes = hex::decode(hex.trim()).map_err(|_| RegistryError::BadPubkey)?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| RegistryError::BadPubkey)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RegistryError::BadPubkey)?;
     VerifyingKey::from_bytes(&arr).map_err(|_| RegistryError::BadPubkey)
 }
 
@@ -379,8 +418,10 @@ pub fn refresh(
 
     // 1. Nonce must equal the one THIS enclave issued — PEEK (don't consume).
     let nonce_bytes = hex::decode(nonce_hex.trim()).map_err(|_| RegistryError::BadNonceHex)?;
-    let nonce: [u8; 32] =
-        nonce_bytes.as_slice().try_into().map_err(|_| RegistryError::BadNonceHex)?;
+    let nonce: [u8; 32] = nonce_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RegistryError::BadNonceHex)?;
     {
         let pend = pending_nonce_guard();
         match *pend {
@@ -396,11 +437,14 @@ pub fn refresh(
     // 2. Signature over canonical(nonce ‖ version ‖ sha256(entries_json)).
     let content_hash = hash_entries(entries_json);
     let sig_bytes = hex::decode(signature_hex.trim()).map_err(|_| RegistryError::BadSignature)?;
-    let sig_arr: [u8; 64] =
-        sig_bytes.as_slice().try_into().map_err(|_| RegistryError::BadSignature)?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RegistryError::BadSignature)?;
     let sig = Signature::from_bytes(&sig_arr);
     let msg = signed_message(&nonce, version, &content_hash);
-    vk.verify(&msg, &sig).map_err(|_| RegistryError::SignatureInvalid)?;
+    vk.verify(&msg, &sig)
+        .map_err(|_| RegistryError::SignatureInvalid)?;
 
     // 3. Derive the entries from the SIGNED bytes — never a caller-supplied Vec.
     let entries: Vec<RefreshEntry> =
@@ -453,7 +497,10 @@ pub fn refresh(
                 allowed_venues: e.allowed_venues,
             })
             .collect();
-        *guard = Arc::new(Registry { entries: resident, version });
+        *guard = Arc::new(Registry {
+            entries: resident,
+            version,
+        });
 
         // 7. ALL checks passed — consume the nonce (one-shot) WHILE still holding
         // the registry write lock, so install + nonce-consume are atomic. The
@@ -563,7 +610,10 @@ pub fn test_install(entries: &[(&str, &str, &[&str])]) {
         }
     }
     let version = g.version.max(1);
-    *g = Arc::new(Registry { entries: current, version });
+    *g = Arc::new(Registry {
+        entries: current,
+        version,
+    });
 }
 
 #[cfg(test)]
@@ -639,13 +689,29 @@ mod tests {
         );
         // hash_entries + signed_message are EXACTLY what `refresh` re-derives.
         let ch = hash_entries(&json);
-        assert_eq!(hex::encode(ch), GOLDEN_CONTENT_HASH_HEX, "content hash drift");
-        assert_eq!(sig_hex, GOLDEN_SIGNATURE_HEX, "signature drift vs control plane");
+        assert_eq!(
+            hex::encode(ch),
+            GOLDEN_CONTENT_HASH_HEX,
+            "content hash drift"
+        );
+        assert_eq!(
+            sig_hex, GOLDEN_SIGNATURE_HEX,
+            "signature drift vs control plane"
+        );
         // And the verifier path itself accepts the golden signature.
         let msg = signed_message(&nonce, version, &ch);
-        assert!(sk.verifying_key().verify(&msg, &Signature::from_bytes(
-            &hex::decode(GOLDEN_SIGNATURE_HEX).unwrap().try_into().unwrap()
-        )).is_ok());
+        assert!(sk
+            .verifying_key()
+            .verify(
+                &msg,
+                &Signature::from_bytes(
+                    &hex::decode(GOLDEN_SIGNATURE_HEX)
+                        .unwrap()
+                        .try_into()
+                        .unwrap()
+                )
+            )
+            .is_ok());
     }
 
     /// Second golden vector — TWO entries (array comma + multi-entry ordering).
@@ -796,7 +862,9 @@ mod tests {
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &reserved, &nonce, 1);
         assert_eq!(refresh(&json, &nonce, 1, &sig).unwrap(), 1);
-        assert!(resolve("x402-platform").expect("reserved resolves").venue_allowed("x402"));
+        assert!(resolve("x402-platform")
+            .expect("reserved resolves")
+            .venue_allowed("x402"));
     }
 
     /// LOW#1 (crypto-panel #211 fast-follow): the reserved `"data-signing"` venue
@@ -858,7 +926,10 @@ mod tests {
         let e2 = mk("b");
         let (j2, s2) = sign_refresh(&sk, &e2, &n2, 4);
         let err = refresh(&j2, &n2, 4, &s2).unwrap_err();
-        assert!(matches!(err, RegistryError::NonMonotonicVersion { .. }), "{err:?}");
+        assert!(
+            matches!(err, RegistryError::NonMonotonicVersion { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -24,11 +24,11 @@ mod envelope;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod handler;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod intent_ledger;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod kms_client;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod proto;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-mod intent_ledger;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod rate_limiter;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
