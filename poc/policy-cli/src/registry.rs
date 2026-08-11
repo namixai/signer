@@ -81,8 +81,7 @@ pub struct RefreshEntry {
 fn is_safe_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Validate the operator-supplied entries against every rule the enclave's
@@ -103,10 +102,7 @@ fn validate_entries(entries: &[RefreshEntry]) -> Result<()> {
             );
         }
         if e.allowed_venues.is_empty() {
-            bail!(
-                "entry {i}: customer {:?} has no allowed_venues",
-                e.customer_id
-            );
+            bail!("entry {i}: customer {:?} has no allowed_venues", e.customer_id);
         }
         for v in &e.allowed_venues {
             if !is_safe_id(v) {
@@ -160,12 +156,10 @@ fn signed_message(nonce: &[u8; 32], version: u64, content_hash: &[u8; 32]) -> [u
 /// Parse a 32-byte hex string (nonce or Ed25519 seed) into bytes.
 fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s.trim()).with_context(|| format!("{what} is not valid hex"))?;
-    bytes.as_slice().try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "{what} must be exactly 32 bytes (64 hex chars), got {} bytes",
-            bytes.len()
-        )
-    })
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{what} must be exactly 32 bytes (64 hex chars), got {} bytes", bytes.len()))
 }
 
 /// The product of a successful sign: the bytes to KMS-encrypt verbatim plus the
@@ -185,10 +179,7 @@ pub struct SignedRefresh {
 impl std::fmt::Debug for SignedRefresh {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignedRefresh")
-            .field(
-                "entries_json",
-                &format_args!("[REDACTED {} bytes]", self.entries_json.len()),
-            )
+            .field("entries_json", &format_args!("[REDACTED {} bytes]", self.entries_json.len()))
             .field("content_hash_hex", &self.content_hash_hex)
             .field("nonce_hex", &self.nonce_hex)
             .field("version", &self.version)
@@ -293,18 +284,11 @@ mod tests {
     fn golden_vector_signs_deterministically() {
         let seed = Zeroizing::new(GOLDEN_SEED);
         let out = sign_refresh(&golden_entries(), GOLDEN_NONCE_HEX, GOLDEN_VERSION, &seed).unwrap();
-        assert_eq!(
-            String::from_utf8(out.entries_json.clone()).unwrap(),
-            GOLDEN_ENTRIES_JSON
-        );
-        assert_eq!(
-            out.content_hash_hex, GOLDEN_CONTENT_HASH_HEX,
-            "content hash drift"
-        );
+        assert_eq!(String::from_utf8(out.entries_json.clone()).unwrap(), GOLDEN_ENTRIES_JSON);
+        assert_eq!(out.content_hash_hex, GOLDEN_CONTENT_HASH_HEX, "content hash drift");
         assert_eq!(out.signature_hex, GOLDEN_SIGNATURE_HEX, "signature drift");
         // Re-sign — Ed25519 is deterministic, so it must be byte-identical.
-        let out2 =
-            sign_refresh(&golden_entries(), GOLDEN_NONCE_HEX, GOLDEN_VERSION, &seed).unwrap();
+        let out2 = sign_refresh(&golden_entries(), GOLDEN_NONCE_HEX, GOLDEN_VERSION, &seed).unwrap();
         assert_eq!(out.signature_hex, out2.signature_hex);
     }
 
@@ -400,16 +384,8 @@ mod tests {
         assert!(sign_refresh(&bad_id, GOLDEN_NONCE_HEX, 1, &seed).is_err());
 
         let dup = vec![
-            RefreshEntry {
-                token: "dup".to_owned(),
-                customer_id: "a".to_owned(),
-                allowed_venues: vec!["binance".to_owned()],
-            },
-            RefreshEntry {
-                token: "dup".to_owned(),
-                customer_id: "b".to_owned(),
-                allowed_venues: vec!["okx".to_owned()],
-            },
+            RefreshEntry { token: "dup".to_owned(), customer_id: "a".to_owned(), allowed_venues: vec!["binance".to_owned()] },
+            RefreshEntry { token: "dup".to_owned(), customer_id: "b".to_owned(), allowed_venues: vec!["okx".to_owned()] },
         ];
         assert!(sign_refresh(&dup, GOLDEN_NONCE_HEX, 1, &seed).is_err());
     }
