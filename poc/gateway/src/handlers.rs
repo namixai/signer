@@ -100,6 +100,36 @@ pub(crate) fn cancel_gate(state: &AppState, raw_token: &str) -> Option<(Response
     crate::limits::deny_response(decision).map(|r| (r, crate::limits::deny_code(decision)))
 }
 
+/// H2: charge an x402 sign against the payer key's per-UTC-day CUMULATIVE spend
+/// cap (CR096). `scope` = `blob_key(customer, key_id)` (the payer key); `value`
+/// = the EIP-3009 transfer amount in raw token units. Returns
+/// `Some((deny_response, code))` to short-circuit, or `None` to proceed. Runs
+/// the fail-closed accumulator on the blocking pool (it fsyncs), mirroring
+/// `order_gate`. Fast path: no blocking work when the cap is unconfigured.
+pub(crate) async fn x402_spend_gate(
+    state: &AppState,
+    scope: &str,
+    value: u128,
+) -> Option<(Response, &'static str)> {
+    if !state.limits.x402_spend_enabled() {
+        return None;
+    }
+    let limits = state.limits.clone();
+    let scope = scope.to_owned();
+    let decision = match tokio::task::spawn_blocking(move || {
+        limits.check_and_count_x402_spend(&scope, value, crate::limits::now_unix_secs())
+    })
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(event = "x402_spend_join_error", error = %e);
+            crate::limits::LimitDecision::CounterUnavailable
+        }
+    };
+    crate::limits::deny_response(decision).map(|r| (r, crate::limits::deny_code(decision)))
+}
+
 /// `POST /sign` — request a fresh KuCoin v2 auth header set from the enclave.
 pub async fn post_sign(
     State(state): State<AppState>,
@@ -182,7 +212,11 @@ pub async fn post_sign(
     // malformed (we can't sign without knowing which action to commit to).
     let action = match enclave_action_for(&req.exchange, req.kind.as_deref()) {
         Some(a) => a,
-        None if matches!(req.exchange.as_str(), "hyperliquid_main" | "hyperliquid_testnet") => {
+        None if matches!(
+            req.exchange.as_str(),
+            "hyperliquid_main" | "hyperliquid_testnet"
+        ) =>
+        {
             // EIP-712 venue with missing/unsupported kind — caller error.
             return finish_log(
                 error_response(err_code::BAD_REQUEST),
@@ -508,6 +542,14 @@ pub async fn get_healthz(State(state): State<AppState>) -> Response {
         attestation_nonce: None,
         attestation_user_data: None,
     };
+    // E3: publish live-signature health (from the periodic self-sign probe)
+    // alongside the vsock liveness. Read lock-free; does NOT affect the 200/503.
+    let now_s = now_ms() / 1000;
+    let sh = &state.sign_health;
+    let sign_checked = sh.is_enabled();
+    let sign_ok = sh.last_ok();
+    let sign_age_s = sh.age_since_ok(now_s);
+
     match vsock::round_trip(state.enclave.cid, state.enclave.port, &req).await {
         Ok(resp) if resp.signature_base64 == "pong" && resp.error.is_none() => (
             StatusCode::OK,
@@ -515,6 +557,9 @@ pub async fn get_healthz(State(state): State<AppState>) -> Response {
                 status: "ok",
                 enclave_cid: state.enclave.cid,
                 enclave_port: state.enclave.port,
+                sign_checked,
+                sign_ok,
+                sign_age_s,
             }),
         )
             .into_response(),
@@ -667,12 +712,7 @@ pub async fn post_verify_blob(
             wire_code = mapped,
             vsock_latency_ms,
         );
-        return finish_log(
-            error_response(mapped),
-            started,
-            false,
-            Some(mapped),
-        );
+        return finish_log(error_response(mapped), started, false, Some(mapped));
     }
 
     // VsockResponse implements Drop (zeroize) so we cannot move fields out —
@@ -749,7 +789,10 @@ pub async fn post_sign_data(
     let data_token = match state.data_signing_token.as_deref() {
         Some(t) => t,
         None => {
-            warn!(event = "sign_data_not_provisioned", "SIGNER_DATA_SIGNING_TOKEN unset");
+            warn!(
+                event = "sign_data_not_provisioned",
+                "SIGNER_DATA_SIGNING_TOKEN unset"
+            );
             return finish_log(
                 error_response(err_code::INTERNAL_ERROR),
                 started,
@@ -869,7 +912,10 @@ pub async fn post_sign_data(
     let mut attested = match resp.attested.take() {
         Some(a) => a,
         None => {
-            warn!(event = "sign_data_missing_attested", "enclave ok but no attested payload");
+            warn!(
+                event = "sign_data_missing_attested",
+                "enclave ok but no attested payload"
+            );
             return finish_log(
                 error_response(err_code::INTERNAL_ERROR),
                 started,
@@ -883,7 +929,10 @@ pub async fn post_sign_data(
         s: std::mem::take(&mut attested.signature.s),
         v: attested.signature.v,
     };
-    info!(event = "sign_data_ok", vsock_latency_ms, "attested-data signed");
+    info!(
+        event = "sign_data_ok",
+        vsock_latency_ms, "attested-data signed"
+    );
     finish_log(
         (
             StatusCode::OK,
@@ -942,6 +991,28 @@ pub async fn post_sign_x402(
             );
         }
     };
+
+    // 1b. H2 (CR096): charge this transfer against the payer key's per-UTC-day
+    //     CUMULATIVE spend cap BEFORE any KMS/enclave work — an already-capped
+    //     key must not drive IMDS/STS (parity with `order_gate`). `value` is raw
+    //     token units; a value the enclave would itself reject (non-numeric or
+    //     wider than u128) fails closed here as a bad request. Attempt-counted:
+    //     the charge persists before the signature, so a retry can't over-spend.
+    let x402_value: u128 = match req.x402.value.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(event = "sign_x402_bad_value", key_id = %key_for_log);
+            return finish_log(
+                error_response(err_code::BAD_REQUEST),
+                started,
+                false,
+                Some(err_code::BAD_REQUEST),
+            );
+        }
+    };
+    if let Some((resp, code)) = x402_spend_gate(&state, &scope, x402_value).await {
+        return finish_log(resp, started, false, Some(code));
+    }
 
     // 2. Fresh AWS creds (same path as /sign, /verify-blob).
     let creds = match state.creds.get().await {
@@ -1470,7 +1541,12 @@ pub async fn post_sign_binance_request(
 
     if !is_safe_key_id(&req.key_id) {
         warn!(event = "binance_request_bad_key_id", key_id = %req.key_id);
-        return finish_log(error_response(err_code::BAD_REQUEST), started, false, Some(err_code::BAD_REQUEST));
+        return finish_log(
+            error_response(err_code::BAD_REQUEST),
+            started,
+            false,
+            Some(err_code::BAD_REQUEST),
+        );
     }
 
     // B3 (б): `op == "order"` places an order through this generic keyless
@@ -1496,18 +1572,33 @@ pub async fn post_sign_binance_request(
         Some(b) => b,
         None => {
             warn!(event = "binance_request_no_blob", key_id = %req.key_id);
-            return finish_log(error_response(err_code::BAD_REQUEST), started, false, Some(err_code::BAD_REQUEST));
+            return finish_log(
+                error_response(err_code::BAD_REQUEST),
+                started,
+                false,
+                Some(err_code::BAD_REQUEST),
+            );
         }
     };
     if !state.backoff.allow(&scope) {
         warn!(event = "binance_request_backoff_rejected", key_id = %req.key_id);
-        return finish_log(error_response(err_code::RATE_LIMITED), started, false, Some(err_code::RATE_LIMITED));
+        return finish_log(
+            error_response(err_code::RATE_LIMITED),
+            started,
+            false,
+            Some(err_code::RATE_LIMITED),
+        );
     }
     let creds = match state.creds.get().await {
         Ok(c) => c,
         Err(e) => {
             warn!(event = "binance_request_creds_failed", key_id = %key_for_log, detail = %e);
-            return finish_log(error_response(err_code::INTERNAL_ERROR), started, false, Some(err_code::INTERNAL_ERROR));
+            return finish_log(
+                error_response(err_code::INTERNAL_ERROR),
+                started,
+                false,
+                Some(err_code::INTERNAL_ERROR),
+            );
         }
     };
 
@@ -1542,11 +1633,17 @@ pub async fn post_sign_binance_request(
         attestation_user_data: None,
     };
 
-    let mut resp = match vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await {
+    let mut resp = match vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(event = "binance_request_vsock", success = false, error_code = "enclave_unreachable", detail = %e);
-            return finish_log(error_response(err_code::ENCLAVE_UNREACHABLE), started, false, Some(err_code::ENCLAVE_UNREACHABLE));
+            return finish_log(
+                error_response(err_code::ENCLAVE_UNREACHABLE),
+                started,
+                false,
+                Some(err_code::ENCLAVE_UNREACHABLE),
+            );
         }
     };
 
@@ -1561,7 +1658,12 @@ pub async fn post_sign_binance_request(
 
     let Some(mut headers) = resp.headers.take() else {
         warn!(event = "binance_request_no_headers", key_id = %key_for_log);
-        return finish_log(error_response(err_code::INTERNAL_ERROR), started, false, Some(err_code::INTERNAL_ERROR));
+        return finish_log(
+            error_response(err_code::INTERNAL_ERROR),
+            started,
+            false,
+            Some(err_code::INTERNAL_ERROR),
+        );
     };
     // `resp.headers.take()` moved the map OUT of resp's ZeroizeOnDrop, so this
     // plain BTreeMap won't wipe its values on drop. Pull out the two fields we
@@ -1582,7 +1684,12 @@ pub async fn post_sign_binance_request(
             zeroize::Zeroize::zeroize(k);
         }
         warn!(event = "binance_request_missing_fields", key_id = %key_for_log);
-        return finish_log(error_response(err_code::INTERNAL_ERROR), started, false, Some(err_code::INTERNAL_ERROR));
+        return finish_log(
+            error_response(err_code::INTERNAL_ERROR),
+            started,
+            false,
+            Some(err_code::INTERNAL_ERROR),
+        );
     }
     // Both present (checked above).
     let signature = signature.expect("signature present after None-check");
@@ -1667,6 +1774,218 @@ pub async fn post_sign_binance_cancel(
                 venue: "binance",
                 method: "DELETE",
                 url: format!("{}/fapi/v1/order?{}", binance_base_url(), qs),
+                headers,
+            }),
+        )
+            .into_response(),
+        started,
+        true,
+        None,
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// /sign/binance-spot-order + /sign/binance-spot-cancel — Binance SPOT.
+//
+// WHY THIS NEEDS NO ENCLAVE CHANGE (and therefore no PCR0 rotation)
+// The enclave never hardcodes `/fapi/` on the structured trade path. It
+// (a) takes `method`/`path` from the gateway and checks them against the
+// blob policy's `allowed_path_prefixes` / `denied_path_prefixes`
+// (`handler.rs::enforce_policy`), and (b) BUILDS the signed querystring
+// itself from the typed `OrderRequest` (`signer.rs::build_binance_order_query`).
+// That builder already emits a spot-legal payload — the golden limit vector is
+// `symbol=…&side=…&type=LIMIT&quantity=…&price=…&timeInForce=GTC`, every field
+// of which is valid on `POST /api/v3/order`. So spot is a NEW PATH CONSTANT
+// plus a policy that allows it, not new enclave code.
+//
+// The action strings stay `sign_binance_order` / `sign_binance_cancel`, which
+// matters: `handler.rs::venue_for_action` maps them to venue `"binance"`, so the
+// KMS encryption context, the sealed AAD and the tenant venue ACL are all
+// unchanged — the same mainnet key (`bf01cfac`) decrypts a spot blob.
+//
+// WHERE THE WITHDRAWAL FLOOR ACTUALLY HOLDS
+// Binance HMAC signs the query string ONLY — it binds neither method nor path.
+// So the `path` we send is a POLICY INPUT, not something the signature commits
+// to; a client that lies about it cannot be caught by path rules alone. The
+// non-bypassable control on THIS route is that the client never supplies the
+// query at all: the enclave constructs it from the typed order, so
+// `coin=/address=/amount=` cannot appear in a signature no matter what path is
+// claimed. The generic `/sign` route is the one that takes a raw query, and
+// there a capped key is constrained by the `generic_capped_op_allowed`
+// allow-list. Both layers live in the enclave; `denied_path_prefixes: ["/sapi/"]`
+// is defence-in-depth on top.
+//
+// CAPS CAVEAT — READ BEFORE PROVISIONING
+// `OrderAssetCap` is keyed by `symbol` alone (`proto.rs`), and spot `BTCUSDT`
+// is the SAME STRING as futures `BTCUSDT`. A single blob whose policy allows
+// both `/fapi/` and `/api/v3/` therefore applies ONE cap to BOTH markets and
+// cannot express different limits per market. Provision spot as its OWN blob
+// stem (its own `key_id`, e.g. `binance_spot`) with its own policy and caps —
+// which needs no code change, since the blob stem is a gateway-side namespace
+// (`blob_key(customer, key_id)`) while the KMS venue comes from the action.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Canonical Binance SPOT order route. Used for BOTH the policy `path` sent to
+/// the enclave and the URL handed back to the client, so the two can never
+/// drift apart.
+pub(crate) const BINANCE_SPOT_ORDER_PATH: &str = "/api/v3/order";
+
+pub async fn post_sign_binance_spot_order(
+    State(state): State<AppState>,
+    Extension(ResolvedCustomer(customer)): Extension<ResolvedCustomer>,
+    Extension(RawToken(raw_token)): Extension<RawToken>,
+    Json(mut req): Json<crate::proto::SignBinanceOrderRequest>,
+) -> Response {
+    let started = Instant::now();
+    let key_for_log = req.key_id.clone();
+    info!(event = "binance_spot_order_received", key_id = %key_for_log, "POST /sign/binance-spot-order");
+    normalize_order_case(&mut req.order);
+
+    // `reduceOnly` is a FUTURES-only param. The enclave's canonical builder
+    // appends `&reduceOnly=true` whenever the flag is set, which on spot both
+    // (a) is rejected by Binance and (b) would bake a futures-only field into a
+    // signature the operator believes is a spot order. Refuse up-front rather
+    // than burn a vsock round-trip on a signature that cannot be used.
+    if req.order.reduce_only {
+        warn!(event = "binance_spot_reduce_only_rejected", key_id = %key_for_log);
+        return finish_log(
+            error_response(err_code::BAD_REQUEST),
+            started,
+            false,
+            Some(err_code::BAD_REQUEST),
+        );
+    }
+
+    // B3 (б): same per-token daily order counter as the futures route — a spot
+    // order is an order.
+    if let Some((resp, code)) = order_gate(&state, &raw_token).await {
+        return finish_log(resp, started, false, Some(code));
+    }
+
+    let payload = serde_json::json!({ "order": req.order });
+
+    let (canonical, mut headers) = match sign_structured_request(
+        &state,
+        &customer,
+        &raw_token,
+        &req.key_id,
+        "sign_binance_order",
+        "POST",
+        BINANCE_SPOT_ORDER_PATH,
+        payload,
+        AgentIntentForward {
+            timestamp_ms: req.timestamp_ms,
+            intent_signature: req.intent_signature,
+            intent_nonce: None, // orders use client_order_id as the replay nonce
+        },
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return finish_log(resp, started, false, None),
+    };
+
+    // POST order: body = full signed querystring, URL is base + path only.
+    let body = match build_binance_signed_qs(&canonical, &mut headers) {
+        Ok(b) => b,
+        Err(detail) => {
+            warn!(event = "binance_spot_order_assembly_failed", key_id = %key_for_log, detail = %detail);
+            return finish_log(
+                error_response(err_code::INTERNAL_ERROR),
+                started,
+                false,
+                Some(err_code::INTERNAL_ERROR),
+            );
+        }
+    };
+    headers.insert(
+        "Content-Type".to_owned(),
+        "application/x-www-form-urlencoded".to_owned(),
+    );
+
+    info!(event = "binance_spot_order_ok", key_id = %key_for_log);
+    finish_log(
+        (
+            StatusCode::OK,
+            Json(crate::proto::SignBinanceOrderResponse {
+                venue: "binance",
+                method: "POST",
+                url: format!("{}{}", binance_spot_base_url(), BINANCE_SPOT_ORDER_PATH),
+                headers,
+                body,
+            }),
+        )
+            .into_response(),
+        started,
+        true,
+        None,
+    )
+}
+
+pub async fn post_sign_binance_spot_cancel(
+    State(state): State<AppState>,
+    Extension(ResolvedCustomer(customer)): Extension<ResolvedCustomer>,
+    Extension(RawToken(raw_token)): Extension<RawToken>,
+    Json(req): Json<crate::proto::SignBinanceCancelRequest>,
+) -> Response {
+    let started = Instant::now();
+    let key_for_log = req.key_id.clone();
+    info!(event = "binance_spot_cancel_received", key_id = %key_for_log, "POST /sign/binance-spot-cancel");
+
+    if let Some((resp, code)) = cancel_gate(&state, &raw_token) {
+        return finish_log(resp, started, false, Some(code));
+    }
+
+    let payload = serde_json::json!({ "cancel": req.cancel });
+
+    let (canonical, mut headers) = match sign_structured_request(
+        &state,
+        &customer,
+        &raw_token,
+        &req.key_id,
+        "sign_binance_cancel",
+        "DELETE",
+        BINANCE_SPOT_ORDER_PATH,
+        payload,
+        AgentIntentForward {
+            timestamp_ms: req.timestamp_ms,
+            intent_signature: req.intent_signature,
+            intent_nonce: req.intent_nonce,
+        },
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return finish_log(resp, started, false, None),
+    };
+
+    // DELETE cancel: signed querystring goes in the URL; no body.
+    let qs = match build_binance_signed_qs(&canonical, &mut headers) {
+        Ok(b) => b,
+        Err(detail) => {
+            warn!(event = "binance_spot_cancel_assembly_failed", key_id = %key_for_log, detail = %detail);
+            return finish_log(
+                error_response(err_code::INTERNAL_ERROR),
+                started,
+                false,
+                Some(err_code::INTERNAL_ERROR),
+            );
+        }
+    };
+
+    info!(event = "binance_spot_cancel_ok", key_id = %key_for_log);
+    finish_log(
+        (
+            StatusCode::OK,
+            Json(crate::proto::SignBinanceCancelResponse {
+                venue: "binance",
+                method: "DELETE",
+                url: format!(
+                    "{}{}?{}",
+                    binance_spot_base_url(),
+                    BINANCE_SPOT_ORDER_PATH,
+                    qs
+                ),
                 headers,
             }),
         )
@@ -1856,7 +2175,9 @@ fn validate_pcr0(raw: &str) -> Result<String, &'static str> {
 /// `"flase"` must NOT silently read as registered.
 fn parse_registered_onchain(raw: Option<String>) -> bool {
     matches!(
-        raw.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        raw.as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
         Some("1" | "true" | "yes")
     )
 }
@@ -2130,7 +2451,10 @@ fn extract_pcr0_from_cose(doc: &[u8]) -> Result<String, &'static str> {
     use ciborium::value::Value;
     let outer: Value = ciborium::from_reader(doc).map_err(|_| "cose: not CBOR")?;
     let arr = outer.as_array().ok_or("cose: not a Sign1 array")?;
-    let payload = arr.get(2).and_then(Value::as_bytes).ok_or("cose: no payload")?;
+    let payload = arr
+        .get(2)
+        .and_then(Value::as_bytes)
+        .ok_or("cose: no payload")?;
     let doc_val: Value =
         ciborium::from_reader(payload.as_slice()).map_err(|_| "doc: payload not CBOR")?;
     let map = doc_val.as_map().ok_or("doc: not a map")?;
@@ -2179,6 +2503,37 @@ pub(crate) fn binance_base_url() -> &'static str {
     })
 }
 
+/// Binance **SPOT** base URL. Separate from `binance_base_url()` (futures) on
+/// purpose — spot lives on a different host AND a different testnet host
+/// (`testnet.binance.vision`, not `testnet.binancefuture.com`), so folding the
+/// two into one function would silently point spot at a futures testnet that
+/// does not serve `/api/v3/`.
+///
+/// ⚠️ SECURITY NOTE — this host also serves `/sapi/v1/capital/withdraw/apply`.
+/// Futures got a free structural separation (`fapi.binance.com` serves no
+/// withdrawal route at all); spot does NOT. That separation was never OUR
+/// control though: the gateway does not send the request (the client does, see
+/// the `/hedge` doctrine note), so the host has always been the client's choice.
+/// The control that actually binds is the enclave never PRODUCING a signature
+/// over withdrawal-shaped params — see the module note on the spot handlers
+/// below. Keep `denied_path_prefixes: ["/sapi/"]` in every spot policy as the
+/// defence-in-depth layer, not as the primary one.
+pub(crate) fn binance_spot_base_url() -> &'static str {
+    static CACHED: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        match std::env::var("SIGNER_BINANCE_ENV")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("mainnet") | Some("live") | Some("prod") => "https://api.binance.com",
+            _ => "https://testnet.binance.vision",
+        }
+    })
+}
+
 /// OKX base URL (always the same host; demo trading is selected by a header,
 /// not a URL switch).
 pub(crate) fn okx_base_url() -> &'static str {
@@ -2207,7 +2562,8 @@ pub(crate) fn okx_is_demo() -> bool {
 /// round-trip + error-to-wire-code mapping so `/account/<venue>` and future
 /// per-venue read endpoints don't each re-implement them. `Err(Response)` is
 /// a ready-to-return HTTP response the caller should pass to `finish_log`.
-#[allow(clippy::result_large_err)] // Response is the canonical wire type — boxing adds indirection (same allow as enclave's enforce_policy).
+#[allow(clippy::result_large_err)]
+// Response is the canonical wire type — boxing adds indirection (same allow as enclave's enforce_policy).
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
 async fn sign_account_read(
     state: &AppState,
@@ -2271,7 +2627,11 @@ async fn sign_account_read(
         payload: None,
         opaque_token: Some(raw_token.to_owned()),
         key_blob_s3_key: Some(format!("secrets/{}.enc", venue)),
-        query: if query.is_empty() { None } else { Some(query.to_owned()) },
+        query: if query.is_empty() {
+            None
+        } else {
+            Some(query.to_owned())
+        },
         hl_action: None,
         nonce: None,
         vault_address: None,
@@ -2349,18 +2709,36 @@ pub(crate) fn is_safe_key_id(v: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
 }
 
-async fn get_account_binance_inner(state: AppState, customer: String, raw_token: String) -> Response {
+async fn get_account_binance_inner(
+    state: AppState,
+    customer: String,
+    raw_token: String,
+) -> Response {
     let started = Instant::now();
-    info!(event = "account_received", venue = "binance", "GET /account/binance");
+    info!(
+        event = "account_received",
+        venue = "binance",
+        "GET /account/binance"
+    );
 
     // Binance USD-M Futures: GET /fapi/v2/account, HMAC over query (no body).
     // The enclave appends timestamp+recvWindow to the canonical query, signs it,
     // and returns those values back in `headers` for us to embed in the URL.
-    let mut headers =
-        match sign_account_read(&state, &customer, &raw_token, "binance", "GET", "/fapi/v2/account", "", "").await {
-            Ok(h) => h,
-            Err(resp) => return finish_log(resp, started, false, None),
-        };
+    let mut headers = match sign_account_read(
+        &state,
+        &customer,
+        &raw_token,
+        "binance",
+        "GET",
+        "/fapi/v2/account",
+        "",
+        "",
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(resp) => return finish_log(resp, started, false, None),
+    };
 
     let signature = match headers.remove("signature") {
         Some(s) => s,
@@ -2386,7 +2764,9 @@ async fn get_account_binance_inner(state: AppState, customer: String, raw_token:
             );
         }
     };
-    let recv_window = headers.remove("recvWindow").unwrap_or_else(|| "5000".to_owned());
+    let recv_window = headers
+        .remove("recvWindow")
+        .unwrap_or_else(|| "5000".to_owned());
 
     // Validate the values before embedding in the URL (defense in depth).
     if ![&signature, &timestamp, &recv_window]
@@ -2434,7 +2814,8 @@ async fn build_okx_signed_read(
     raw_token: &str,
     path: &'static str,
 ) -> Result<crate::proto::SignedReadRequest, Response> {
-    let mut headers = sign_account_read(state, customer_id, raw_token, "okx", "GET", path, "", "").await?;
+    let mut headers =
+        sign_account_read(state, customer_id, raw_token, "okx", "GET", path, "", "").await?;
     if okx_is_demo() {
         headers.insert("x-simulated-trading".to_owned(), "1".to_owned());
     }
@@ -2447,20 +2828,29 @@ async fn build_okx_signed_read(
 
 async fn get_account_okx_inner(state: AppState, customer: String, raw_token: String) -> Response {
     let started = Instant::now();
-    info!(event = "account_received", venue = "okx", "GET /account/okx");
+    info!(
+        event = "account_received",
+        venue = "okx",
+        "GET /account/okx"
+    );
 
     // A1 composite (per marketplace coordination): sign BOTH /balance and
     // /positions in one /account hit so the MCP fires them in parallel without
     // a second round-trip to the gateway. Sequential here (only 2 calls, one
     // enclave at a time anyway via vsock) keeps the code linear.
-    let balance = match build_okx_signed_read(&state, &customer, &raw_token, "/api/v5/account/balance").await {
-        Ok(b) => b,
-        Err(resp) => return finish_log(resp, started, false, None),
-    };
-    let positions = match build_okx_signed_read(&state, &customer, &raw_token, "/api/v5/account/positions").await {
-        Ok(p) => p,
-        Err(resp) => return finish_log(resp, started, false, None),
-    };
+    let balance =
+        match build_okx_signed_read(&state, &customer, &raw_token, "/api/v5/account/balance").await
+        {
+            Ok(b) => b,
+            Err(resp) => return finish_log(resp, started, false, None),
+        };
+    let positions =
+        match build_okx_signed_read(&state, &customer, &raw_token, "/api/v5/account/positions")
+            .await
+        {
+            Ok(p) => p,
+            Err(resp) => return finish_log(resp, started, false, None),
+        };
 
     info!(event = "account_ok", venue = "okx");
     finish_log(
@@ -2539,12 +2929,21 @@ fn binance_signed_url(
 ) -> Result<String, &'static str> {
     // `Zeroizing` so signature/timestamp/recvWindow are wiped on EVERY return path
     // (incl. the validation-failure error path) — defense-in-depth secret hygiene.
-    let signature =
-        zeroize::Zeroizing::new(headers.remove("signature").ok_or(err_code::INTERNAL_ERROR)?);
-    let timestamp =
-        zeroize::Zeroizing::new(headers.remove("timestamp").ok_or(err_code::INTERNAL_ERROR)?);
-    let recv_window =
-        zeroize::Zeroizing::new(headers.remove("recvWindow").unwrap_or_else(|| "5000".to_owned()));
+    let signature = zeroize::Zeroizing::new(
+        headers
+            .remove("signature")
+            .ok_or(err_code::INTERNAL_ERROR)?,
+    );
+    let timestamp = zeroize::Zeroizing::new(
+        headers
+            .remove("timestamp")
+            .ok_or(err_code::INTERNAL_ERROR)?,
+    );
+    let recv_window = zeroize::Zeroizing::new(
+        headers
+            .remove("recvWindow")
+            .unwrap_or_else(|| "5000".to_owned()),
+    );
     for v in [signature.as_str(), timestamp.as_str(), recv_window.as_str()] {
         if !is_safe_query_value(v) {
             return Err(err_code::INTERNAL_ERROR);
@@ -2626,7 +3025,11 @@ async fn open_orders_binance_inner(
     symbol: Option<String>,
 ) -> Response {
     let started = Instant::now();
-    info!(event = "open_orders_received", venue = "binance", "GET /open-orders/binance");
+    info!(
+        event = "open_orders_received",
+        venue = "binance",
+        "GET /open-orders/binance"
+    );
     // Optional `symbol` filter. Validate BEFORE it enters the signed query.
     let user_query = match validated_filter(symbol.as_deref(), "symbol") {
         Ok(q) => q,
@@ -2641,7 +3044,14 @@ async fn open_orders_binance_inner(
         }
     };
     let mut headers = match sign_account_read(
-        &state, &customer, &raw_token, "binance", "GET", "/fapi/v1/openOrders", "", &user_query,
+        &state,
+        &customer,
+        &raw_token,
+        "binance",
+        "GET",
+        "/fapi/v1/openOrders",
+        "",
+        &user_query,
     )
     .await
     {
@@ -2680,7 +3090,11 @@ async fn open_orders_okx_inner(
     inst_id: Option<String>,
 ) -> Response {
     let started = Instant::now();
-    info!(event = "open_orders_received", venue = "okx", "GET /open-orders/okx");
+    info!(
+        event = "open_orders_received",
+        venue = "okx",
+        "GET /open-orders/okx"
+    );
     // OKX signs the requestPath INCLUDING the query, so the URL must carry the
     // exact same query string the enclave merged + signed.
     let query = match validated_filter(inst_id.as_deref(), "instId") {
@@ -2798,7 +3212,11 @@ async fn user_trades_binance_inner(
     q: UserTradesQuery,
 ) -> Response {
     let started = Instant::now();
-    info!(event = "user_trades_received", venue = "binance", "GET /user-trades/binance");
+    info!(
+        event = "user_trades_received",
+        venue = "binance",
+        "GET /user-trades/binance"
+    );
     // Build the signed query in a FIXED order (the enclave signs `user_query +
     // timestamp + recvWindow`, and `binance_signed_url` rebuilds it the same way).
     // `symbol` is REQUIRED; each present filter is validated BEFORE it is signed.
@@ -2826,7 +3244,11 @@ async fn user_trades_binance_inner(
             Ok(f) if !f.is_empty() => fragments.push(f),
             Ok(_) => {}
             Err(()) => {
-                warn!(event = "user_trades_bad_filter", venue = "binance", filter = key);
+                warn!(
+                    event = "user_trades_bad_filter",
+                    venue = "binance",
+                    filter = key
+                );
                 return finish_log(
                     error_response(err_code::BAD_REQUEST),
                     started,
@@ -2838,7 +3260,14 @@ async fn user_trades_binance_inner(
     }
     let user_query = fragments.join("&");
     let mut headers = match sign_account_read(
-        &state, &customer, &raw_token, "binance", "GET", "/fapi/v1/userTrades", "", &user_query,
+        &state,
+        &customer,
+        &raw_token,
+        "binance",
+        "GET",
+        "/fapi/v1/userTrades",
+        "",
+        &user_query,
     )
     .await
     {
@@ -2877,13 +3306,19 @@ async fn user_trades_okx_inner(
     q: UserTradesQuery,
 ) -> Response {
     let started = Instant::now();
-    info!(event = "user_trades_received", venue = "okx", "GET /user-trades/okx");
+    info!(
+        event = "user_trades_received",
+        venue = "okx",
+        "GET /user-trades/okx"
+    );
     // OKX `GET /api/v5/trade/fills-history` REQUIRES `instType`; the rest are
     // read-only filters / pagination. OKX signs the requestPath INCLUDING the
     // query, so the URL must carry the exact same query the enclave merged + signed.
     let mut fragments: Vec<String> = Vec::new();
     match q.inst_type.as_deref() {
-        Some(s) if !s.is_empty() && is_safe_query_value(s) => fragments.push(format!("instType={s}")),
+        Some(s) if !s.is_empty() && is_safe_query_value(s) => {
+            fragments.push(format!("instType={s}"))
+        }
         _ => {
             warn!(event = "user_trades_bad_inst_type", venue = "okx");
             return finish_log(
@@ -2907,7 +3342,11 @@ async fn user_trades_okx_inner(
             Ok(f) if !f.is_empty() => fragments.push(f),
             Ok(_) => {}
             Err(()) => {
-                warn!(event = "user_trades_bad_filter", venue = "okx", filter = key);
+                warn!(
+                    event = "user_trades_bad_filter",
+                    venue = "okx",
+                    filter = key
+                );
                 return finish_log(
                     error_response(err_code::BAD_REQUEST),
                     started,
@@ -2919,7 +3358,14 @@ async fn user_trades_okx_inner(
     }
     let query = fragments.join("&");
     let mut headers = match sign_account_read(
-        &state, &customer, &raw_token, "okx", "GET", "/api/v5/trade/fills-history", "", &query,
+        &state,
+        &customer,
+        &raw_token,
+        "okx",
+        "GET",
+        "/api/v5/trade/fills-history",
+        "",
+        &query,
     )
     .await
     {
@@ -2989,7 +3435,11 @@ async fn cancel_all_binance_inner(
     symbol: Option<String>,
 ) -> Response {
     let started = Instant::now();
-    info!(event = "cancel_all_received", venue = "binance", "POST /cancel-all/binance");
+    info!(
+        event = "cancel_all_received",
+        venue = "binance",
+        "POST /cancel-all/binance"
+    );
     // B3.1: cancels-rate bucket. Enforced here (not the dispatcher) so a rate-
     // limited cancel-all still emits request_finished with the deny code — the
     // dispatcher-level check bypassed all lifecycle logging (Gemini #224).
@@ -3086,7 +3536,10 @@ mod tests {
             Value::Bytes(pcr0.to_vec()),
         )]);
         let payload_doc = Value::Map(vec![
-            (Value::Text("module_id".into()), Value::Text("enc-test".into())),
+            (
+                Value::Text("module_id".into()),
+                Value::Text("enc-test".into()),
+            ),
             (Value::Text("pcrs".into()), pcrs),
         ]);
         let mut payload = Vec::new();
@@ -3100,6 +3553,44 @@ mod tests {
         let mut out = Vec::new();
         ciborium::into_writer(&cose, &mut out).expect("encode cose");
         out
+    }
+
+    // ── Binance SPOT route constants ────────────────────────────────────────
+    // These pin the two mistakes that would silently break the spot lane's
+    // safety story. No env is touched: nothing in this crate sets
+    // `SIGNER_BINANCE_ENV`, so both base-URL helpers resolve to their testnet
+    // arm deterministically.
+
+    #[test]
+    fn binance_spot_and_futures_hosts_are_distinct() {
+        // Spot testnet is `testnet.binance.vision`, NOT `testnet.binancefuture.com`
+        // — folding the two helpers into one would point spot at a futures host
+        // that serves no `/api/v3/` at all.
+        assert_ne!(binance_spot_base_url(), binance_base_url());
+        assert!(
+            !binance_spot_base_url().contains("binancefuture"),
+            "spot base URL must not be the futures host: {}",
+            binance_spot_base_url()
+        );
+        assert!(
+            binance_spot_base_url().starts_with("https://"),
+            "spot base URL must be https: {}",
+            binance_spot_base_url()
+        );
+    }
+
+    #[test]
+    fn binance_spot_order_path_is_not_a_withdrawal_path() {
+        // The spot host also serves `/sapi/v1/capital/withdraw/apply`, so the
+        // route constant must stay inside `/api/v3/` and never collide with the
+        // `/sapi/` prefix that every spot policy denies. If someone ever
+        // "generalises" this constant, this test is the tripwire.
+        assert_eq!(BINANCE_SPOT_ORDER_PATH, "/api/v3/order");
+        assert!(!BINANCE_SPOT_ORDER_PATH.starts_with("/sapi/"));
+        assert!(!BINANCE_SPOT_ORDER_PATH.starts_with("/fapi/"));
+        // The enclave's allow-list check is prefix-based with a boundary rule,
+        // so a spot policy granting `/api/v3/` must NOT thereby grant `/sapi/`.
+        assert!(!"/sapi/v1/capital/withdraw/apply".starts_with("/api/v3/"));
     }
 
     #[test]
@@ -3366,12 +3857,17 @@ mod tests {
         let mut blobs = std::collections::HashMap::new();
         blobs.insert(
             blob_key(cust_b, "binance"),
-            crate::state::BlobBundle { ciphertext: b"cust-b-binance".to_vec(), encryption_context: None },
+            crate::state::BlobBundle {
+                ciphertext: b"cust-b-binance".to_vec(),
+                encryption_context: None,
+            },
         );
         let state = AppState::new(blobs, EnclaveTarget { cid: 0, port: 0 });
 
         // Customer A (no A/binance blob) → bad_request, never touches B's blob.
-        let req = crate::proto::VerifyBlobRequest { venue_id: "binance".to_owned() };
+        let req = crate::proto::VerifyBlobRequest {
+            venue_id: "binance".to_owned(),
+        };
         let resp = post_verify_blob(
             State(state.clone()),
             Extension(ResolvedCustomer(cust_a.to_owned())),
@@ -3405,7 +3901,10 @@ mod tests {
         let mut blobs = std::collections::HashMap::new();
         blobs.insert(
             blob_key(cust_b, stem),
-            BlobBundle { ciphertext: b"cust-b".to_vec(), encryption_context: None },
+            BlobBundle {
+                ciphertext: b"cust-b".to_vec(),
+                encryption_context: None,
+            },
         );
         AppState::new(blobs, EnclaveTarget { cid: 0, port: 0 })
     }
@@ -3421,7 +3920,14 @@ mod tests {
         let payload = serde_json::json!({ "order": {} });
         // A → bad_request (no A/binance blob, no fall-through to B's).
         let err = sign_structured_request(
-            &state, CUST_A, "tok-a", "binance", "sign_binance_order", "POST", "/fapi/v1/order", payload.clone(),
+            &state,
+            CUST_A,
+            "tok-a",
+            "binance",
+            "sign_binance_order",
+            "POST",
+            "/fapi/v1/order",
+            payload.clone(),
             AgentIntentForward::default(),
         )
         .await
@@ -3429,7 +3935,14 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         // B → gets PAST the blob lookup (fails later on creds, NOT bad_request).
         let b_resp = sign_structured_request(
-            &state, CUST_B, "tok-b", "binance", "sign_binance_order", "POST", "/fapi/v1/order", payload,
+            &state,
+            CUST_B,
+            "tok-b",
+            "binance",
+            "sign_binance_order",
+            "POST",
+            "/fapi/v1/order",
+            payload,
             AgentIntentForward::default(),
         )
         .await;
@@ -3442,13 +3955,84 @@ mod tests {
         }
     }
 
+    /// `reduceOnly` is futures-only: on the SPOT route it must be refused up
+    /// front, before any vsock round-trip, so no signature carrying a
+    /// futures-only field can exist for an order the operator believes is spot.
+    ///
+    /// The control case is the point. `bad_request` alone would also be produced
+    /// by a missing blob or a broken enclave target, so a single assertion could
+    /// pass with the guard deleted. The same request with `reduce_only: false`
+    /// must therefore reach PAST the guard and fail LATER (no enclave at cid 0)
+    /// with a different code — proving the first refusal came from the guard.
+    #[tokio::test]
+    async fn binance_spot_order_refuses_reduce_only_before_signing() {
+        use axum::extract::{Json, State};
+        use axum::Extension;
+
+        let cust = CUST_B;
+        let state = state_with_only_b(cust, "binance");
+        let req = |reduce_only: bool| {
+            serde_json::from_value::<crate::proto::SignBinanceOrderRequest>(serde_json::json!({
+                "key_id": "binance",
+                // snake_case on purpose: `OrderParams` is `deny_unknown_fields`,
+                // so `ordType`/`reduceOnly` are REJECTED rather than silently
+                // dropped — that guard is what keeps a typo'd caller field from
+                // flipping order semantics. Writing the fixture in camelCase
+                // fails here loudly, which is the intended behaviour.
+                "order": {
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "qty": "0.001",
+                    "ord_type": "MARKET",
+                    "reduce_only": reduce_only,
+                }
+            }))
+            .expect("request fixture must deserialize")
+        };
+
+        let denied = post_sign_binance_spot_order(
+            State(state.clone()),
+            Extension(ResolvedCustomer(cust.to_owned())),
+            Extension(RawToken("tok-b".to_owned())),
+            Json(req(true)),
+        )
+        .await;
+        assert_eq!(
+            denied.status(),
+            StatusCode::BAD_REQUEST,
+            "reduceOnly on the spot route must be refused"
+        );
+
+        let allowed = post_sign_binance_spot_order(
+            State(state),
+            Extension(ResolvedCustomer(cust.to_owned())),
+            Extension(RawToken("tok-b".to_owned())),
+            Json(req(false)),
+        )
+        .await;
+        assert_ne!(
+            allowed.status(),
+            StatusCode::BAD_REQUEST,
+            "without reduceOnly the request must get past the guard and fail later"
+        );
+    }
+
     /// Site `sign_account_read` (get_account binance/okx): same isolation.
     #[tokio::test]
     async fn account_read_customer_isolation() {
         let state = state_with_only_b(CUST_B, "binance");
-        let err = sign_account_read(&state, CUST_A, "tok-a", "binance", "GET", "/fapi/v2/account", "", "")
-            .await
-            .expect_err("A must be denied B's account blob");
+        let err = sign_account_read(
+            &state,
+            CUST_A,
+            "tok-a",
+            "binance",
+            "GET",
+            "/fapi/v2/account",
+            "",
+            "",
+        )
+        .await
+        .expect_err("A must be denied B's account blob");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 

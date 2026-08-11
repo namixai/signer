@@ -101,9 +101,10 @@ def check(cond, msg):
 # 🔴 THIS DEFAULT IS PAIRED WITH THE DEFAULT `SIGNER_URL` ABOVE. Change one and you
 # MUST change the other. They describe two different enclaves:
 #
-#   SIGNER_URL=https://signer-demo.usenami.io:8443  ->  ff53e1fe…  (the DEMO enclave;
+#   SIGNER_URL=https://signer-demo.usenami.io:8443  ->  32d25d8c…  (the DEMO enclave;
 #                                                        both defaults here)
-#   the mainnet/production enclave                  ->  c16632ed…  (override BOTH)
+#   the mainnet/production enclave                  ->  32d25d8c…  (same image since
+#                                                        the 2026-08-10 rotation)
 #
 # The two were never linked, which is why this file could drift: a reader who
 # repointed the URL kept an expectation belonging to the other enclave and got a
@@ -116,7 +117,7 @@ def check(cond, msg):
 # possible reason for a verification to fail.
 EXPECTED_PCR0 = os.environ.get(
     "EXPECTED_PCR0",
-    "ff53e1fe23498737e647a3baf0706133c4b157af024a519bf9d983a1f538d356e01f05792e15837728a7829c2908f6c6",
+    "32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103",
 ).strip().lower()
 
 # 0) Pin the AWS Nitro root before trusting anything.
@@ -191,11 +192,14 @@ check; a non-AWS chain fails the pinned-root path validation.
 
 ### Where the expected PCR0 comes from
 
-The value baked in above — `ff53e1fe…f6c6` — is the PCR0 the **public demo**
+The value baked in above — `32d25d8c…7103` — is the PCR0 the **public demo**
 enclave currently attests, and it is paired with this file's default
-`SIGNER_URL`. The **mainnet/production** enclave is a different image and
-measures `c16632ed…`; if you point `SIGNER_URL` there, override `EXPECTED_PCR0`
-to match, or the comparison is meaningless.
+`SIGNER_URL`. Since the 2026-08-10 rotation the **mainnet/production** enclave
+runs the *same* image and attests the *same* measurement, so this value holds for
+both endpoints. That was not true before: the two lanes rotated separately and
+carried different PCR0s. If you ever see them diverge again, trust neither until
+the mismatch is explained — a shared measurement is the property that makes one
+published number meaningful for both.
 
 The demo measurement has two independent sources, in increasing order of trust:
 

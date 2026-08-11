@@ -86,6 +86,14 @@ struct SignRequest {
     ciphertext_blob_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     registry_refresh: Option<RegistryRefreshParams>,
+    // ROT-1 agent-key minting. Skipped when absent so every other action keeps
+    // sending exactly the bytes it sent before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provision_venue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provision_customer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provision_policy: Option<String>,
 }
 
 impl fmt::Debug for SignRequest {
@@ -221,11 +229,49 @@ enum Cmd {
     /// `{customer_id:"attested-data", venue_id:"data-signing"}` context. Writes the
     /// sealed envelope to `--out` and prints `SIGNER_DATA_PUBKEY` / `..._ADDRESS`.
     ProvisionDataKey {
-        /// KMS key id/alias to GenerateDataKey under (the signer KMS key).
-        #[arg(long, default_value = "alias/signer-poc")]
+        /// KMS key id/alias to seal the data key under. REQUIRED — there is no
+        /// default on purpose.
+        ///
+        /// This used to default to `alias/signer-poc`, the DEMO key. A mainnet
+        /// ceremony run without `--key-id` therefore went to the demo lane and
+        /// failed with `provision_wrap_failed`, which reads like a wrap defect
+        /// and not like "you addressed the wrong key" — the denial was
+        /// identity-side on a key nobody meant to touch. That cost a rotation
+        /// window half a day and produced a confident, wrong diagnosis against
+        /// the mainnet key's policy. A default that silently picks a lane is
+        /// worse than no default: the caller cannot see what it chose.
+        #[arg(long)]
         key_id: String,
         /// Path to write the sealed envelope blob (the gateway loads this).
         #[arg(long, default_value = "secrets/attested-data/data-signing.enc")]
+        out: PathBuf,
+    },
+    /// ROT-1 agent-key minting, ONE-SHOT: ask the enclave to BIRTH a venue agent
+    /// key, seal it under `{customer_id, venue_id}`, and return the sealed
+    /// envelope plus the agent ADDRESS. The private key never leaves the
+    /// enclave, so there is nothing to hand over — the account owner simply
+    /// approves the printed address on the venue from their own wallet.
+    ///
+    /// The POLICY travels the other way: author and authority-sign it off-box
+    /// (`signer-policy-wrap`) and pass the file here. For a money venue the
+    /// enclave refuses to mint against a policy that is not authority-signed or
+    /// carries no binding cap — it will not hand back a key it could not later
+    /// load.
+    ProvisionAgentKey {
+        /// KMS key id/alias to wrap the DEK under (the venue's key).
+        #[arg(long)]
+        key_id: String,
+        /// Venue the minted key signs for, e.g. `hyperliquid_main`.
+        #[arg(long)]
+        venue: String,
+        /// Tenant the key belongs to (the registry `customer_id`).
+        #[arg(long)]
+        customer_id: String,
+        /// File holding the authority-signed policy JSON to seal with the key.
+        #[arg(long)]
+        policy: PathBuf,
+        /// Path to write the sealed envelope blob (the gateway loads this).
+        #[arg(long)]
         out: PathBuf,
     },
 }
@@ -243,6 +289,9 @@ fn build_request(cmd: Cmd) -> Result<SignRequest> {
             aws_credentials: None,
             ciphertext_blob_base64: None,
             registry_refresh: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         }),
         Cmd::RegistryChallenge => Ok(SignRequest {
             action: "registry_challenge".to_owned(),
@@ -255,6 +304,9 @@ fn build_request(cmd: Cmd) -> Result<SignRequest> {
             aws_credentials: None,
             ciphertext_blob_base64: None,
             registry_refresh: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         }),
         Cmd::RegistryRefresh { blob, refresh } => build_registry_refresh_request(blob, refresh),
         Cmd::Sign {
@@ -294,7 +346,74 @@ fn build_request(cmd: Cmd) -> Result<SignRequest> {
             blob,
         ),
         Cmd::ProvisionDataKey { key_id, .. } => build_provision_request(key_id),
+        Cmd::ProvisionAgentKey {
+            key_id,
+            venue,
+            customer_id,
+            policy,
+            ..
+        } => build_provision_agent_request(key_id, venue, customer_id, policy),
     }
+}
+
+/// Build a `provision_agent_key` request (ROT-1).
+///
+/// The policy is read from disk and forwarded VERBATIM: it carries an authority
+/// signature computed over its canonical form off-box, and re-encoding it here
+/// would add a second place where those bytes could drift from what was signed.
+fn build_provision_agent_request(
+    key_id: String,
+    venue: String,
+    customer_id: String,
+    policy: PathBuf,
+) -> Result<SignRequest> {
+    // Mirror of the enclave's `is_safe_id`. Both ids land in the KMS encryption
+    // context and in the newline-delimited sealed AAD, so the enclave rejects
+    // anything outside this charset to close field-shift injection at the trust
+    // boundary. This copy is FAIL-FAST ONLY — the enclave stays the enforcement,
+    // and duplicating the rule is unavoidable because `parent` is a separate
+    // crate. Value: an operator typo becomes a named error here instead of a
+    // bare `bad_request` after a network round-trip.
+    let is_safe_id = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    for (label, value) in [("venue", &venue), ("customer_id", &customer_id)] {
+        if !is_safe_id(value) {
+            bail!(
+                "{label} {value:?} is invalid: 1-64 characters of ASCII alphanumeric, '-' or '_' \
+                 (it goes into the KMS encryption context and the sealed AAD)"
+            );
+        }
+    }
+
+    let creds = load_credentials_from_env().context(
+        "AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN missing in env \
+         (need the ephemeral scoped role granting kms:Encrypt on the venue key)",
+    )?;
+    let policy_json = std::fs::read_to_string(&policy)
+        .with_context(|| format!("read policy file {}", policy.display()))?;
+    // Fail here rather than at the enclave: a malformed policy is an operator
+    // typo, and the round-trip would report it as a bare bad_request.
+    serde_json::from_str::<serde_json::Value>(&policy_json)
+        .with_context(|| format!("policy file {} is not valid JSON", policy.display()))?;
+    Ok(SignRequest {
+        action: "provision_agent_key".to_owned(),
+        method: None,
+        path: None,
+        body: None,
+        timestamp_ms: None,
+        key_blob_s3_key: None,
+        key_id: Some(key_id),
+        aws_credentials: Some(creds),
+        ciphertext_blob_base64: None,
+        registry_refresh: None,
+        provision_venue: Some(venue),
+        provision_customer_id: Some(customer_id),
+        provision_policy: Some(policy_json),
+    })
 }
 
 /// Build a `provision_data_key` request: action + the KMS key id + IMDS creds.
@@ -316,6 +435,9 @@ fn build_provision_request(key_id: String) -> Result<SignRequest> {
         aws_credentials: Some(creds),
         ciphertext_blob_base64: None,
         registry_refresh: None,
+        provision_venue: None,
+        provision_customer_id: None,
+        provision_policy: None,
     })
 }
 
@@ -347,6 +469,9 @@ fn build_kucoin_request(
         aws_credentials: Some(creds),
         ciphertext_blob_base64: Some(ciphertext_b64),
         registry_refresh: None,
+        provision_venue: None,
+        provision_customer_id: None,
+        provision_policy: None,
     })
 }
 
@@ -388,6 +513,9 @@ fn build_registry_refresh_request(blob: PathBuf, refresh: PathBuf) -> Result<Sig
         aws_credentials: Some(creds),
         ciphertext_blob_base64: Some(ciphertext_b64),
         registry_refresh: Some(params),
+        provision_venue: None,
+        provision_customer_id: None,
+        provision_policy: None,
     })
 }
 
@@ -439,8 +567,16 @@ fn write_new_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Capture the provision out-path before build_request consumes cli.cmd.
-    let provision_out = match &cli.cmd {
-        Cmd::ProvisionDataKey { out, .. } => Some(out.clone()),
+    // Carry WHICH provisioning command this is, not merely that one ran. The two
+    // outputs mean different things to the operator and must not share wording.
+    let provision_out: Option<(PathBuf, Option<(String, String)>)> = match &cli.cmd {
+        Cmd::ProvisionDataKey { out, .. } => Some((out.clone(), None)),
+        Cmd::ProvisionAgentKey {
+            out,
+            venue,
+            customer_id,
+            ..
+        } => Some((out.clone(), Some((venue.clone(), customer_id.clone())))),
         _ => None,
     };
     let req = build_request(cli.cmd)?;
@@ -458,9 +594,9 @@ async fn main() -> Result<()> {
     // `provision` payload — never exit 0 having written nothing. If `out` is set
     // (it WAS a provision call) but the enclave returned no `provision` field,
     // that's an error, not a silent success.
-    if let Some(out) = provision_out {
+    if let Some((out, agent)) = provision_out {
         let prov = resp.provision.as_ref().context(
-            "provision-data-key: enclave returned no `provision` payload — refusing \
+            "provisioning: enclave returned no `provision` payload — refusing \
              to exit 0 without a sealed key",
         )?;
         let blob = B64
@@ -476,10 +612,31 @@ async fn main() -> Result<()> {
         // world-readable.
         write_new_private_file(&out, &blob)
             .with_context(|| format!("write sealed envelope to {}", out.display()))?;
-        println!("attested-data key provisioned:");
-        println!("  sealed envelope -> {}", out.display());
-        println!("  SIGNER_DATA_PUBKEY={}", prov.pubkey_compressed);
-        println!("  SIGNER_DATA_ADDRESS={}", prov.pubkey_address);
+        match agent {
+            None => {
+                println!("attested-data key provisioned:");
+                println!("  sealed envelope -> {}", out.display());
+                println!("  SIGNER_DATA_PUBKEY={}", prov.pubkey_compressed);
+                println!("  SIGNER_DATA_ADDRESS={}", prov.pubkey_address);
+            }
+            Some((venue, customer_id)) => {
+                // The address is the ONE value a human then acts on: the account
+                // owner approves exactly this string on the venue. Printing it
+                // under data-signing names misdirects that step, which is the
+                // step that decides whether the key can trade at all.
+                println!("agent key provisioned for {customer_id} on {venue}:");
+                println!("  sealed envelope -> {}", out.display());
+                println!("  AGENT_PUBKEY={}", prov.pubkey_compressed);
+                println!("  AGENT_ADDRESS={}", prov.pubkey_address);
+                println!();
+                println!(
+                    "  NEXT: approve {} as an agent/API wallet on {venue}",
+                    prov.pubkey_address
+                );
+                println!("        from the account owner's own wallet. The private key");
+                println!("        never left the enclave — there is nothing else to move.");
+            }
+        }
         return Ok(());
     }
 
@@ -570,10 +727,25 @@ mod tests {
             aws_credentials: None,
             ciphertext_blob_base64: Some("Zg==".to_owned()),
             registry_refresh: Some(p),
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         };
         // registry_refresh survives serialization (the enclave needs it).
         let s = serde_json::to_string(&req).unwrap();
-        assert!(s.contains(r#""registry_refresh":{"nonce_hex":"ab","version":7"#), "{s}");
+        assert!(
+            s.contains(r#""registry_refresh":{"nonce_hex":"ab","version":7"#),
+            "{s}"
+        );
+        // ROT-1 fields are absent here and must not appear on the wire: the
+        // enclave parses with `deny_unknown_fields`, and every pre-existing
+        // action has to keep sending exactly the bytes it sent before.
+        assert!(
+            !s.contains("provision_venue")
+                && !s.contains("provision_customer_id")
+                && !s.contains("provision_policy"),
+            "unset ROT-1 fields leaked onto the wire: {s}"
+        );
     }
 
     #[test]
@@ -595,6 +767,9 @@ mod tests {
             }),
             ciphertext_blob_base64: Some(B64.encode(b"fake-ciphertext")),
             registry_refresh: None,
+            provision_venue: None,
+            provision_customer_id: None,
+            provision_policy: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let back: SignRequest = serde_json::from_str(&json).expect("deserialize");

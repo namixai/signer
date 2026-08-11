@@ -44,7 +44,7 @@ use tower::{Service, ServiceBuilder};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::{
@@ -71,7 +71,7 @@ const SUPPORTED_EXCHANGES: &[&str] = &[
 /// bodies are well under 1 KiB; 32 KiB is a generous cap.
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 
-/// C30 (adversarial review 2026-05-18): total per-request timeout at the HTTP layer
+/// C30 (ZLODEY 2026-05-18): total per-request timeout at the HTTP layer
 /// (after hyper has parsed headers and dispatched into the tower stack).
 /// Body-phase slow-loris and slow-handler DoS are bounded by this.
 ///
@@ -84,7 +84,7 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024;
 /// proves /sign p99 well under 1s.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// C30.next (adversarial review 2026-05-18): TCP-level slow-loris hardening.
+/// C30.next (ZLODEY 2026-05-18): TCP-level slow-loris hardening.
 ///
 /// `header_read_timeout` bounds how long hyper will wait for the
 /// request headers to fully arrive after the TCP connection is
@@ -163,9 +163,7 @@ async fn main() -> Result<()> {
 
     let blobs = load_all_blobs(&cli)?;
     if blobs.is_empty() {
-        anyhow::bail!(
-            "no exchange blobs loaded — set --blobs-dir or --blob-path"
-        );
+        anyhow::bail!("no exchange blobs loaded — set --blobs-dir or --blob-path");
     }
     let exchange_list: Vec<&str> = blobs.keys().map(String::as_str).collect();
     info!(exchanges = ?exchange_list, "ciphertext blobs loaded");
@@ -191,7 +189,7 @@ async fn main() -> Result<()> {
     .with_data_signing_token(std::env::var("SIGNER_DATA_SIGNING_TOKEN").ok())
     .with_limits(b3_limits);
 
-    // C22 (adversarial review 2026-05-18): load bearer-token config and apply to /sign.
+    // C22 (ZLODEY 2026-05-18): load bearer-token config and apply to /sign.
     // Healthz stays unauthenticated for Cloudflare/AWS liveness probes.
     // When SIGNER_API_TOKENS is unset, AuthState::from_env logs a loud
     // warning and the middleware passes through (backward compat).
@@ -221,9 +219,31 @@ async fn main() -> Result<()> {
         .route("/cancel-all/:venue", post(handlers::post_cancel_all))
         // Binance USD-M Futures trade signing — structured order/cancel in,
         // venue-canonical signed bytes out (enclave builds canonical inside).
-        .route("/sign/binance-order", post(handlers::post_sign_binance_order))
-        .route("/sign/binance-request", post(handlers::post_sign_binance_request))
-        .route("/sign/binance-cancel", post(handlers::post_sign_binance_cancel))
+        .route(
+            "/sign/binance-order",
+            post(handlers::post_sign_binance_order),
+        )
+        .route(
+            "/sign/binance-request",
+            post(handlers::post_sign_binance_request),
+        )
+        .route(
+            "/sign/binance-cancel",
+            post(handlers::post_sign_binance_cancel),
+        )
+        // Binance SPOT trade signing (`/api/v3/order` on api.binance.com).
+        // Reuses the futures ACTIONS on purpose — the enclave takes the path
+        // from us and builds the canonical itself, so spot is a path + policy
+        // change, not new enclave code (no PCR0 rotation). See the doctrine
+        // note above these handlers, incl. why spot wants its OWN blob stem.
+        .route(
+            "/sign/binance-spot-order",
+            post(handlers::post_sign_binance_spot_order),
+        )
+        .route(
+            "/sign/binance-spot-cancel",
+            post(handlers::post_sign_binance_spot_cancel),
+        )
         // OKX v5 perp trade signing — byte-exact JSON body signed inside the
         // enclave and forwarded verbatim (re-serialization would invalidate
         // the OK-ACCESS-SIGN HMAC). Cancel is POST not DELETE.
@@ -309,7 +329,7 @@ async fn main() -> Result<()> {
         .route("/attestation", get(handlers::get_attestation))
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
 
-    // C30 (adversarial review 2026-05-18): slow-loris + connection-exhaustion hardening.
+    // C30 (ZLODEY 2026-05-18): slow-loris + connection-exhaustion hardening.
     //
     // Stack on /sign (outermost → innermost; axum applies last .layer() first):
     //   1. RequestBodyLimitLayer — 413 for oversized bodies BEFORE acquiring
@@ -349,6 +369,12 @@ async fn main() -> Result<()> {
         .await
         .context("attested-data boot self-test")?;
 
+    // E3: arm the periodic live-signature health probe (no-op if the data key
+    // isn't provisioned or the interval is 0). Clone BEFORE `state` is moved into
+    // the router below; the probe task and the handlers share the same
+    // `Arc<SignHealth>` cell.
+    spawn_sign_health_probe(state.clone());
+
     // `/attestation` (public_router) and `/healthz` ride the `app` tier — OUTSIDE
     // the dos_hardening pool that gates `/sign` — so neither can starve `/sign`.
     let app = Router::new()
@@ -362,7 +388,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {}", cli.bind))?;
     info!(local_addr = %listener.local_addr()?, "listener ready");
 
-    // C30.next (adversarial review 2026-05-18): manual accept loop with a custom
+    // C30.next (ZLODEY 2026-05-18): manual accept loop with a custom
     // hyper-util Builder configured with `http1.header_read_timeout`.
     // `axum::serve` uses hyper-util defaults which leave the header-
     // read phase unbounded — a slow-loris attacker who opens a TCP
@@ -396,35 +422,70 @@ async fn main() -> Result<()> {
 ///
 /// Skipped (logged) when the data key is not provisioned — venue-only
 /// deployments are unaffected.
-async fn data_signing_self_test(state: &AppState) -> Result<()> {
+/// Outcome of one attested-data self-sign probe (shared by the boot self-test
+/// and the E3 periodic health probe).
+enum ProbeOutcome {
+    /// Signature round-trip succeeded and the enclave key address matched.
+    Passed,
+    /// Nothing to probe — the attested-data key is not provisioned on this box.
+    Skipped(&'static str),
+    /// The probe ran but signing is broken (enclave error, key undecryptable,
+    /// address drift, or the enclave was unreachable across all attempts).
+    Failed(String),
+}
+
+const SIGN_PROBE_PAYLOAD: &str = r#"{"usenami_self_test":"boot"}"#;
+/// Boot uses many attempts (waits out enclave cold-start); the periodic probe
+/// uses few (the enclave is already up — a sustained outage should surface via
+/// staleness, and one transient blip must not spam).
+const BOOT_PROBE_ATTEMPTS: u32 = 20;
+const PERIODIC_PROBE_ATTEMPTS: u32 = 3;
+/// Default cadence of the E3 periodic self-sign probe (0 disables it).
+const DEFAULT_SIGN_PROBE_INTERVAL_SEC: u64 = 300;
+
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Run ONE attested-data self-sign probe: sign a fixed harmless payload via the
+/// enclave (`sign_data`) and assert the returned key address equals the published
+/// `SIGNER_DATA_ADDRESS`. This exercises the FULL sign path (IMDS creds → vsock →
+/// enclave KMS-decrypt-under-attestation → secp256k1 sign → attested response),
+/// so it detects a silently-broken signer that still answers vsock `ping`. It
+/// never touches a venue or places an order — the payload is a constant.
+async fn run_data_signing_probe(state: &AppState, max_attempts: u32) -> ProbeOutcome {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
 
     let Some(token) = state.data_signing_token.as_deref() else {
-        info!(
-            event = "data_signing_self_test_skipped",
-            reason = "SIGNER_DATA_SIGNING_TOKEN unset"
-        );
-        return Ok(());
+        return ProbeOutcome::Skipped("SIGNER_DATA_SIGNING_TOKEN unset");
     };
-    let expected_addr = std::env::var("SIGNER_DATA_ADDRESS")
+    let expected_addr = match std::env::var("SIGNER_DATA_ADDRESS")
         .ok()
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
-        .context(
-            "SIGNER_DATA_SIGNING_TOKEN is set but SIGNER_DATA_ADDRESS is not — \
-             cannot self-test the data key; refusing to start",
-        )?;
+    {
+        Some(a) => a,
+        None => {
+            return ProbeOutcome::Failed(
+                "SIGNER_DATA_SIGNING_TOKEN is set but SIGNER_DATA_ADDRESS is not — \
+                 cannot self-test the data key"
+                    .to_owned(),
+            )
+        }
+    };
     let scope = blob_key(DATA_SIGNING_CUSTOMER, DATA_SIGNING_STEM);
-    let blob = state.blobs.get(&scope).with_context(|| {
-        format!("data-signing provisioned but blob '{scope}' not loaded — refusing to start")
-    })?;
-
-    // Fixed canonical-v1-valid probe (all-string, dup-free).
-    let probe = r#"{"usenami_self_test":"boot"}"#;
+    let Some(blob) = state.blobs.get(&scope) else {
+        return ProbeOutcome::Failed(format!(
+            "data-signing provisioned but blob '{scope}' not loaded"
+        ));
+    };
 
     let mut last_err = String::new();
-    for attempt in 1..=20u32 {
+    for attempt in 1..=max_attempts {
         // LOW#3 (crypto-panel #211): jittered, growing backoff (cap 5s) so a
         // fleet restarting together doesn't bail in lockstep at a fixed cliff
         // when the enclave is briefly slow. Jitter from clock nanos — no rand dep.
@@ -472,7 +533,7 @@ async fn data_signing_self_test(state: &AppState) -> Result<()> {
             x402: None,
             order: None,
             cancel: None,
-            data: Some(probe.to_owned()),
+            data: Some(SIGN_PROBE_PAYLOAD.to_owned()),
             intent_signature: None,
             intent_nonce: None,
             attestation_nonce: None,
@@ -481,33 +542,131 @@ async fn data_signing_self_test(state: &AppState) -> Result<()> {
         match crate::vsock::round_trip(state.enclave.cid, state.enclave.port, &req).await {
             Ok(mut resp) => {
                 if let Some(code) = resp.error.as_deref() {
-                    anyhow::bail!(
-                        "data-signing self-test: enclave returned '{code}' — the data key is \
-                         not decryptable / misconfigured; refusing to start"
-                    );
+                    return ProbeOutcome::Failed(format!(
+                        "enclave returned '{code}' — the data key is not decryptable / misconfigured"
+                    ));
                 }
-                let attested = resp
-                    .attested
-                    .take()
-                    .context("data-signing self-test: enclave ok but no attested payload")?;
+                let Some(attested) = resp.attested.take() else {
+                    return ProbeOutcome::Failed("enclave ok but no attested payload".to_owned());
+                };
                 let got = attested.pubkey_address.trim().to_ascii_lowercase();
                 if got != expected_addr {
-                    anyhow::bail!(
-                        "data-signing self-test FAILED: enclave key address {got} != published \
-                         SIGNER_DATA_ADDRESS {expected_addr} (config drift); refusing to start"
-                    );
+                    return ProbeOutcome::Failed(format!(
+                        "enclave key address {got} != published SIGNER_DATA_ADDRESS \
+                         {expected_addr} (config drift)"
+                    ));
                 }
-                info!(event = "data_signing_self_test_passed", address = %expected_addr);
-                return Ok(());
+                return ProbeOutcome::Passed;
             }
             Err(e) => {
                 last_err = format!("vsock: {e}");
-                warn!(event = "data_signing_self_test_retry", attempt, detail = %last_err);
+                warn!(event = "data_signing_probe_retry", attempt, detail = %last_err);
                 tokio::time::sleep(backoff).await;
             }
         }
     }
-    anyhow::bail!("data-signing self-test: enclave unreachable after 20 attempts ({last_err})");
+    ProbeOutcome::Failed(format!(
+        "enclave unreachable after {max_attempts} attempts ({last_err})"
+    ))
+}
+
+/// Q2a boot self-test for attested-signed-data. If the data-signing key is
+/// provisioned (token + published address + staged blob), sign a fixed probe
+/// payload via the enclave and assert the returned key address equals the
+/// published `SIGNER_DATA_ADDRESS`. A mismatch — or an enclave that cannot
+/// decrypt the data key — means `/attestation` would publish a `data_pubkey`
+/// that buyers pin and then fail to verify against, so we FAIL LOUD (abort boot)
+/// rather than serve a drifted/garbage trust anchor.
+///
+/// Also seeds the E3 `sign_health` cell: on pass, the periodic probe is armed
+/// (`enabled`) and the first success is recorded; when the data key isn't
+/// provisioned the probe stays disabled and `/healthz` reports `sign_checked:false`.
+///
+/// Skipped (logged) when the data key is not provisioned — venue-only
+/// deployments are unaffected.
+async fn data_signing_self_test(state: &AppState) -> Result<()> {
+    match run_data_signing_probe(state, BOOT_PROBE_ATTEMPTS).await {
+        ProbeOutcome::Passed => {
+            state.sign_health.set_enabled(true);
+            state.sign_health.record_success(now_epoch_s());
+            info!(event = "data_signing_self_test_passed");
+            Ok(())
+        }
+        ProbeOutcome::Skipped(reason) => {
+            state.sign_health.set_enabled(false);
+            info!(event = "data_signing_self_test_skipped", reason);
+            Ok(())
+        }
+        ProbeOutcome::Failed(detail) => {
+            anyhow::bail!("data-signing boot self-test failed ({detail}); refusing to start")
+        }
+    }
+}
+
+/// E3: spawn the periodic self-sign health probe. No-op unless the attested-data
+/// key is provisioned (boot self-test set `sign_health.enabled`) AND the interval
+/// is > 0. On each tick it re-runs the probe and records the outcome in
+/// `sign_health`; `/healthz` publishes it and the on-box healthcheck alerts on
+/// staleness. It NEVER restarts anything — a signing outage pages an operator; it
+/// does not make the gateway flap. `SIGNER_HEALTH_SIGN_INTERVAL_SEC` overrides the
+/// cadence (0 disables).
+fn spawn_sign_health_probe(state: AppState) {
+    let interval_s = std::env::var("SIGNER_HEALTH_SIGN_INTERVAL_SEC")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SIGN_PROBE_INTERVAL_SEC);
+    if interval_s == 0 {
+        // Disable the /healthz sign-liveness view too: boot set enabled=true, but
+        // with no periodic re-probe `sign_age_s` would grow forever and the monitor
+        // would false-alert on staleness (CodeRabbit). interval=0 ⇒ not monitored.
+        state.sign_health.set_enabled(false);
+        info!(event = "sign_health_probe_disabled", reason = "interval=0");
+        return;
+    }
+    if !state.sign_health.is_enabled() {
+        info!(
+            event = "sign_health_probe_skipped",
+            reason = "attested-data key not provisioned"
+        );
+        return;
+    }
+    info!(event = "sign_health_probe_started", interval_s);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_s));
+        // Skip (don't burst) missed ticks: after a host suspend/stall the default
+        // Burst would fire back-to-back probes to "catch up" — pointless for a
+        // liveness probe and a needless enclave-sign storm (Gemini).
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The boot self-test already recorded one success; skip the immediate
+        // first tick so the first re-probe happens one interval later.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match run_data_signing_probe(&state, PERIODIC_PROBE_ATTEMPTS).await {
+                ProbeOutcome::Passed => {
+                    state.sign_health.record_success(now_epoch_s());
+                    tracing::debug!(event = "sign_health_probe_ok");
+                }
+                ProbeOutcome::Skipped(reason) => {
+                    // Shouldn't happen once enabled (token can't unset at runtime),
+                    // but treat as non-fatal and keep the last-known state.
+                    warn!(event = "sign_health_probe_skipped_runtime", reason);
+                }
+                ProbeOutcome::Failed(detail) => {
+                    state.sign_health.record_failure(now_epoch_s());
+                    let consecutive = state
+                        .sign_health
+                        .consecutive_failures
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    error!(
+                        event = "sign_health_probe_failed",
+                        consecutive,
+                        detail = %detail
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// C30.next: hard cap on concurrent TCP connections in the accept loop.
@@ -646,14 +805,12 @@ async fn serve_with_hyper_util(
             // accept loop must do it explicitly. Today no handler uses it,
             // but defensive future-proofing — audit-log middleware is a
             // natural near-term addition.
-            let hyper_svc = hyper::service::service_fn(
-                move |mut req: hyper::Request<Incoming>| {
-                    req.extensions_mut()
-                        .insert(axum::extract::ConnectInfo(peer_addr));
-                    let mut svc = svc.clone();
-                    async move { svc.call(req).await }
-                },
-            );
+            let hyper_svc = hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer_addr));
+                let mut svc = svc.clone();
+                async move { svc.call(req).await }
+            });
 
             let io = TokioIo::new(tcp);
             // serve_connection (NOT serve_connection_with_upgrades) —
@@ -730,7 +887,10 @@ fn load_blob_with_ctx(dir_path: &Path, stem: &str) -> Result<BlobBundle> {
         None
     };
     info!(stem = %stem, path = %candidate.display(), bytes = bytes.len(), has_context = encryption_context.is_some(), "blob loaded");
-    Ok(BlobBundle { ciphertext: bytes, encryption_context })
+    Ok(BlobBundle {
+        ciphertext: bytes,
+        encryption_context,
+    })
 }
 
 fn load_all_blobs(cli: &Cli) -> Result<HashMap<String, BlobBundle>> {
@@ -810,7 +970,8 @@ fn load_all_blobs(cli: &Cli) -> Result<HashMap<String, BlobBundle>> {
                     if !sub.is_dir() {
                         continue;
                     }
-                    let Some(customer) = sub.file_name().and_then(|s| s.to_str()).map(str::to_owned)
+                    let Some(customer) =
+                        sub.file_name().and_then(|s| s.to_str()).map(str::to_owned)
                     else {
                         continue;
                     };
@@ -885,7 +1046,13 @@ fn load_all_blobs(cli: &Cli) -> Result<HashMap<String, BlobBundle>> {
                 bytes = bytes.len(),
                 "legacy KuCoin blob loaded (default customer)"
             );
-            blobs.insert(kucoin_key, BlobBundle { ciphertext: bytes, encryption_context: None });
+            blobs.insert(
+                kucoin_key,
+                BlobBundle {
+                    ciphertext: bytes,
+                    encryption_context: None,
+                },
+            );
         }
     }
 
@@ -964,7 +1131,9 @@ mod tests {
         };
         let blobs = load_all_blobs(&cli).unwrap();
 
-        let default_b = blobs.get(&blob_key(DEFAULT_CUSTOMER_ID, "binance")).unwrap();
+        let default_b = blobs
+            .get(&blob_key(DEFAULT_CUSTOMER_ID, "binance"))
+            .unwrap();
         let cust_b = blobs.get(&blob_key(cust, "binance")).unwrap();
         assert_eq!(default_b.ciphertext, b"default-binance");
         assert_eq!(cust_b.ciphertext, b"custA-binance");
@@ -1054,12 +1223,12 @@ mod tests {
             "done"
         }
 
-        let app = Router::new().route("/slow", get(slow)).layer(
-            TimeoutLayer::with_status_code(
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .layer(TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,
                 Duration::from_millis(50),
-            ),
-        );
+            ));
 
         let resp = app
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -1077,12 +1246,12 @@ mod tests {
             "ok"
         }
 
-        let app = Router::new().route("/fast", get(fast)).layer(
-            TimeoutLayer::with_status_code(
+        let app = Router::new()
+            .route("/fast", get(fast))
+            .layer(TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,
                 Duration::from_secs(30),
-            ),
-        );
+            ));
 
         let resp = app
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -1276,8 +1445,7 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let app = slow_loris_test_app();
         tokio::spawn(async move {
-            let _ = serve_with_hyper_util(listener, app, header_timeout, max_connections)
-                .await;
+            let _ = serve_with_hyper_util(listener, app, header_timeout, max_connections).await;
         });
         // Tiny yield so the spawned task gets to the accept loop before
         // the test connects. Without this, connect() can race the
@@ -1299,9 +1467,7 @@ mod tests {
         let header_timeout = Duration::from_millis(200);
         let addr = spawn_test_server(header_timeout).await;
 
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect");
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
 
         // Send a partial request line + one header but NO terminating
         // \r\n\r\n. Hyper is now waiting for more bytes that we will
@@ -1315,11 +1481,7 @@ mod tests {
         // Wait longer than header_timeout. Server should drop us.
         // Use a generous slack to avoid flake on busy CI.
         let mut buf = [0u8; 1024];
-        let read_result = tokio::time::timeout(
-            Duration::from_secs(2),
-            stream.read(&mut buf),
-        )
-        .await;
+        let read_result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
 
         match read_result {
             // EOF (0 bytes) = clean close by server. This is the
@@ -1410,18 +1572,13 @@ mod tests {
         // the dropped TCP, the read should return EOF (0 bytes) or
         // an error promptly.
         let _ = excess
-            .write_all(
-                b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-            )
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
             .await;
         let _ = excess.flush().await;
 
         let mut buf = Vec::new();
-        let read_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            excess.read_to_end(&mut buf),
-        )
-        .await;
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(1), excess.read_to_end(&mut buf)).await;
 
         match read_result {
             // EOF on a refused connection — expected. The server
@@ -1461,16 +1618,12 @@ mod tests {
         let header_timeout = Duration::from_millis(500);
         let addr = spawn_test_server(header_timeout).await;
 
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect");
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
 
         // Complete the request immediately — server should respond
         // with 200 well before header_timeout.
         stream
-            .write_all(
-                b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            )
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .expect("write");
         stream.flush().await.expect("flush");

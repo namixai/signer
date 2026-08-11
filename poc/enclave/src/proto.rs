@@ -227,6 +227,31 @@ pub struct SignRequest {
     /// commits to the running trust root). `None` for every other action.
     #[serde(default)]
     pub attestation_user_data: Option<String>,
+
+    /// ROT-1 (`action == "provision_agent_key"`): the venue the minted agent key
+    /// will sign for, e.g. `hyperliquid_main`. Decides the KMS encryption
+    /// context and the sealed AAD, so it MUST equal the venue the sign path
+    /// later derives from the action — otherwise the blob is unopenable.
+    #[serde(default)]
+    pub provision_venue: Option<String>,
+
+    /// ROT-1: the tenant the minted key belongs to. Unlike the data-signing key
+    /// (a fixed SERVICE identity), an agent key is a TENANT key, so the
+    /// customer id cannot be hardcoded.
+    #[serde(default)]
+    pub provision_customer_id: Option<String>,
+
+    /// ROT-1: the policy to seal alongside the minted key, as JSON, ALREADY
+    /// signed by the baked policy authority.
+    ///
+    /// The private key is born inside and never arrives from outside; the
+    /// POLICY is the opposite — it is authored and authority-signed off-box and
+    /// travels in. Under the strict regime a money-venue policy that is not
+    /// authority-signed, or that carries no binding cap, is refused at load —
+    /// so provisioning re-runs those same checks before minting rather than
+    /// handing back a key that can never be used (ROT-9's lesson).
+    #[serde(default)]
+    pub provision_policy: Option<String>,
 }
 
 /// Freshness envelope for a `registry_refresh` request. The Ed25519 signature
@@ -335,10 +360,7 @@ impl fmt::Debug for SignRequest {
             .field("has_opaque_token", &self.opaque_token.is_some())
             // Phase 1 Stage 2: action JSON may contain wallet identifiers,
             // sub-account IDs, or order details — redact unconditionally.
-            .field(
-                "hl_action",
-                &self.hl_action.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("hl_action", &self.hl_action.as_ref().map(|_| "[REDACTED]"))
             .field("nonce", &self.nonce)
             .field("vault_address", &self.vault_address)
             .finish()
@@ -910,7 +932,10 @@ impl fmt::Debug for HyperliquidSecret {
             // harder to follow if the KMS path ever leaks log lines into
             // long-term retention.
             .field("wallet_address", &"[REDACTED]")
-            .field("vault_address", &self.vault_address.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "vault_address",
+                &self.vault_address.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -1127,6 +1152,15 @@ pub struct Policy {
     /// order in a `sign_hyperliquid_main_order` action must have its `a` listed
     /// here and its size `orders[].s` ≤ `max_size`; an order for an unlisted
     /// asset (or oversize) is denied fail-closed. Absent = no HL size cap.
+    ///
+    /// ROT-1: `max_size` bounds the ASSET's TOTAL within one action, not each
+    /// order separately — the sizes of every entry sharing an `a` are summed and
+    /// the sum is compared against the same `max_size` (`max_notional` likewise,
+    /// over `s × p`). Reduce-only entries are NOT exempt: they still execute a
+    /// trade at a requester-chosen price. So a batch of N orders on one asset
+    /// needs a cap covering their sum, and a multi-leg shape (e.g. an entry with
+    /// its take-profit/stop-loss exits) is either sized to fit the cap or sent as
+    /// separate single-order actions, each bounded on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hl_order_caps: Option<Vec<HlOrderCap>>,
 

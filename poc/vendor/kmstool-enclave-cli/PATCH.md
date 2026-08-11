@@ -21,6 +21,41 @@ patch ported, layered onto the upstream SDK tree at Docker build time. The
 SDK lib itself (which provides `aws_kms_decrypt_blocking_with_context` since
 `v0.4.2`) is built unchanged from upstream.
 
+## ROT-7 addition: the `encrypt` subcommand (2026-08-01)
+
+`genkey` **cannot** carry an EncryptionContext, and no version bump fixes that.
+The SDK exposes no `aws_kms_generate_data_key_blocking_with_context` and no
+`aws_kms_generate_data_key_blocking_from_request` — verified against upstream
+`main`, not only our pinned `v0.4.5`. The transport that would send a
+context-bearing request lives inside the SDK and is not exported.
+
+That is not academic: the enclave passed `--encryption-context` to `genkey`,
+the per-subcommand parser has no `case 'e'` in that branch, and the flag hit
+`default:` → `Unknown option` → usage → **exit before a single packet reached
+KMS**. Provisioning had never been run, so nobody noticed. Diagnosed 2026-08-01.
+
+**We did not add `case 'e'` to `genkey`.** Accepting a flag it cannot honour
+would silently produce a data key wrapped WITHOUT context, which the
+context-pinned read path can never unwrap — the failure would surface only at
+the first real signature, long after provisioning reported success. `genkey`
+keeps refusing, and its usage text now says why.
+
+Instead this fork adds an **`encrypt`** subcommand built on
+`aws_kms_encrypt_blocking_with_context`, which **does** exist upstream. The
+enclave births the DEK itself and asks KMS only to wrap it. Consequences:
+
+* the vendored **SDK stays unmodified** — the property this file protects;
+* the DEK never leaves the enclave in any form (with `GenerateDataKey` it is
+  minted by KMS and travels back, encrypted to the enclave);
+* the key policy grants `kms:Encrypt` instead of `kms:GenerateDataKey`; the
+  EncryptionContext conditions are unchanged;
+* an **empty context is a hard error** in this subcommand — see `s_parse_options`.
+  There is deliberately no no-context fallback.
+
+`encrypt_data()` mirrors `decrypt()` structurally on purpose: that function
+survived three review rounds that found real leaks in upstream's `fail_on`
+pattern, and diverging from its shape would re-open the same class of bug.
+
 ## Base version
 
 Upstream `v0.4.5` (commit `cd61b6187c8b20867ba4368d1ae62c5790c0269a`,
@@ -73,7 +108,7 @@ Apache-2.0.
 
 ## Re-applying on SDK bump
 
-When `AWS_NITRO_SDK_C_REF` in `poc/enclave/Dockerfile` is bumped:
+When `AWS_NITRO_SDK_C_REF` in `_signer/poc/enclave/Dockerfile` is bumped:
 
 1. Pull upstream tree at the new ref locally.
 2. Diff `bin/kmstool-enclave-cli/main.c` between old ref and new ref.

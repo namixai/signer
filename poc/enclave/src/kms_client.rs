@@ -246,8 +246,7 @@ pub fn decrypt(
         for k in keys {
             let v = &ctx[k];
             validate_context_pair(k, v)?;
-            cmd.arg("--encryption-context")
-                .arg(format!("{}={}", k, v));
+            cmd.arg("--encryption-context").arg(format!("{}={}", k, v));
         }
     }
 
@@ -467,7 +466,10 @@ mod rot7_encrypt_args {
     #[test]
     fn empty_context_is_refused() {
         let err = build_encrypt_args("cec983ce", "ZGVr", &HashMap::new());
-        assert!(err.is_err(), "an empty context must be refused, not defaulted");
+        assert!(
+            err.is_err(),
+            "an empty context must be refused, not defaulted"
+        );
     }
 
     /// The context is what the KMS policy pins; a pair that could shift field
@@ -497,9 +499,15 @@ mod rot7_encrypt_args {
         reversed.insert("venue_id".to_owned(), "data-signing".to_owned());
         reversed.insert("customer_id".to_owned(), "attested-data".to_owned());
         let a: Vec<String> = build_encrypt_args("k", "ZGVr", &reversed)
-            .expect("build").iter().map(|z| z.to_string()).collect();
+            .expect("build")
+            .iter()
+            .map(|z| z.to_string())
+            .collect();
         let b: Vec<String> = build_encrypt_args("k", "ZGVr", &data_signing_ctx())
-            .expect("build").iter().map(|z| z.to_string()).collect();
+            .expect("build")
+            .iter()
+            .map(|z| z.to_string())
+            .collect();
         assert_eq!(a, b);
     }
 

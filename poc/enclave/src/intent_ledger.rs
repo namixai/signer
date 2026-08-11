@@ -73,7 +73,11 @@ impl IntentLedger {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).seen.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .seen
+            .len()
     }
 }
 

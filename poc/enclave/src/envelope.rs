@@ -54,15 +54,16 @@ pub enum EnvelopeError {
 
 pub fn is_envelope(blob: &[u8]) -> bool {
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(blob) {
-        v.get("version").and_then(|v| v.as_u64()).is_some_and(|v| v >= ENVELOPE_VERSION)
+        v.get("version")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v >= ENVELOPE_VERSION)
     } else {
         false
     }
 }
 
 pub fn parse_envelope(blob: &[u8]) -> Result<Envelope, EnvelopeError> {
-    let env: Envelope =
-        serde_json::from_slice(blob).map_err(|_| EnvelopeError::JsonParse)?;
+    let env: Envelope = serde_json::from_slice(blob).map_err(|_| EnvelopeError::JsonParse)?;
     if env.version != ENVELOPE_VERSION {
         return Err(EnvelopeError::UnsupportedVersion(env.version));
     }
@@ -100,7 +101,13 @@ pub fn decrypt_with_dek(
     let nonce = Nonce::from(nonce_array);
 
     let plaintext = cipher
-        .decrypt(&nonce, Payload { msg: ciphertext.as_ref(), aad })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad,
+            },
+        )
         .map_err(|_| EnvelopeError::AesGcmDecrypt)?;
 
     Ok(Zeroizing::new(plaintext))
@@ -130,7 +137,13 @@ pub fn seal_with_dek(
     let cipher = Aes256Gcm::new_from_slice(dek).map_err(|_| EnvelopeError::AesGcmEncrypt)?;
     let nonce = Aes256Gcm::generate_nonce(OsRng); // 12 bytes from the CSPRNG
     let ciphertext = cipher
-        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| EnvelopeError::AesGcmEncrypt)?;
     Ok(Envelope {
         version: ENVELOPE_VERSION,
@@ -247,7 +260,13 @@ mod tests {
         let aad_b = b"customer_id=cust-b\nvenue_id=binance\nkey_version=1";
         let secret = b"{\"key\":\"k\"}";
         let ct = cipher
-            .encrypt(&nonce, Payload { msg: secret.as_ref(), aad: aad_a })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: secret.as_ref(),
+                    aad: aad_a,
+                },
+            )
             .unwrap();
         let env = Envelope {
             version: ENVELOPE_VERSION,
