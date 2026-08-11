@@ -143,11 +143,11 @@ ROOT_PEM_PATH = os.environ.get("NITRO_ROOT_PEM", "root.pem")
 try:
     with open(ROOT_PEM_PATH, "rb") as fh:
         ROOT_PEM = fh.read()
-except FileNotFoundError:
-    raise SystemExit(
-        f"ATTESTATION VERIFY FAILED: {ROOT_PEM_PATH} not found — run the download "
-        f"step above (curl … AWS_NitroEnclaves_Root-G1.zip && unzip) in this "
-        f"directory first, or point NITRO_ROOT_PEM at the file."
+except OSError as e:                       # not just FileNotFoundError: a
+    raise SystemExit(                      # permission/EISDIR error must not
+        f"ATTESTATION VERIFY FAILED: cannot read {ROOT_PEM_PATH} ({e}) — run "  # traceback either
+        f"the download step above (curl … AWS_NitroEnclaves_Root-G1.zip && "
+        f"unzip) in this directory first, or point NITRO_ROOT_PEM at the file."
     )
 
 # 0) Pin the AWS Nitro root before trusting anything.
