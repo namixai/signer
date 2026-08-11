@@ -100,7 +100,17 @@ if [ "${SIGNER_ROTATION_GATE}" = "1" ]; then
   # like a passed gate.
   echo "rotation gate PASSED: baked SIGNER_REQUIRE_POLICY=1 (strict)"
 else
-  echo "rotation gate DISABLED (SIGNER_ROTATION_GATE=0) — permissive build, NOT for mainnet rotation" >&2
+  # Report the MODE THAT WILL BE BAKED, not an assumption about it.
+  # SIGNER_ROTATION_GATE=0 disables the pre-build assertion only; it does NOT
+  # force SIGNER_REQUIRE_POLICY=0. Saying "permissive build" unconditionally
+  # mislabels `SIGNER_ROTATION_GATE=0 SIGNER_REQUIRE_POLICY=1`, which bakes a
+  # STRICT image — and this line gets quoted into rotation reports, so the
+  # mislabel would outlive the shell that printed it.
+  if [ "${SIGNER_REQUIRE_POLICY:-0}" = "1" ]; then
+    echo "rotation gate DISABLED (SIGNER_ROTATION_GATE=0) — building with SIGNER_REQUIRE_POLICY=1 (strict), gate assertion SKIPPED" >&2
+  else
+    echo "rotation gate DISABLED (SIGNER_ROTATION_GATE=0) — building with SIGNER_REQUIRE_POLICY=${SIGNER_REQUIRE_POLICY:-0} (permissive), NOT for mainnet rotation" >&2
+  fi
 fi
 
 # Build the deterministic builder image and copy the static binary out.

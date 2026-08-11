@@ -3955,6 +3955,68 @@ mod tests {
         }
     }
 
+    /// `reduceOnly` is futures-only: on the SPOT route it must be refused up
+    /// front, before any vsock round-trip, so no signature carrying a
+    /// futures-only field can exist for an order the operator believes is spot.
+    ///
+    /// The control case is the point. `bad_request` alone would also be produced
+    /// by a missing blob or a broken enclave target, so a single assertion could
+    /// pass with the guard deleted. The same request with `reduce_only: false`
+    /// must therefore reach PAST the guard and fail LATER (no enclave at cid 0)
+    /// with a different code — proving the first refusal came from the guard.
+    #[tokio::test]
+    async fn binance_spot_order_refuses_reduce_only_before_signing() {
+        use axum::extract::{Json, State};
+        use axum::Extension;
+
+        let cust = CUST_B;
+        let state = state_with_only_b(cust, "binance");
+        let req = |reduce_only: bool| {
+            serde_json::from_value::<crate::proto::SignBinanceOrderRequest>(serde_json::json!({
+                "key_id": "binance",
+                // snake_case on purpose: `OrderParams` is `deny_unknown_fields`,
+                // so `ordType`/`reduceOnly` are REJECTED rather than silently
+                // dropped — that guard is what keeps a typo'd caller field from
+                // flipping order semantics. Writing the fixture in camelCase
+                // fails here loudly, which is the intended behaviour.
+                "order": {
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "qty": "0.001",
+                    "ord_type": "MARKET",
+                    "reduce_only": reduce_only,
+                }
+            }))
+            .expect("request fixture must deserialize")
+        };
+
+        let denied = post_sign_binance_spot_order(
+            State(state.clone()),
+            Extension(ResolvedCustomer(cust.to_owned())),
+            Extension(RawToken("tok-b".to_owned())),
+            Json(req(true)),
+        )
+        .await;
+        assert_eq!(
+            denied.status(),
+            StatusCode::BAD_REQUEST,
+            "reduceOnly on the spot route must be refused"
+        );
+
+        let allowed = post_sign_binance_spot_order(
+            State(state),
+            Extension(ResolvedCustomer(cust.to_owned())),
+            Extension(RawToken("tok-b".to_owned())),
+            Json(req(false)),
+        )
+        .await;
+        assert_ne!(
+            allowed.status(),
+            StatusCode::BAD_REQUEST,
+            "without reduceOnly the request must get past the guard and fail later"
+        );
+    }
+
     /// Site `sign_account_read` (get_account binance/okx): same isolation.
     #[tokio::test]
     async fn account_read_customer_isolation() {

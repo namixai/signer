@@ -693,7 +693,14 @@ impl Limits {
     /// decide. Mirrors `check_and_count_order` but ACCUMULATES a value sum (not
     /// a +1 count). Attempt-counted: the charge is persisted BEFORE the enclave
     /// signs, so a concurrent/retried request cannot push the day's sum past the
-    /// cap. `key` is the SHA-256(scope) hex identifying the payer key.
+    /// cap.
+    ///
+    /// `scope` is the RAW payer scope (`customer_id/key_id`) — this function
+    /// hashes it internally. Pass it unhashed: a caller that pre-hashes would be
+    /// double-hashed here and would open a SECOND accumulator for the same payer,
+    /// so the cap would count that payer twice and enforce neither half. The doc
+    /// previously named this parameter `key` and described it as already-hashed,
+    /// which is exactly the mistake it now warns about.
     pub fn check_and_count_x402_spend(
         &self,
         scope: &str,

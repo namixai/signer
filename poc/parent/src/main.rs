@@ -229,8 +229,18 @@ enum Cmd {
     /// `{customer_id:"attested-data", venue_id:"data-signing"}` context. Writes the
     /// sealed envelope to `--out` and prints `SIGNER_DATA_PUBKEY` / `..._ADDRESS`.
     ProvisionDataKey {
-        /// KMS key id/alias to GenerateDataKey under (the signer KMS key).
-        #[arg(long, default_value = "alias/signer-poc")]
+        /// KMS key id/alias to seal the data key under. REQUIRED — there is no
+        /// default on purpose.
+        ///
+        /// This used to default to `alias/signer-poc`, the DEMO key. A mainnet
+        /// ceremony run without `--key-id` therefore went to the demo lane and
+        /// failed with `provision_wrap_failed`, which reads like a wrap defect
+        /// and not like "you addressed the wrong key" — the denial was
+        /// identity-side on a key nobody meant to touch. That cost a rotation
+        /// window half a day and produced a confident, wrong diagnosis against
+        /// the mainnet key's policy. A default that silently picks a lane is
+        /// worse than no default: the caller cannot see what it chose.
+        #[arg(long)]
         key_id: String,
         /// Path to write the sealed envelope blob (the gateway loads this).
         #[arg(long, default_value = "secrets/attested-data/data-signing.enc")]
