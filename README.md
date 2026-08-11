@@ -235,15 +235,15 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > | build | PCR0 |
 > |---|---|
 > | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `32d25d8c…` — **this is production** |
-> | `SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh` (permissive) | `9f80b8d4…` — not deployed anywhere |
+> | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh` | `9f80b8d4…` — not deployed anywhere |
 >
-> Both values are measured on this tree, not asserted. Note the permissive build
-> now needs an explicit `SIGNER_ROTATION_GATE=0`: on a rotation tree the plain
-> flagless command **refuses to build** rather than silently emit a permissive
-> image (see the note below). If your build lands on `9f80b8d4…` you have
-> reproduced the permissive image correctly and simply used the non-production
-> command; if it lands on neither, that is the interesting case and we would like
-> to hear about it.
+> Both values are measured on this tree, not asserted. Set **both** variables
+> explicitly for the permissive build: the script honours whatever
+> `SIGNER_REQUIRE_POLICY` it inherits from your shell before falling back to its
+> permissive default, so if you exported `=1` for the strict build above, passing
+> only `SIGNER_ROTATION_GATE=0` would rebuild the *strict* image. If your build
+> lands on `9f80b8d4…` you reproduced the permissive image correctly; if it lands
+> on neither, that is the interesting case and we would like to hear about it.
 >
 > The permissive PCR0 is a property of the source tree — an earlier tree measured
 > `18b6ece4…` here; on the current tree it is `9f80b8d4…`. The strict value is what
@@ -251,12 +251,17 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 >
 > ### The permissive build is gated on a rotation tree
 >
-> Running `./scripts/build-eif.sh` without the flag on this tree stops with:
-> `rotation gate — this image is PERMISSIVE (SIGNER_REQUIRE_POLICY=0). A mainnet
-> rotation image must bake exactly 1.` That is deliberate: the build itself refuses
-> to hand you a permissive image where a rotation expects the strict one. To
-> measure the permissive PCR0 anyway, ask for it explicitly with
-> `SIGNER_ROTATION_GATE=0`.
+> With `SIGNER_REQUIRE_POLICY` unset (its default is permissive), the flagless
+> `./scripts/build-eif.sh` on this tree stops with:
+>
+> ```text
+> FATAL: rotation gate — this image is PERMISSIVE (SIGNER_REQUIRE_POLICY=0).
+>        A mainnet rotation image must bake exactly 1.
+> ```
+>
+> That is deliberate: the build refuses to hand you a permissive image where a
+> rotation expects the strict one. To measure the permissive PCR0 anyway, ask for
+> it explicitly with `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0`.
 >
 > This README previously showed the flagless command next to a production PCR0, so
 > anyone following it byte-for-byte got a mismatch and had every reason to conclude

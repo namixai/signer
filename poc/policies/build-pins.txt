@@ -32,8 +32,10 @@
 # ⚠️ The measurement also depends on SIGNER_REQUIRE_POLICY, which is BAKED INTO
 # THE IMAGE. The permissive build is a DIFFERENT enclave and measures 9f80b8d4…
 # on this tree (an earlier tree measured 18b6ece4…). On a rotation tree the
-# flagless build now REFUSES to run — build permissive explicitly with
-# SIGNER_ROTATION_GATE=0. See "Reproducible build" in the top-level README.
+# flagless build now REFUSES to run — build permissive explicitly, setting BOTH
+# variables so an inherited SIGNER_REQUIRE_POLICY=1 can't silently make it strict:
+#   SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh
+# See "Reproducible build" in the top-level README.
 #
 # The authority for what is running is /attestation — an NSM-signed COSE
 # document — not this file and not the README.
