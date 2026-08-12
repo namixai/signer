@@ -241,11 +241,13 @@ The demo measurement has two independent sources, in increasing order of trust:
   to match this value. A permissive (`SIGNER_REQUIRE_POLICY=0`) image measures to a
   *different* PCR0.
 
-- **The on-chain registry** (Base `UsenamiAttestationRegistry`) — an anchor nobody,
-  including us, can rewrite after the fact. Since the 2026-08-10 rotation the
-  measurement above **is** registered and the demo's `/attestation` returns
-  `registered_onchain: true`; read it yourself with Part 1.3 rather than taking
-  that field's word for it. (Earlier revisions of this page said the demo was not
+- **The on-chain registry** (Base `UsenamiAttestationRegistry`) — a public,
+  timestamped record whose **event log** cannot be rewritten after the fact.
+  (The *current* active-owner lookup is mutable state, and registration is
+  permissionless — so check the owner address, not just the boolean; Part 1.3
+  spells this out.) Since the 2026-08-10 rotation the measurement above **is**
+  registered and the demo's `/attestation` returns `registered_onchain: true`;
+  read it yourself rather than taking that field's word for it. (Earlier revisions of this page said the demo was not
   on-chain and told you a chain lookup did not apply to it. That was true when
   written and is false now — corrected rather than quietly amended.)
 
@@ -292,9 +294,46 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" "0x${PCR0}" --rpc-url https://mainnet.base.org
 ```
 
-`active = true` means this exact measurement is the one the registry currently
-records. It does **not** by itself prove the live endpoint runs it — that is Part 1's
-job; the two together are what make the chain record meaningful.
+🔴 **Read `active` for what it is: current, mutable state — and check the `owner`.**
+`registerPCR0` is permissionless: **any** address may register an unclaimed
+measurement and becomes its owner, and an owner may register a new measurement,
+which auto-deprecates their previous one. So `active = true` on its own says
+"someone has this measurement registered right now", not "Usenami vouches for it".
+Two things make it meaningful:
+
+1. **The `owner` must be the canonical Usenami address**
+   `0x21538eBF6598e5866BA496A954dE8E39097bFB59` (published in the repository
+   [README](../README.md) and [DEMO.md](../DEMO.md)) — compare it yourself; a
+   measurement registered by any other address proves nothing about us.
+2. **The append-only part is the event log, not this getter.** Registrations and
+   deprecations emit `PCR0Registered` / `PCR0Deprecated`; those logs and their
+   blocks cannot be rewritten after the fact, while the mapping this call reads
+   can change with the next registration. For an anchor in time, read the event:
+
+```bash
+# The registration of the current measurement: Base block 49836503,
+# tx 0x8841d01ce96d04a4c0e7d2afdf7377d3aac8382bac12a7c108d6c052052658cf
+# topic0 = keccak256("PCR0Registered(address,bytes32,bytes,bytes32,string)")
+# topic2 = keccak256(<the 48 raw PCR0 bytes>)
+curl -s https://mainnet.base.org -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{
+    "address":"0x38b42eED740b0fDeb211bBDf773F2238cAEec240",
+    "topics":[
+      "0x40074e27ec69a03db88f79da96749aa2d4c9477ae4339f6abf42bf0056d2e267",
+      null,
+      "0x9b974b9779f0b2b7bbd99892762eee82913d8d17b4b27af15278605b74b1f27e"],
+    "fromBlock":"0x2f87173","toBlock":"0x2f8723b"}]}'
+# topics[1] is the owner, left-padded — expect …21538ebf6598e5866ba496a954de8e39097bfb59
+```
+
+⚠️ Public Base RPCs cap `eth_getLogs` at a **10 000-block range** — `fromBlock:"0x0"`
+is rejected outright, and so is `"toBlock":"latest"` once the chain has moved 10 000
+blocks past your start. The window above (`49836403`–`49836603`) brackets the
+registration; to find a *later* rotation's event, scan forward in ≤10 000-block steps.
+
+Finally, none of this proves the live endpoint *runs* that image — that is Part 1's
+job. The chain record is only meaningful together with a live attestation you
+verified yourself.
 
 ---
 
