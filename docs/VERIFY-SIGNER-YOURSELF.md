@@ -47,10 +47,10 @@ certificate and read PCR0 out of the *signed* document.
 4. **Verify the COSE `ES384` signature** with the leaf public key over the
    `Signature1` structure.
 5. **Read PCR0** from the *verified* `pcrs[0]` and compare it to the value you expect
-   — either your **own reproducible rebuild** (Part 2, trusts no one) or the value
-   this document publishes below. (The demo is testnet and not on-chain; the on-chain
-   registry is a production anchor — see [Where the expected PCR0 comes
-   from](#where-the-expected-pcr0-comes-from).)
+   — your **own reproducible rebuild** (Part 2, trusts no one), the value this
+   document publishes below, or the **on-chain registry** (Part 1.3 — since the
+   2026-08-10 rotation the demo measurement is registered too). See [Where the
+   expected PCR0 comes from](#where-the-expected-pcr0-comes-from).
 6. **Check the nonce** inside the verified document equals the one you sent (proves
    it is fresh, not a replay).
 
@@ -119,6 +119,36 @@ EXPECTED_PCR0 = os.environ.get(
     "EXPECTED_PCR0",
     "32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103",
 ).strip().lower()
+
+# The endpoint to query, and the root pin to hold it to. These are read from the
+# SAME environment variable names the bash block below offers — an earlier
+# revision of this page used different names internally (and did not define them
+# at all), so the documented `SIGNER_URL=…` had no effect and the script died on
+# a NameError before its first check. Overriding BASE means overriding
+# EXPECTED_PCR0 too — see the note above.
+BASE = os.environ.get("SIGNER_URL", "https://signer-demo.usenami.io:8443").strip().rstrip("/")
+
+# The pin you confirmed OUT-OF-BAND in the bash block above. Keeping it here as a
+# default (rather than only in a variable) is what makes this script runnable as
+# published; supply NITRO_ROOT_SHA256 to hold it to a value YOU sourced.
+ROOT_SHA256 = os.environ.get(
+    "NITRO_ROOT_SHA256",
+    "6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0",
+).strip().lower()
+
+# root.pem is the file the bash block above downloaded and hashed. Read it from
+# disk rather than embedding it: a certificate pasted into a document is exactly
+# the kind of thing that silently goes stale.
+ROOT_PEM_PATH = os.environ.get("NITRO_ROOT_PEM", "root.pem")
+try:
+    with open(ROOT_PEM_PATH, "rb") as fh:
+        ROOT_PEM = fh.read()
+except OSError as e:                       # not just FileNotFoundError: a
+    raise SystemExit(                      # permission/EISDIR error must not
+        f"ATTESTATION VERIFY FAILED: cannot read {ROOT_PEM_PATH} ({e}) — run "  # traceback either
+        f"the download step above (curl … AWS_NitroEnclaves_Root-G1.zip && "
+        f"unzip) in this directory first, or point NITRO_ROOT_PEM at the file."
+    )
 
 # 0) Pin the AWS Nitro root before trusting anything.
 check(hashlib.sha256(ROOT_PEM).hexdigest() == ROOT_SHA256, "Nitro root cert hash mismatch")
@@ -211,14 +241,99 @@ The demo measurement has two independent sources, in increasing order of trust:
   to match this value. A permissive (`SIGNER_REQUIRE_POLICY=0`) image measures to a
   *different* PCR0.
 
-> **The demo is testnet and is NOT registered on-chain** (its `/attestation` returns
-> `registered_onchain: false`). On-chain PCR0 registration (the Base
-> `UsenamiAttestationRegistry`) is a **production/mainnet** anchor, not a demo one —
-> so for the demo, trust your rebuild, not a chain lookup. A PCR0 changes whenever any
-> build pin changes; that is a re-attestation event, never a silent swap.
+- **The on-chain registry** (Base `UsenamiAttestationRegistry`) — a public,
+  timestamped record whose **event log** cannot be rewritten after the fact.
+  (The *current* active-owner lookup is mutable state, and registration is
+  permissionless — so check the owner address, not just the boolean; Part 1.3
+  spells this out.) Since the 2026-08-10 rotation the measurement above **is**
+  registered and the demo's `/attestation` returns `registered_onchain: true`;
+  read it yourself rather than taking that field's word for it. (Earlier revisions of this page said the demo was not
+  on-chain and told you a chain lookup did not apply to it. That was true when
+  written and is false now — corrected rather than quietly amended.)
+
+> A PCR0 changes whenever any build pin changes; that is a re-attestation event
+> (KMS re-allow + on-chain re-register), never a silent swap.
 
 The deeper auditor-facing walkthrough (COSE structure, references) follows the
 AWS Nitro attestation documentation and the enclave source (`poc/enclave/`).
+
+### 1.3 Check the measurement against the on-chain registry
+
+The `UsenamiAttestationRegistry` is live on **Base mainnet** at
+`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`
+([source](../poc/contracts/src/UsenamiAttestationRegistry.sol)). It answers one
+question: *is this measurement currently registered as active, and by whom.*
+
+```solidity
+function isPCR0Active(bytes calldata pcr0) external view returns (bool active, address owner);
+```
+
+🔴 **The parameter is the raw 48 BYTES, not the 96-character hex string.** The
+contract enforces `pcr0.length == 48` and reverts `InvalidPCR0Length()` otherwise,
+so passing the hex text (96 bytes) reverts — which reads like a broken contract and
+is really an encoding mistake. It returns **two** values; decode both.
+
+```bash
+# Read-only eth_call — no key, no wallet, nothing is sent or created.
+# 0x05d85549 = selector of isPCR0Active(bytes); then offset=32, length=48, the
+# 48 raw bytes, right-padded to a 32-byte boundary.
+PCR0=32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
+curl -s https://mainnet.base.org -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"eth_call","params":[{
+    "to":"0x38b42eED740b0fDeb211bBDf773F2238cAEec240",
+    "data":"0x05d85549'"$(printf '%064x' 32)$(printf '%064x' 48)${PCR0}$(printf '%032x' 0)"'"
+  },"latest"]}'
+# → {"result":"0x0000…0001 0000…21538ebf6598e5866ba496a954de8e39097bfb59"}
+#      first word = active (1 = true), second = owner address
+```
+
+With `cast` (Foundry), which does the encoding for you:
+
+```bash
+cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
+  "isPCR0Active(bytes)(bool,address)" "0x${PCR0}" --rpc-url https://mainnet.base.org
+```
+
+🔴 **Read `active` for what it is: current, mutable state — and check the `owner`.**
+`registerPCR0` is permissionless: **any** address may register an unclaimed
+measurement and becomes its owner, and an owner may register a new measurement,
+which auto-deprecates their previous one. So `active = true` on its own says
+"someone has this measurement registered right now", not "Usenami vouches for it".
+Two things make it meaningful:
+
+1. **The `owner` must be the canonical Usenami address**
+   `0x21538eBF6598e5866BA496A954dE8E39097bFB59` (published in the repository
+   [README](../README.md) and [DEMO.md](../DEMO.md)) — compare it yourself; a
+   measurement registered by any other address proves nothing about us.
+2. **The append-only part is the event log, not this getter.** Registrations and
+   deprecations emit `PCR0Registered` / `PCR0Deprecated`; those logs and their
+   blocks cannot be rewritten after the fact, while the mapping this call reads
+   can change with the next registration. For an anchor in time, read the event:
+
+```bash
+# The registration of the current measurement: Base block 49836503,
+# tx 0x8841d01ce96d04a4c0e7d2afdf7377d3aac8382bac12a7c108d6c052052658cf
+# topic0 = keccak256("PCR0Registered(address,bytes32,bytes,bytes32,string)")
+# topic2 = keccak256(<the 48 raw PCR0 bytes>)
+curl -s https://mainnet.base.org -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{
+    "address":"0x38b42eED740b0fDeb211bBDf773F2238cAEec240",
+    "topics":[
+      "0x40074e27ec69a03db88f79da96749aa2d4c9477ae4339f6abf42bf0056d2e267",
+      null,
+      "0x9b974b9779f0b2b7bbd99892762eee82913d8d17b4b27af15278605b74b1f27e"],
+    "fromBlock":"0x2f87173","toBlock":"0x2f8723b"}]}'
+# topics[1] is the owner, left-padded — expect …21538ebf6598e5866ba496a954de8e39097bfb59
+```
+
+⚠️ Public Base RPCs cap `eth_getLogs` at a **10 000-block range** — `fromBlock:"0x0"`
+is rejected outright, and so is `"toBlock":"latest"` once the chain has moved 10 000
+blocks past your start. The window above (`49836403`–`49836603`) brackets the
+registration; to find a *later* rotation's event, scan forward in ≤10 000-block steps.
+
+Finally, none of this proves the live endpoint *runs* that image — that is Part 1's
+job. The chain record is only meaningful together with a live attestation you
+verified yourself.
 
 ---
 
@@ -236,7 +351,8 @@ Reproducibility is engineered, not incidental:
 - **Toolchain pinned exact** (`rust-toolchain.toml`), builder base image pinned by
   **digest** (not a floating tag), fully static musl binary.
 - **All external sources pinned by commit SHA / digest** — every `git clone` in the
-  Dockerfile is a `git checkout <commit>`; recorded in `policies/build-pins.txt`.
+  Dockerfile is a `git checkout <commit>`; recorded in
+  [`poc/policies/build-pins.txt`](../poc/policies/build-pins.txt).
 - **`Cargo.lock` committed + `cargo build --locked`** — dependency versions cannot
   drift; vendored NSM deps built `--offline --locked`.
 - **Timestamp / locale / umask pinned** (`SOURCE_DATE_EPOCH`, `LC_ALL=C`, `TZ=UTC`,
@@ -312,12 +428,12 @@ deny-without-attestation statement is present on every money-path key, then the
 source you read is the only image that can ever decrypt your key — no trust in
 Usenami required at any link.**
 
-> **Which links apply to the demo vs. production.** The loop above is the
-> **production/mainnet** property. The public **demo is testnet**: its enclave is
-> not registered on-chain (`registered_onchain: false`, so the `PCR0_onchain` link
-> does not apply to the demo), and the KMS money-gate is exercised against testnet
-> keys. On the demo you can still verify `PCR0_rebuilt == PCR0_live` (Parts 1–2) —
-> the on-chain + KMS-money-gate links close on the production deployment.
+> **Which links apply to the demo vs. production.** The public **demo is testnet**,
+> and its KMS money-gate is exercised against testnet keys — that link closes on the
+> production deployment. The other three you can check on the demo yourself:
+> `PCR0_rebuilt` (Part 2), `PCR0_live` (Part 1), and — since the 2026-08-10 rotation,
+> when the demo measurement was registered — `PCR0_onchain` (Part 1.3). An earlier
+> revision of this page said the on-chain link did not apply to the demo; it does now.
 
 ---
 
