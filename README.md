@@ -102,34 +102,43 @@ sdk/
 
 ## On-chain trust anchor
 
-> ## ⚠️ THE ON-CHAIN ANCHOR IS STALE — READ THIS BEFORE USING IT
+> ## The registry now tracks the running enclave again — and an earlier revision of this page did not
 >
-> Measured against Base on 2026-08-11, after the rotation:
+> Measured against Base on **2026-08-12** by the `cast` call below:
 >
-> | PCR0 | `isPCR0Active` |
+> | PCR0 | `isPCR0Active` → `(active, owner)` |
 > |---|---|
-> | `7c9e8b26…` (registered, no longer running) | **true** |
-> | `32d25d8c…` (**currently running**) | **false** |
-> | `ff53e1fe…` (retired 2026-08-10) | **false** |
+> | `32d25d8c…` (**currently running**, both demo and production) | **`(true, 0x21538eBF…)`** |
+> | `7c9e8b26…` (registered 2026-06-23, auto-deprecated) | `(false, 0x0000…0000)` |
+> | `ff53e1fe…` (retired 2026-08-10) | `(false, 0x0000…0000)` |
 >
-> The registry marks an old measurement active and does not know the one actually
-> serving. The dangerous failure mode is not the obvious one: a careful verifier
-> compares the LIVE attestation against the chain, gets `false`, and correctly refuses.
-> A careless one compares this README's number against the chain, sees them agree, and
-> concludes it verified something — **two stale sources agreeing looks exactly like
-> verification.**
+> **Why this notice stays.** Between the 2026-08-10 rotation and the re-registration,
+> this section told you the opposite — that `7c9e8b26…` was the active value — and it
+> published `7c9e8b26…` as the number to paste. Copy-pasting it today returns `false`.
+> The failure mode was the quiet one: a careless verifier compares *this page's* number
+> against the chain, sees two stale sources agree, and concludes it verified something.
+> **Two sources agreeing looks exactly like verification.** The fix is not to trust this
+> table either — it is to take the measurement from the live `/attestation` document and
+> put *that* into the call.
 >
-> Until a fresh registration lands, treat the on-chain check as **not satisfiable** and
-> rely on `/attestation` verified against the AWS Nitro root. Published rather than
-> quietly re-pointed, because the point of this section is that you should not have to
-> take our word for it.
+> The correction is published rather than quietly swapped, because the point of this
+> section is that you should not have to take our word for it.
 
-An immutable registry on Base exists for exactly this purpose, subject to the staleness
-above:
+A public registry on Base records which measurement an address claims. Read what it
+actually guarantees before leaning on it:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
-- **Owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Registered PCR0 (STALE — not the running enclave)**: `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
+- **Canonical owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
+- **Currently registered and running PCR0**: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
+
+> 🔴 **`isPCR0Active` reads mutable state, and `registerPCR0` is permissionless.** Any
+> address may register an unclaimed measurement and becomes its owner; an owner's next
+> registration auto-deprecates their previous one. So `active = true` means "somebody
+> has this measurement registered right now" — **not** "Usenami vouches for this
+> enclave". What no one can rewrite after the fact is the **event log**
+> (`PCR0Registered` / `PCR0Deprecated`) and the blocks carrying it. Two things make a
+> `true` meaningful: the `owner` equals the canonical address above, and the
+> registration event is where and when it claims to be.
 
 ### How to verify (the correct way — read this carefully)
 
@@ -140,10 +149,22 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375 \
+  0x32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103 \
   --rpc-url https://mainnet.base.org
-# → (true, 0x21538eBF6598e5866BA496A954dE8E39097bFB59)
+# → true
+#   0x21538eBF6598e5866BA496A954dE8E39097bFB59
+# BOTH lines must match: `false` or a different owner = stop, do not use the service.
 ```
+
+The argument is the raw **48 bytes** — `cast` encodes the `0x…` literal for you. Passing
+the 96-character hex *text* is 96 bytes and reverts `InvalidPCR0Length()`, which reads
+like a broken contract and is really an encoding mistake.
+
+Best practice is to feed this call the PCR0 you read out of the **verified live
+attestation document**, not the constant printed above — that is what turns the two into
+a cross-check instead of two copies of the same claim. See
+[`docs/VERIFY-SIGNER-YOURSELF.md`](./docs/VERIFY-SIGNER-YOURSELF.md) §1.3, which also
+shows how to read the immutable registration **event** rather than the mutable getter.
 
 ⚠️ **Critical: strict-compare the owner address.** If your code just checks `if (active) accept` and ignores the owner, an attacker can register the same 48 bytes after we deprecate and you will accept their fake attestation. The canonical Usenami owner is:
 
