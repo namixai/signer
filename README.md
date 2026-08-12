@@ -132,7 +132,7 @@ actually guarantees before leaning on it:
 - **Currently registered and running PCR0**: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
 
 > 🔴 **`isPCR0Active` reads mutable state, and `registerPCR0` is permissionless.** Any
-> address may register an unclaimed measurement and becomes its owner; an owner's next
+> address may register an unclaimed measurement and become its owner; an owner's next
 > registration auto-deprecates their previous one. So `active = true` means "somebody
 > has this measurement registered right now" — **not** "Usenami vouches for this
 > enclave". What no one can rewrite after the fact is the **event log**

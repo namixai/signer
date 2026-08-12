@@ -287,7 +287,7 @@ Translation: *the registry reports PCR0 32d25d8c… as active right now, with ow
 
 🔴 **Both lines matter, and the second one carries the weight.** `registerPCR0` is
 permissionless: **any** address can register a measurement nobody currently holds and
-becomes its owner. `true` on its own therefore means "somebody has this registered at
+become its owner. `true` on its own therefore means "somebody has this registered at
 this moment" — it is not Usenami vouching for anything. Compare the owner against the
 canonical address yourself; a `true` owned by any other address proves nothing about
 us. Code that does `if (active) accept` and ignores the owner is exploitable.
@@ -296,7 +296,7 @@ us. Code that does `if (active) accept` and ignores the owner is exploitable.
 that changes with the next registration or deprecation. The part that cannot be
 rewritten is the **event log** — `PCR0Registered` / `PCR0Deprecated` and the blocks
 carrying them. If you want an anchor in time rather than a snapshot of now, read the
-event with `eth_getLogs`; [`docs/VERIFY-SIGNER-YOURSELF.md`](https://github.com/namixai/signer/blob/main/docs/VERIFY-SIGNER-YOURSELF.md) §1.3 gives the exact query.
+event with `eth_getLogs`; [`docs/VERIFY-SIGNER-YOURSELF.md`](./docs/VERIFY-SIGNER-YOURSELF.md) §1.3 gives the exact query.
 
 **What this call does and does not prove.** It proves that *the address we publish
 has this value registered right now*. It does **not** prove that value is running:
