@@ -227,25 +227,30 @@ smart contract on Base mainnet. Since the 2026-08-10 rotation the demo
 endpoint above runs the SAME image as production and attests the SAME
 measurement, so one number covers both — you verify it live by requesting
 an attestation from the endpoint (see *The Nitro attestation document*
-below). Note that the on-chain record itself is currently behind:
+below). The on-chain record tracks that same measurement again as of
+2026-08-12:
 
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
   (source verified on Basescan)
-- Registered PCR0 — ⚠️ **STALE, not the running enclave** (measured 2026-08-06:
-  `isPCR0Active` returns true for this value and false for the one actually
-  serving). Treat the on-chain check as **not satisfiable** until a fresh
-  registration lands, and verify against `/attestation` instead:
-  `7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375`
+- Registered PCR0 — the one now running, on the demo endpoint and in
+  production alike:
+  `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
 - Canonical owner address:
   `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
 
-**Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required)** — ⚠️ **but read what a `true` here means today.** The command below queries the STALE registered value, so it returns `true` and proves only that this value is registered. It says nothing about the enclave now serving. Two stale sources agreeing looks exactly like verification; the check that actually binds is `/attestation` against the AWS Nitro root.
+> ⚠️ **An earlier revision of this page printed `7c9e8b26…` here** and told you to
+> expect `true`. That value was auto-deprecated by the 2026-08-10 rotation; pasting
+> it today returns `false`. If you followed this page between the rotation and this
+> correction, re-run the command below with the value above. The correction is
+> published, not quietly swapped.
+
+**Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required)** — and read carefully what a `true` here does and does not mean; the paragraphs after the command spell it out.
 
 ```bash
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x7c9e8b26a8f6af6e6109faeff1ed4313f332735f6b7aacce7795461de656c84a70f3761d806738121accaf171f329375 \
+  0x32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103 \
   --rpc-url https://mainnet.base.org
 ```
 
@@ -277,18 +282,34 @@ true
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-Translation: *the registry reports PCR0 7c9e8b26… as active, registered by
-0x21538eBF…, the canonical owner address Usenami publishes.*
+Translation: *the registry reports PCR0 32d25d8c… as active right now, with owner
+0x21538eBF…, the canonical address Usenami publishes.*
 
-⚠️ "Active **in the registry**" is not "running". As of 2026-08-06 this entry is
-stale: it does not correspond to the enclave now serving. The registry proves who
-registered a value, not that the value is live — for that, read `/attestation`.
+🔴 **Both lines matter, and the second one carries the weight.** `registerPCR0` is
+permissionless: **any** address can register a measurement nobody currently holds and
+become its owner. `true` on its own therefore means "somebody has this registered at
+this moment" — it is not Usenami vouching for anything. Compare the owner against the
+canonical address yourself; a `true` owned by any other address proves nothing about
+us. Code that does `if (active) accept` and ignores the owner is exploitable.
 
-**What this call does and does not prove.** It proves that *someone we
-control registered this value*. It does **not** prove that value is
-running: swap the enclave and leave the registry untouched, and this
-call keeps returning `true` for the old measurement — the chain has no
-way to notice. That is not hypothetical; it is the state today.
+⚠️ **`active` is mutable state, not a historical fact.** The getter reads a mapping
+that changes with the next registration or deprecation. The part that cannot be
+rewritten is the **event log** — `PCR0Registered` / `PCR0Deprecated` and the blocks
+carrying them. The getter tells you what is true this second; only the event tells you
+*when* it became true and who made it so. **For anything past a smoke test, do not stop
+at the getter** — require a matching `PCR0Registered` event carrying this measurement,
+the canonical owner in `topics[1]`, and the block or transaction it landed in.
+[`docs/VERIFY-SIGNER-YOURSELF.md`](./docs/VERIFY-SIGNER-YOURSELF.md) §1.3 gives the exact
+`eth_getLogs` query. Keep that check separate from the live `/attestation` measurement:
+they fail independently, which is the entire reason to run both.
+
+**What this call does and does not prove.** It proves that *the address we publish
+has this value registered right now*. It does **not** prove that value is running:
+swap the enclave and leave the registry untouched, and this call keeps returning
+`true` for the old measurement — the chain has no way to notice. That is not
+hypothetical. It happened here between 2026-08-10 and 2026-08-12: the enclave rotated
+to `32d25d8c…` while this page still pointed at the old `7c9e8b26…`, so the document
+and the chain agreed with each other and disagreed with reality.
 
 So the registry is one half of a pair, and the half that moves is the
 other one: `/attestation` reports what the enclave *actually* measures,
@@ -344,16 +365,28 @@ deployment.
 
 ### Registry governance — who can change what's on-chain
 
-The contract that holds the active PCR0 list is permissionless to read
-but the registration calls require ownership. Today, ownership of the
-canonical Usenami PCR0 sits on a **single externally-owned account**:
-`0x21538eBF6598e5866BA496A954dE8E39097bFB59`. This is Phase 1
-governance.
+The contract is permissionless to read, and **`registerPCR0` is
+permissionless to call as well** — any address may claim a measurement
+nobody currently holds and becomes recorded as its owner
+(`UsenamiAttestationRegistry.sol`, no access modifier; the caller is
+simply `msg.sender`). Only **`deprecatePCR0` is owner-gated**: it reverts
+`NotOwnerOfPCR0()` for anyone but the address that registered that
+measurement. This is why every check above compares the returned `owner`
+rather than the boolean — "registered" is not a privilege, so it is not
+evidence about us on its own.
+
+Today the canonical Usenami PCR0 is registered from a **single
+externally-owned account**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`.
+That is Phase 1 governance.
 
 A sophisticated adversary does not need to compromise the enclave —
 they only need to compromise that one private key, then call
 `deprecatePCR0` followed by `registerPCR0` with a malicious PCR0 under
-the same address. The on-chain `isPCR0Active` check would still pass.
+the same address. The on-chain `isPCR0Active` check would still pass,
+**and so would the owner comparison** — which is precisely why the chain
+is one half of a pair and the live `/attestation` measurement is the
+other. A stolen key can rewrite what the registry says is active today;
+it cannot make a Nitro enclave attest a measurement it is not running.
 
 Mitigations in flight:
 - **Phase 1 (now)**: the deploy key is on a hardware-isolated Rabby
