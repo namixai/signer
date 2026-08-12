@@ -295,8 +295,13 @@ us. Code that does `if (active) accept` and ignores the owner is exploitable.
 ⚠️ **`active` is mutable state, not a historical fact.** The getter reads a mapping
 that changes with the next registration or deprecation. The part that cannot be
 rewritten is the **event log** — `PCR0Registered` / `PCR0Deprecated` and the blocks
-carrying them. If you want an anchor in time rather than a snapshot of now, read the
-event with `eth_getLogs`; [`docs/VERIFY-SIGNER-YOURSELF.md`](./docs/VERIFY-SIGNER-YOURSELF.md) §1.3 gives the exact query.
+carrying them. The getter tells you what is true this second; only the event tells you
+*when* it became true and who made it so. **For anything past a smoke test, do not stop
+at the getter** — require a matching `PCR0Registered` event carrying this measurement,
+the canonical owner in `topics[1]`, and the block or transaction it landed in.
+[`docs/VERIFY-SIGNER-YOURSELF.md`](./docs/VERIFY-SIGNER-YOURSELF.md) §1.3 gives the exact
+`eth_getLogs` query. Keep that check separate from the live `/attestation` measurement:
+they fail independently, which is the entire reason to run both.
 
 **What this call does and does not prove.** It proves that *the address we publish
 has this value registered right now*. It does **not** prove that value is running:
@@ -360,16 +365,28 @@ deployment.
 
 ### Registry governance — who can change what's on-chain
 
-The contract that holds the active PCR0 list is permissionless to read
-but the registration calls require ownership. Today, ownership of the
-canonical Usenami PCR0 sits on a **single externally-owned account**:
-`0x21538eBF6598e5866BA496A954dE8E39097bFB59`. This is Phase 1
-governance.
+The contract is permissionless to read, and **`registerPCR0` is
+permissionless to call as well** — any address may claim a measurement
+nobody currently holds and becomes recorded as its owner
+(`UsenamiAttestationRegistry.sol`, no access modifier; the caller is
+simply `msg.sender`). Only **`deprecatePCR0` is owner-gated**: it reverts
+`NotOwnerOfPCR0()` for anyone but the address that registered that
+measurement. This is why every check above compares the returned `owner`
+rather than the boolean — "registered" is not a privilege, so it is not
+evidence about us on its own.
+
+Today the canonical Usenami PCR0 is registered from a **single
+externally-owned account**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`.
+That is Phase 1 governance.
 
 A sophisticated adversary does not need to compromise the enclave —
 they only need to compromise that one private key, then call
 `deprecatePCR0` followed by `registerPCR0` with a malicious PCR0 under
-the same address. The on-chain `isPCR0Active` check would still pass.
+the same address. The on-chain `isPCR0Active` check would still pass,
+**and so would the owner comparison** — which is precisely why the chain
+is one half of a pair and the live `/attestation` measurement is the
+other. A stolen key can rewrite what the registry says is active today;
+it cannot make a Nitro enclave attest a measurement it is not running.
 
 Mitigations in flight:
 - **Phase 1 (now)**: the deploy key is on a hardware-isolated Rabby
