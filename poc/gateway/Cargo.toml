@@ -24,7 +24,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 # HTTP server
-axum = "0.7"
+axum = "0.8"
 # C30.next: hyper-util Builder lets us set http1_header_read_timeout
 # (axum::serve uses defaults that don't bound TCP-level slow-loris).
 # `tokio` for the Tokio runtime adapter (TokioIo, TokioTimer). We use
