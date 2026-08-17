@@ -53,7 +53,7 @@ parking_lot = "0.12"
 # `aws s3 cp` in the systemd unit's ExecStartPre), and the gateway reads
 # the file path from `SIGNER_BLOB_PATH`. That keeps the gateway dep set
 # small and removes a SigV4 surface from the auditable binary.
-reqwest = { version = "=0.12.5", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 http = "1"
 
 # Pin away from `idna_adapter >= 1.2.2` and friends — those require
