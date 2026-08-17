@@ -38,7 +38,7 @@ jobs:
     permissions:
       contents: write # gh release upload (release event only)
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Isolate the job's contents:write token from SBOM generation — the
           # release upload below authenticates via GH_TOKEN, not the persisted
@@ -48,7 +48,7 @@ jobs:
         run: rustup show
       - name: Install cargo-cyclonedx (prebuilt)
         # PREBUILT binary — no per-run source compile. SHA-pinned + Dependabot-tracked.
-        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
           tool: cargo-cyclonedx
       - name: Generate SBOM (enclave target)
@@ -57,7 +57,7 @@ jobs:
         # Default naming yields distinct files: poc/<crate>/signer-<crate>.cdx.json
         run: cargo cyclonedx --format json --spec-version 1.5 --target x86_64-unknown-linux-musl
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-cyclonedx
           path: poc/**/*.cdx.json
