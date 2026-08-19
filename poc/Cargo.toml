@@ -22,7 +22,7 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # Phase 1 Stage 2 — EIP-712 signing (Hyperliquid family).
 # Pinned minor versions so cargo --offline --locked picks identical deps
