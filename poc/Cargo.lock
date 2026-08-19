@@ -1856,7 +1856,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "icu_collections 1.5.0",
+ "icu_collections 2.1.1",
  "icu_locid",
  "icu_locid_transform",
  "icu_normalizer",
