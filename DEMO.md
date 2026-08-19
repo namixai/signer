@@ -367,7 +367,7 @@ deployment.
 
 The contract is permissionless to read, and **`registerPCR0` is
 permissionless to call as well** — any address may claim a measurement
-nobody currently holds and becomes recorded as its owner
+nobody currently holds and become recorded as its owner
 (`UsenamiAttestationRegistry.sol`, no access modifier; the caller is
 simply `msg.sender`). Only **`deprecatePCR0` is owner-gated**: it reverts
 `NotOwnerOfPCR0()` for anyone but the address that registered that
