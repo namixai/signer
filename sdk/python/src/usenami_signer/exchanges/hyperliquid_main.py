@@ -40,9 +40,10 @@ class HyperliquidMainExchange(BaseExchange):
       - ``cancel(...)``: cancel an open order by ``(asset_index, oid)``
 
     Internally each method:
-      1. Builds the canonical ``action`` JSON with keys sorted as the
-         Hyperliquid Python SDK does (the msgpack encoding is order-
-         sensitive — see ``signer.rs::msgpack_action`` for context).
+      1. Builds the canonical ``action`` JSON with keys in the exact
+         insertion order of the official Hyperliquid Python SDK — NOT
+         alphabetical (the msgpack encoding is order-sensitive — see
+         ``signer.rs::msgpack_action`` for context).
       2. Calls ``signer.sign(...)`` with the EIP-712-specific kwargs
          (``kind``, ``action``, ``nonce``).
       3. Receives ``{r, s, v}`` back from the gateway.
@@ -102,25 +103,31 @@ class HyperliquidMainExchange(BaseExchange):
             order_type = {"limit": {"tif": "Gtc"}}
         nonce = nonce if nonce is not None else int(time.time() * 1000)
 
-        # Build the single-order action. Keys MUST be alphabetical because
-        # the Hyperliquid SDK's msgpack encoding is order-sensitive and
-        # our enclave's `msgpack_action` defaults to alphabetical (see
-        # signer.rs comment for the full reasoning).
+        # Build the single-order action. Key order is NOT alphabetical — it is
+        # the exact insertion order of the official hyperliquid-python-sdk
+        # (`order_request_to_order_wire`): a, b, p, s, r, t, then c. The
+        # msgpack action hash is order-sensitive and both the enclave
+        # (signer.rs `msgpack_action`, preserve_order) and the Hyperliquid
+        # server canonicalize to THIS order; an alphabetical dict signs a
+        # different hash and the venue rejects the signature. Golden vector:
+        # tests/test_hyperliquid_main.py::TestHyperliquidWireOrder.
         order_obj: dict[str, Any] = {
             "a": asset_index,
             "b": is_buy,
             "p": price,
-            "r": reduce_only,
             "s": size,
+            "r": reduce_only,
             "t": order_type,
         }
         if cloid is not None:
             order_obj["c"] = cloid
 
+        # Same rule at the top level: type, orders, grouping — as emitted by
+        # the official SDK, byte-for-byte pinned by the golden-vector test.
         action: dict[str, Any] = {
-            "grouping": grouping,
-            "orders": [order_obj],
             "type": "order",
+            "orders": [order_obj],
+            "grouping": grouping,
         }
 
         return self._sign_and_post(
@@ -152,9 +159,10 @@ class HyperliquidMainExchange(BaseExchange):
             ``httpx.Response`` from ``POST /exchange``.
         """
         nonce = nonce if nonce is not None else int(time.time() * 1000)
+        # Wire order per official SDK: type first, then cancels ({a, o}).
         action: dict[str, Any] = {
-            "cancels": [{"a": asset_index, "o": oid}],
             "type": "cancel",
+            "cancels": [{"a": asset_index, "o": oid}],
         }
         return self._sign_and_post(
             kind="cancel",

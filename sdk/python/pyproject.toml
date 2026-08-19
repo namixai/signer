@@ -36,6 +36,9 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "respx>=0.21",
+    # Golden-vector wire-order test packs the action exactly as the venue
+    # and the enclave do (tests/test_hyperliquid_main.py).
+    "msgpack>=1.0",
 ]
 
 [project.scripts]

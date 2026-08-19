@@ -304,3 +304,100 @@ class TestSignEip712Method:
                     pass
                 else:
                     raise AssertionError("expected SignerBadRequest")
+
+
+class TestHyperliquidWireOrder:
+    """Golden-vector tests pinning the msgpack-sensitive key order.
+
+    The reference bytes come from the enclave's own cross-vector test
+    (signer.rs::action_hash_matches_hyperliquid_sdk_reference), which was
+    itself generated against the official hyperliquid-python-sdk. If these
+    tests fail, the SDK is emitting an action whose msgpack hash differs
+    from what the venue recomputes — the enclave will happily sign it, and
+    Hyperliquid will reject the signature. This is a money-path invariant:
+    do NOT "fix" a failure here by updating the expected bytes unless the
+    enclave reference changed first.
+
+    Historical bug this pins down (2026-08-19): the SDK built dicts in
+    alphabetical order (a,b,p,r,s,t / grouping,orders,type) following a
+    "MUST be alphabetical" comment. The real wire order is the official
+    SDK's insertion order: a,b,p,s,r,t / type,orders,grouping. Live runs
+    had used hand-written curl bodies, so the bug never fired in prod.
+    """
+
+    # signer.rs golden vector: msgpack({"type":"order","orders":[{"a":0,
+    # "b":true,"p":"50000","s":"0.001","r":false,"t":{"limit":{"tif":
+    # "Gtc"}}}],"grouping":"na"})
+    ENCLAVE_REFERENCE_MSGPACK_HEX = (
+        "83a474797065a56f72646572a66f72646572739186a16100a162c3a170a5"
+        "3530303030a173a5302e303031a172c2a17481a56c696d697481a3746966"
+        "a3477463a867726f7570696e67a26e61"
+    )
+
+    def _capture_sign_action(self, do_call) -> dict:
+        """Run `do_call(signer)` under respx and return the action dict as
+        the gateway would parse it (json.loads preserves document order)."""
+        with respx.mock:
+            sign_route = respx.post(f"{GATEWAY}/sign").mock(
+                return_value=httpx.Response(200, json={"signature": MOCK_SIGNATURE})
+            )
+            respx.post(f"{HL}/exchange").mock(
+                return_value=httpx.Response(200, json={"status": "ok"})
+            )
+            with Signer(GATEWAY) as s:
+                do_call(s)
+            return json.loads(sign_route.calls[0].request.content)["action"]
+
+    def test_order_action_msgpack_matches_enclave_reference(self):
+        """Byte-for-byte: msgpack(action as sent on the wire) == the golden
+        bytes the enclave test signs over. Catches ANY key-order or
+        encoding drift, not just the fields we remember to assert on."""
+        import msgpack
+
+        action = self._capture_sign_action(
+            lambda s: s.hyperliquid_main.order(
+                asset_index=0,
+                is_buy=True,
+                price="50000",
+                size="0.001",
+            )
+        )
+        packed = msgpack.packb(action)
+        assert packed == bytes.fromhex(self.ENCLAVE_REFERENCE_MSGPACK_HEX), (
+            "msgpack(action) diverged from the enclave/hyperliquid-python-sdk "
+            f"reference; wire key order was {list(action.keys())} / "
+            f"{list(action['orders'][0].keys())}"
+        )
+
+    def test_order_key_order_is_sdk_insertion_order_not_alphabetical(self):
+        action = self._capture_sign_action(
+            lambda s: s.hyperliquid_main.order(
+                asset_index=0,
+                is_buy=True,
+                price="50000",
+                size="0.001",
+            )
+        )
+        assert list(action.keys()) == ["type", "orders", "grouping"]
+        assert list(action["orders"][0].keys()) == ["a", "b", "p", "s", "r", "t"]
+
+    def test_order_with_cloid_appends_c_last(self):
+        action = self._capture_sign_action(
+            lambda s: s.hyperliquid_main.order(
+                asset_index=0,
+                is_buy=True,
+                price="50000",
+                size="0.001",
+                cloid="0x" + "00" * 16,
+            )
+        )
+        assert list(action["orders"][0].keys()) == [
+            "a", "b", "p", "s", "r", "t", "c",
+        ]
+
+    def test_cancel_key_order_is_type_first(self):
+        action = self._capture_sign_action(
+            lambda s: s.hyperliquid_main.cancel(asset_index=0, oid=12345)
+        )
+        assert list(action.keys()) == ["type", "cancels"]
+        assert list(action["cancels"][0].keys()) == ["a", "o"]

@@ -207,7 +207,12 @@ class Signer:
             exchange: Venue, e.g. ``"hyperliquid_main"``.
             kind: ``"order"`` or ``"cancel"``.
             action: Canonical JSON action object. Caller is responsible for
-                key ordering (alphabetical for Hyperliquid).
+                key ordering — for Hyperliquid this is the official SDK's
+                insertion order (order: type/orders/grouping with
+                a,b,p,s,r,t[,c] per order; cancel: type/cancels), NOT
+                alphabetical. The enclave signs the action exactly as
+                ordered here, and the venue recomputes the hash in SDK
+                order — a mismatch yields an invalid signature.
             nonce: Hyperliquid nonce (Unix ms). MUST monotonically increase
                 per address; Hyperliquid rejects ``<=`` last-seen.
             vault_address: Optional ``0x``-prefixed 20-byte vault address.
