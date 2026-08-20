@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 import respx
 
 from usenami_signer import Signer
@@ -441,55 +442,31 @@ class TestHyperliquidTriggerNormalization:
         }
 
     def test_trigger_unknown_key_refused(self):
-        try:
+        with pytest.raises(ValueError, match=r"unknown=\['extra'\]"):
             self._capture(
                 {"trigger": {"isMarket": True, "triggerPx": "1", "tpsl": "tp",
                              "extra": 1}}
             )
-        except ValueError as e:
-            assert "unknown=['extra']" in str(e)
-        else:
-            raise AssertionError("expected ValueError on unknown trigger key")
 
     def test_trigger_missing_key_refused(self):
-        try:
+        with pytest.raises(ValueError, match="missing="):
             self._capture({"trigger": {"isMarket": True}})
-        except ValueError as e:
-            assert "missing=" in str(e)
-        else:
-            raise AssertionError("expected ValueError on missing trigger keys")
 
     def test_unknown_order_type_refused(self):
-        try:
+        with pytest.raises(ValueError, match="canonicalize"):
             self._capture({"mystery": {}})
-        except ValueError as e:
-            assert "canonicalize" in str(e)
-        else:
-            raise AssertionError("expected ValueError on unknown order type")
 
     def test_combined_limit_and_trigger_refused(self):
-        try:
+        with pytest.raises(ValueError, match="canonicalize"):
             self._capture(
                 {"limit": {"tif": "Gtc"},
                  "trigger": {"isMarket": True, "triggerPx": "1", "tpsl": "tp"}}
             )
-        except ValueError as e:
-            assert "canonicalize" in str(e)
-        else:
-            raise AssertionError("expected ValueError on limit+trigger")
 
     def test_limit_with_extra_top_level_key_refused(self):
-        try:
+        with pytest.raises(ValueError, match="canonicalize"):
             self._capture({"limit": {"tif": "Gtc"}, "extra": {}})
-        except ValueError as e:
-            assert "canonicalize" in str(e)
-        else:
-            raise AssertionError("expected ValueError on limit+extra")
 
     def test_non_mapping_trigger_refused(self):
-        try:
+        with pytest.raises(ValueError, match="mapping"):
             self._capture({"trigger": "tp"})
-        except ValueError as e:
-            assert "mapping" in str(e)
-        else:
-            raise AssertionError("expected ValueError on non-mapping trigger")
