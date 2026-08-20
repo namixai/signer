@@ -401,3 +401,68 @@ class TestHyperliquidWireOrder:
         )
         assert list(action.keys()) == ["type", "cancels"]
         assert list(action["cancels"][0].keys()) == ["a", "o"]
+
+
+class TestHyperliquidTriggerNormalization:
+    """The trigger order type is a nested map inside the signed action, so
+    its key order is hash-sensitive too. The SDK canonicalizes it to the
+    official SDK's order (isMarket, triggerPx, tpsl — same as the enclave's
+    own trigger vectors) and refuses shapes it cannot canonicalize."""
+
+    def _capture(self, order_type) -> dict:
+        with respx.mock:
+            sign_route = respx.post(f"{GATEWAY}/sign").mock(
+                return_value=httpx.Response(200, json={"signature": MOCK_SIGNATURE})
+            )
+            respx.post(f"{HL}/exchange").mock(
+                return_value=httpx.Response(200, json={"status": "ok"})
+            )
+            with Signer(GATEWAY) as s:
+                s.hyperliquid_main.order(
+                    asset_index=0,
+                    is_buy=True,
+                    price="50000",
+                    size="0.001",
+                    order_type=order_type,
+                )
+            return json.loads(sign_route.calls[0].request.content)["action"]
+
+    def test_trigger_keys_reordered_to_canonical(self):
+        action = self._capture(
+            {"trigger": {"tpsl": "tp", "triggerPx": "50000", "isMarket": True}}
+        )
+        t = action["orders"][0]["t"]
+        assert list(t.keys()) == ["trigger"]
+        assert list(t["trigger"].keys()) == ["isMarket", "triggerPx", "tpsl"]
+        assert t["trigger"] == {
+            "isMarket": True,
+            "triggerPx": "50000",
+            "tpsl": "tp",
+        }
+
+    def test_trigger_unknown_key_refused(self):
+        try:
+            self._capture(
+                {"trigger": {"isMarket": True, "triggerPx": "1", "tpsl": "tp",
+                             "extra": 1}}
+            )
+        except ValueError as e:
+            assert "unknown=['extra']" in str(e)
+        else:
+            raise AssertionError("expected ValueError on unknown trigger key")
+
+    def test_trigger_missing_key_refused(self):
+        try:
+            self._capture({"trigger": {"isMarket": True}})
+        except ValueError as e:
+            assert "missing=" in str(e)
+        else:
+            raise AssertionError("expected ValueError on missing trigger keys")
+
+    def test_unknown_order_type_refused(self):
+        try:
+            self._capture({"mystery": {}})
+        except ValueError as e:
+            assert "canonicalize" in str(e)
+        else:
+            raise AssertionError("expected ValueError on unknown order type")

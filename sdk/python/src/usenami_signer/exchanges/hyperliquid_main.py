@@ -31,6 +31,39 @@ import httpx
 
 from usenami_signer.exchanges.base import BaseExchange
 
+# Canonical trigger key order per the official hyperliquid-python-sdk
+# (`order_type_to_wire`) and the enclave's own trigger vectors
+# (handler.rs: {"trigger": {"isMarket", "triggerPx", "tpsl"}}).
+_TRIGGER_KEY_ORDER = ("isMarket", "triggerPx", "tpsl")
+
+
+def _order_type_to_wire(order_type: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an order type to the official SDK's wire key order.
+
+    The msgpack action hash is order-sensitive all the way down, so a
+    caller-supplied ``{"trigger": {"tpsl": ..., "triggerPx": ..., ...}}``
+    would sign a different hash than the venue recomputes. ``limit`` carries
+    a single key and passes through; ``trigger`` is rebuilt in canonical
+    order. Anything else is refused rather than signed as-is: an order type
+    this SDK cannot canonicalize must not reach a signature.
+    """
+    if "limit" in order_type:
+        return order_type
+    if "trigger" in order_type:
+        trig = order_type["trigger"]
+        missing = [k for k in _TRIGGER_KEY_ORDER if k not in trig]
+        unknown = [k for k in trig if k not in _TRIGGER_KEY_ORDER]
+        if missing or unknown:
+            raise ValueError(
+                f"trigger order type must have exactly the keys "
+                f"{list(_TRIGGER_KEY_ORDER)}; missing={missing} unknown={unknown}"
+            )
+        return {"trigger": {k: trig[k] for k in _TRIGGER_KEY_ORDER}}
+    raise ValueError(
+        "order_type must contain 'limit' or 'trigger' — refusing to sign an "
+        f"order type this SDK cannot canonicalize: {sorted(order_type)}"
+    )
+
 
 class HyperliquidMainExchange(BaseExchange):
     """Hyperliquid mainnet (`hyperliquid_main`) DEX wrapper.
@@ -117,7 +150,7 @@ class HyperliquidMainExchange(BaseExchange):
             "p": price,
             "s": size,
             "r": reduce_only,
-            "t": order_type,
+            "t": _order_type_to_wire(order_type),
         }
         if cloid is not None:
             order_obj["c"] = cloid
