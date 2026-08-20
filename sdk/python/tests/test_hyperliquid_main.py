@@ -466,3 +466,30 @@ class TestHyperliquidTriggerNormalization:
             assert "canonicalize" in str(e)
         else:
             raise AssertionError("expected ValueError on unknown order type")
+
+    def test_combined_limit_and_trigger_refused(self):
+        try:
+            self._capture(
+                {"limit": {"tif": "Gtc"},
+                 "trigger": {"isMarket": True, "triggerPx": "1", "tpsl": "tp"}}
+            )
+        except ValueError as e:
+            assert "canonicalize" in str(e)
+        else:
+            raise AssertionError("expected ValueError on limit+trigger")
+
+    def test_limit_with_extra_top_level_key_refused(self):
+        try:
+            self._capture({"limit": {"tif": "Gtc"}, "extra": {}})
+        except ValueError as e:
+            assert "canonicalize" in str(e)
+        else:
+            raise AssertionError("expected ValueError on limit+extra")
+
+    def test_non_mapping_trigger_refused(self):
+        try:
+            self._capture({"trigger": "tp"})
+        except ValueError as e:
+            assert "mapping" in str(e)
+        else:
+            raise AssertionError("expected ValueError on non-mapping trigger")

@@ -47,10 +47,12 @@ def _order_type_to_wire(order_type: dict[str, Any]) -> dict[str, Any]:
     order. Anything else is refused rather than signed as-is: an order type
     this SDK cannot canonicalize must not reach a signature.
     """
-    if "limit" in order_type:
-        return order_type
-    if "trigger" in order_type:
+    if set(order_type) == {"limit"}:
+        return {"limit": order_type["limit"]}
+    if set(order_type) == {"trigger"}:
         trig = order_type["trigger"]
+        if not isinstance(trig, dict):
+            raise ValueError("trigger order type must be a mapping")
         missing = [k for k in _TRIGGER_KEY_ORDER if k not in trig]
         unknown = [k for k in trig if k not in _TRIGGER_KEY_ORDER]
         if missing or unknown:
