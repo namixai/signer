@@ -41,55 +41,68 @@ SNAPSHOT = ROOT / "enclave" / "DEPENDENCY-CLOSURE.lock"
 ROOT_PACKAGE = "signer-enclave"
 
 
-def parse_lock(text: str) -> dict[tuple[str, str], list[tuple[str, str | None]]]:
-    """{(name, version): [(dep_name, dep_version_or_None), ...]}"""
-    pkgs: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
-    for block in text.split("[[package]]")[1:]:
+# A package is identified by (name, version, source). `source` is part of the
+# identity on purpose: a `[patch]`/`replace` that swaps a registry crate for a
+# git checkout, or bumps a git revision, keeps name+version and still changes
+# the compiled enclave (CodeRabbit). Workspace members and path deps have no
+# `source` line in Cargo.lock and are keyed as "path".
+PkgKey = tuple[str, str, str]
+
+
+def parse_lock(text: str) -> dict[PkgKey, list[tuple[str, str | None, str | None]]]:
+    """{(name, version, source): [(dep_name, dep_version|None, dep_source|None), ...]}"""
+    pkgs: dict[PkgKey, list[tuple[str, str | None, str | None]]] = {}
+    # Split only at a `[[package]]` that starts a line — the literal could in
+    # principle appear inside a string elsewhere in the file.
+    for block in re.split(r"^\[\[package\]\]", text, flags=re.M)[1:]:
         name = re.search(r'^name = "([^"]+)"', block, re.M)
         ver = re.search(r'^version = "([^"]+)"', block, re.M)
         if not name or not ver:
             continue
-        deps: list[tuple[str, str | None]] = []
+        src_m = re.search(r'^source = "([^"]+)"', block, re.M)
+        source = src_m.group(1) if src_m else "path"
+        deps: list[tuple[str, str | None, str | None]] = []
         m = re.search(r"^dependencies = \[(.*?)^\]", block, re.M | re.S)
         if m:
-            for line in m.group(1).splitlines():
-                line = line.strip().strip(",").strip('"')
-                if not line:
+            for raw in m.group(1).splitlines():
+                entry = raw.strip().strip(",").strip('"')
+                if not entry:
                     continue
-                parts = line.split()
-                deps.append((parts[0], parts[1] if len(parts) > 1 else None))
-        pkgs[(name.group(1), ver.group(1))] = deps
+                # forms: `name` | `name ver` | `name ver (source)`
+                dm = re.match(r"^(\S+)(?: (\S+))?(?: \((.+)\))?$", entry)
+                if not dm:
+                    raise ValueError(f"unparseable dependency entry in Cargo.lock: {entry!r}")
+                deps.append((dm.group(1), dm.group(2), dm.group(3)))
+        pkgs[(name.group(1), ver.group(1), source)] = deps
     return pkgs
 
 
-def closure(pkgs, root_name: str) -> list[str]:
-    by_name: dict[str, list[tuple[str, str]]] = {}
+def closure(pkgs: dict[PkgKey, list], root_name: str) -> list[str]:
+    by_name: dict[str, list[PkgKey]] = {}
     for key in pkgs:
         by_name.setdefault(key[0], []).append(key)
     roots = by_name.get(root_name, [])
     if not roots:
-        sys.exit(f"enclave-closure-check: package {root_name!r} not found in lockfile")
-    seen: set[tuple[str, str]] = set()
+        raise ValueError(f"package {root_name!r} not found in lockfile")
+    seen: set[PkgKey] = set()
     stack = list(roots)
     while stack:
         key = stack.pop()
         if key in seen:
             continue
         seen.add(key)
-        for dep_name, dep_ver in pkgs.get(key, []):
-            if dep_ver is not None:
-                cands = [(dep_name, dep_ver)]
-            else:
-                cands = by_name.get(dep_name, [])
-            for c in cands:
-                if c in pkgs and c not in seen:
-                    stack.append(c)
-    return sorted(f"{n} {v}" for (n, v) in seen if n != root_name)
+        for dep_name, dep_ver, dep_src in pkgs.get(key, []):
+            cands = [
+                k for k in by_name.get(dep_name, [])
+                if (dep_ver is None or k[1] == dep_ver) and (dep_src is None or k[2] == dep_src)
+            ]
+            stack.extend(c for c in cands if c not in seen)
+    return sorted(f"{n} {v} ({src})" for (n, v, src) in seen if n != root_name)
 
 
 def read_snapshot(path: Path) -> tuple[list[str], list[str]]:
     header, body = [], []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("#"):
             header.append(line)
         elif line.strip():
@@ -104,14 +117,17 @@ def main() -> int:
     ap.add_argument("--write", action="store_true", help="rewrite the snapshot body from --lock (header kept)")
     args = ap.parse_args()
 
-    current = closure(parse_lock(args.lock.read_text()), ROOT_PACKAGE)
+    try:
+        current = closure(parse_lock(args.lock.read_text(encoding="utf-8")), ROOT_PACKAGE)
+    except ValueError as e:
+        sys.exit(f"enclave-closure-check: {e}")
 
     if args.write:
         header = read_snapshot(args.snapshot)[0] if args.snapshot.exists() else [
             "# Transitive dependency closure of signer-enclave, from poc/Cargo.lock.",
             "# Header lines (#) are maintained by hand: commit + measured PCR0 + host.",
         ]
-        args.snapshot.write_text("\n".join(header) + "\n\n" + "\n".join(current) + "\n")
+        args.snapshot.write_text("\n".join(header) + "\n\n" + "\n".join(current) + "\n", encoding="utf-8")
         print(f"enclave-closure-check: wrote {len(current)} entries to {args.snapshot}")
         return 0
 
