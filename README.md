@@ -240,13 +240,39 @@ Every signed call returns a **Verifiable Policy Proof** — a Nitro attestation 
 ## Reproducible build
 
 The enclave EIF (Enclave Image File) is **deterministically buildable** — a clean
-clone of this repository rebuilds the measurement the production endpoint attests to.
+clone of this repository **at the measured commit** rebuilds the measurement the
+production endpoint attests to. A measurement belongs to a commit, not to a
+branch: dependency bumps on `main` change the enclave binary and therefore PCR0.
 
 ```bash
+git clone https://github.com/namixai/signer.git && cd signer
+git checkout db68182                    # the commit the production PCR0 was measured on
 cd poc
 SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 # → PCR0 32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
 ```
+
+> **Measured, not asserted — and here is the measurement record.**
+> Last independent re-run: **2026-08-20**, clean anonymous clone into an empty
+> directory, `env -i`, x86_64 EC2 build host `i-0d332f8f`, **`nitro-cli 1.4.4`**.
+> PCR0 also depends on the `nitro-cli` release (it bundles the enclave kernel and
+> init), so use the same version or expect a different number for that reason alone.
+> A build needs ~30 GB of free disk for the Docker layers; `build-eif.sh` prunes
+> its own cache after the build (set `SIGNER_BUILD_KEEP_CACHE=1` to keep it).
+>
+> | tree | build | PCR0 |
+> |---|---|---|
+> | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — **production** (also the public demo since the 2026-08-10 rotation) |
+> | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
+> | commit `1207d37` (2026-08-19, current `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9` — **not deployed**; differs because `anyhow` and `thiserror` were bumped after the measurement |
+>
+> Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
+> production number. Anyone who followed it got `b502601b…` and had every reason to
+> call the claim false. The mechanism was intact; the instruction was stale. Since then
+> CI runs `scripts/enclave-closure-check.py`: the enclave's dependency closure is
+> snapshotted in `poc/enclave/DEPENDENCY-CLOSURE.lock` next to the PCR0 it was measured
+> as, and a lockfile change that touches the enclave fails CI until someone re-measures
+> and updates both in the same PR.
 
 > ### The flag is part of the measurement, not a runtime switch
 >
@@ -258,7 +284,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `32d25d8c…` — **this is production** |
 > | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh` | `9f80b8d4…` — not deployed anywhere |
 >
-> Both values are measured on this tree, not asserted. Set **both** variables
+> Both values are measured on commit `db68182`, not asserted. Set **both** variables
 > explicitly for the permissive build: the script honours whatever
 > `SIGNER_REQUIRE_POLICY` it inherits from your shell before falling back to its
 > permissive default, so if you exported `=1` for the strict build above, passing
@@ -267,8 +293,8 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > on neither, that is the interesting case and we would like to hear about it.
 >
 > The permissive PCR0 is a property of the source tree — an earlier tree measured
-> `18b6ece4…` here; on the current tree it is `9f80b8d4…`. The strict value is what
-> the production endpoint attests, and it is the one to trust.
+> `18b6ece4…` here; on `db68182` it is `9f80b8d4…`. The strict value is what the
+> production endpoint attests, and it is the one to trust.
 >
 > ### The permissive build is gated on a rotation tree
 >

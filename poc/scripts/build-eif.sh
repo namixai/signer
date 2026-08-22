@@ -141,3 +141,15 @@ nitro-cli build-enclave \
 echo ""
 echo "=== PCR0 ==="
 nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
+
+# Reclaim the Docker build cache. Each --no-cache build leaves its layers behind
+# (~30 GB on the build host); on 2026-08-20 the SECOND of two consecutive clean
+# builds died with "No space left on device". If we ask outsiders to rebuild on
+# demand, we must be able to rebuild on demand ourselves. Runs AFTER the PCR0 is
+# printed, so it can never influence the measurement; opt out with
+# SIGNER_BUILD_KEEP_CACHE=1 (e.g. to inspect intermediate layers).
+if [ "${SIGNER_BUILD_KEEP_CACHE:-0}" != "1" ]; then
+  echo "pruning docker build cache + dangling images (SIGNER_BUILD_KEEP_CACHE=1 to keep)" >&2
+  docker builder prune -f >/dev/null 2>&1 || true
+  docker image prune -f >/dev/null 2>&1 || true
+fi

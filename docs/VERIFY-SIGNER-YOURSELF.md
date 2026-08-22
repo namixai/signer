@@ -354,7 +354,11 @@ Reproducibility is engineered, not incidental:
   Dockerfile is a `git checkout <commit>`; recorded in
   [`poc/policies/build-pins.txt`](../poc/policies/build-pins.txt).
 - **`Cargo.lock` committed + `cargo build --locked`** — dependency versions cannot
-  drift; vendored NSM deps built `--offline --locked`.
+  drift *within a commit*; vendored NSM deps built `--offline --locked`. The lockfile
+  is itself a PCR0 input: a dependency bump on `main` changes the enclave binary, so a
+  measurement is tied to a commit (the repo README names it) and CI
+  (`scripts/enclave-closure-check.py`) fails when the enclave's dependency closure
+  drifts from the snapshot the published number was measured against.
 - **Timestamp / locale / umask pinned** (`SOURCE_DATE_EPOCH`, `LC_ALL=C`, `TZ=UTC`,
   `umask 022`) — removes mtime / locale-sort / permission drift.
 - **The strict money-path flag is PCR0-determining** — the policy-enforcing image

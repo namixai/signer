@@ -11,6 +11,10 @@
 # pinned Docker build, which GitHub-hosted runners cannot reproduce bit-for-bit.
 # Attestation integrity is proven separately by the reproducible-build pins and
 # the published PCR0 (see docs/VERIFY-SIGNER-YOURSELF.md), not by this workflow.
+# What this workflow DOES guard (2026-08-20): the enclave's dependency closure in
+# Cargo.lock — a PCR0 input — must match the snapshot the published number was
+# measured against (`enclave-closure-check`). A bump that touches the enclave
+# fails here until the image is re-measured and the snapshot + README updated.
 #
 # All third-party actions are pinned by full commit SHA (OpenSSF Scorecard
 # "Pinned-Dependencies"); the version tag is kept in a trailing comment and is
@@ -45,12 +49,18 @@ jobs:
       # action needed — one fewer third-party dependency to trust.
       - name: Materialize pinned toolchain
         run: rustup show
+      # PCR0 input guard: the enclave's dependency closure from Cargo.lock must be
+      # the one the published measurement was taken against. Pure Python, no
+      # nitro-cli, runs in seconds. A red here means "re-measure before merging".
+      - name: Enclave dependency closure matches the measured snapshot
+        run: python3 scripts/enclave-closure-check.py
       - name: Build (locked)
         run: cargo build --workspace --locked
       # Clippy is split because the enclave crate is PCR0-frozen (see header).
       # Strict `-D warnings` on the crates we CAN edit; warn-only on signer-enclave,
       # whose source cannot be touched to clear dead_code without rebuilding the
-      # attested binary and rotating the published PCR0 (ff53e1fe). Rationale +
+      # attested binary and rotating the published PCR0 (the current production
+      # measurement is named in the repo README). Rationale +
       # the exact frozen items are documented in the OSTIF feedback doc.
       - name: Clippy — mutable crates (deny warnings)
         run: cargo clippy --workspace --exclude signer-enclave --all-targets --locked -- -D warnings
