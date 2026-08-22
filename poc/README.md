@@ -2,13 +2,13 @@
 
 Keyless signing for crypto exchange (CEX) and DEX order/transfer requests inside an **AWS Nitro Enclave**. The exchange API secret (or DEX private key) never leaves the attested enclave — not to the parent EC2 instance, the operator, the OS, or any other process. A client sends an order; the enclave returns only the signed request (auth headers / signature), never the key.
 
-**Status:** production build, **multi-tenant** (testnet venue keys). The current production enclave measures to PCR0 `32d25d8c…`, and since the 2026-08-10 rotation the public demo enclave runs the same image and attests the same measurement — **reproducible from this repository at commit `db68182`** (check that commit out first; HEAD carries later dependency bumps and builds to a different, undeployed PCR0 — see [Reproducible build](../README.md#reproducible-build) and [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet; on-chain registration of the current PCR0 is the next step, and the public demo attests `registered_onchain: false`.
+**Status:** production build, **multi-tenant**; mainnet venue keys exist for the operator's own funds only (no third-party money in production, no external audit). The current production enclave measures to PCR0 `32d25d8c…`, and since the 2026-08-10 rotation the public demo enclave runs the same image and attests the same measurement — **reproducible from this repository at commit `db68182`** (check that commit out first; HEAD carries later dependency bumps and builds to a different, undeployed PCR0 — see [Reproducible build](../README.md#reproducible-build) and [`docs/VERIFY-SIGNER-YOURSELF.md`](../docs/VERIFY-SIGNER-YOURSELF.md)). The attestation registry contract is live on Base mainnet and the current PCR0 is registered there (since 2026-08-12, owner `0x21538eBF…`); the public demo attests `registered_onchain: true`. That flag is set by the gateway from its environment, not read from the chain — check `isPCR0Active` yourself and compare the **owner**, because `registerPCR0` is permissionless.
 
 ## What it does
 - **CEX request signing** — HMAC-SHA256 auth headers (KuCoin/Binance/OKX/Bybit style) and per-venue structured order/cancel signing for Binance + OKX.
 - **DEX / x402 signing** — EIP-712 / ECDSA, and `/sign-x402` for EIP-3009 `TransferWithAuthorization` (agent micropayments).
 - **Multi-tenant** — many customers' keys on one signer, cryptographically isolated per customer (see Registry control-plane).
-- **Verifiable trust** — the key blob only decrypts inside the enclave whose attested measurement (PCR0) the KMS key policy allows, and that PCR0 is reproducible from this source so anyone can verify it (on-chain publication of the PCR0 is the next step).
+- **Verifiable trust** — the key blob only decrypts inside the enclave whose attested measurement (PCR0) the KMS key policy allows, and that PCR0 is reproducible from this source at the pinned commit so anyone can verify it; it is also published on-chain (Base registry, see Trust model).
 
 > **Policy-enforcement scope (be precise — hardening in progress):** per-asset **size caps** (`order_caps`) are enforced inside the enclave on the **structured Binance/OKX `order`/`cancel` path only**. The generic `/sign`, the `/sign-x402` recipient, and the EIP-712 venues (Hyperliquid, Asterdex) are **action/venue-gated but NOT yet size-capped**. Do not claim or rely on a size cap outside the structured Binance/OKX path until CR050–053 land.
 
@@ -20,7 +20,7 @@ client ──HTTP(bearer)──▶ Parent EC2 ──vsock──▶ Nitro Enclave
 - **Parent EC2 (`gateway/`)** — HTTP API + bearer-token auth + vsock proxy. Holds NO secrets; forwards sign requests over vsock and relays AWS creds for the enclave's KMS/exchange calls. Routes are split into three tiers:
   - `sign_router` (gated by `SIGNER_API_TOKENS`, tenant tokens) — all `/sign*`, `/hedge`, `/account/:venue`.
   - `operator_router` (gated by `SIGNER_OPERATOR_TOKENS`, operator tokens) — `/verify-blob` only. A tenant token cannot reach operator routes and vice-versa (route_layer applied before merge — hard separation).
-  - **public (no bearer)** — `/attestation` (trust-anchor proof) + `/healthz`. Kept OFF the shared `/sign` concurrency pool so an unauthenticated flood can't starve signing; `/attestation` is edge-cached (`Cache-Control: public, max-age=60`).
+  - **public (no bearer)** — `/attestation` (trust-anchor proof) + `/healthz`. Kept OFF the shared `/sign` concurrency pool so an unauthenticated flood can't starve signing; `/attestation` is served with `Cache-Control: no-store` — every call does a vsock round-trip to the enclave for a fresh NSM document, so a client-supplied `?nonce=` is bound into it (the nonce must be hex with an even number of digits, at most 2048 characters; anything else is `bad_request`).
 - **Nitro Enclave (`enclave/`)** — the signer: resolves the caller's identity via the in-memory registry, KMS-decrypts that customer's venue key blob under attestation, signs, returns only the signature. The key plaintext lives only transiently in enclave RAM.
 - **`parent/`** — `signer-client` CLI (vsock test driver, registry-challenge/refresh).
 - **`policy-cli/`** — off-box tool to author + Ed25519-sign registry refresh envelopes and venue policies.
@@ -35,7 +35,7 @@ The enclave keeps an **in-memory (RAM-only) registry** mapping each bearer token
 
 ## Trust model
 1. Key blobs are KMS-encrypted; the KMS key policy allows `Decrypt` **only** under a `kms:RecipientAttestation:ImageSha384` condition matching the enclave's PCR0 → only the exact attested code can decrypt.
-2. The attestation registry contract is live on Base mainnet (`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`) to hold the authorized PCR0 on-chain as a public, verifiable record; registering the current PCR0 (`registerPCR0`) is the next step.
+2. The attestation registry contract is live on Base mainnet (`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`) and holds the current PCR0 `32d25d8c…` as a public record (registered 2026-08-12). Read it with `isPCR0Active(bytes)` and compare the returned owner to `0x21538eBF6598e5866BA496A954dE8E39097bFB59`: registration is permissionless, so `active=true` alone proves nothing.
 3. The operator and host are untrusted for key material; they manage the vsock channel and relay creds but cannot extract the key (Nitro isolation + attestation-gated KMS).
 
 ## Venues (6)
