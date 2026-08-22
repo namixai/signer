@@ -46,36 +46,38 @@ For engineers, security reviewers, and recruiters who want to dig deeper:
 
 | Exchange | Scheme | Status |
 |---|---|---|
-| KuCoin Futures | HMAC-SHA256 v2 headers | Live |
-| Binance | HMAC-SHA256 query param | Live |
-| Bybit V5 | HMAC-SHA256 headers | Live |
-| OKX V5 | HMAC-SHA256 + passphrase | Live |
-| Asterdex (BNB chain) | EIP-712 typed-data (secp256k1) | Live (first non-HMAC adapter) |
+| KuCoin Futures | HMAC-SHA256 v2 headers | Adapter; no mainnet key, generic path fail-closed under caps |
+| Binance USD-M futures | HMAC-SHA256 query param | **Mainnet, own funds** — completed round trip 2026-07-27 |
+| Bybit V5 | HMAC-SHA256 headers | Adapter; no mainnet key, generic path fail-closed under caps |
+| OKX V5 | HMAC-SHA256 + passphrase | **Mainnet, own funds** — signed, accepted into the book, cancelled (2026-08-18); never filled |
+| Asterdex (BNB chain) | EIP-712 typed-data (secp256k1) | Adapter (first non-HMAC); not armed on mainnet |
 | Hyperliquid **testnet** | EIP-712 typed-data (secp256k1) | Live |
-| Hyperliquid **mainnet** | EIP-712 typed-data (secp256k1) | **No key provisioned** — see below |
+| Hyperliquid **mainnet** | EIP-712 typed-data (secp256k1) | **Mainnet, own funds** — agent key born inside the enclave 2026-08-16, completed round trip 2026-08-19 |
 | Hyperliquid HIP-3 family (xyz/km/cash/flx) | EIP-712 (same as main, different chainId) | Coming next |
 | dYdX v4 | Cosmos signing | Phase 2 |
 | Paradex | StarkEx | Phase 2 |
 
-> **On Hyperliquid mainnet — the guarantee CHANGED on 2026-08-10, read this.**
-> Until then the enclave refused `sign_hyperliquid_main_order` and
-> `sign_hyperliquid_main_cancel` before touching any key material: denied inside the
-> enclave, not merely unconfigured. **That in-enclave deny was removed** in the
-> rotation deployed on 2026-08-10, so the code path no longer refuses by construction.
+> **On Hyperliquid mainnet — what holds the line, stated plainly.**
+> Until 2026-08-10 the enclave refused `sign_hyperliquid_main_order` /
+> `sign_hyperliquid_main_cancel` before touching any key material. That in-enclave deny
+> was removed in the 2026-08-10 rotation. On 2026-08-16 a mainnet agent key was minted
+> **inside the enclave** (ROT-1 in-enclave mint, `poc/enclave/src/handler.rs` "MINT an agent key in-enclave"; the operator-side ceremony script is not yet synced to this repo; the key never existed outside;
+> the account owner approved the agent address from their own wallet), and on 2026-08-19
+> that key signed a completed round trip (entry filled, position closed — verifiable
+> against Hyperliquid's public `userFills`).
 >
-> What stops a mainnet signature today is weaker and worth stating plainly: **no
-> Hyperliquid mainnet key exists** — none is provisioned, so there is nothing to
-> decrypt and nothing to sign with. That is an operational fact, not an enclave-enforced
-> property, and it can change the day a key is created. Do not rely on this row as a
-> safety guarantee; rely on the policy you attest.
+> So today nothing is "unprovisioned". What limits a mainnet signature is the **attested
+> policy** (`hl_order_caps`: per-asset size and notional caps, checked before signing) plus
+> Hyperliquid's own rule that agent wallets cannot withdraw — the latter is the venue's
+> property, not ours. Rely on the policy you attest, not on this row.
 >
 > Hyperliquid **testnet** signs through the same EIP-712 code path; the only difference
 > is the phantom-agent source byte.
 >
-> This row read `Live` from 2026-06-26 until 2026-08-05, which was wrong for the whole
-> of that period. Corrected rather than quietly edited — and corrected again here, in
-> the other direction, rather than leaving a stale claim that flattered us.
-
+> History of this row, kept on purpose: it read `Live` from 2026-06-26 to 2026-08-05 while
+> the enclave still refused mainnet (wrong); then `No key provisioned` from 2026-08-11 to
+> 2026-08-22 while a key already existed since 2026-08-16 (stale). Corrected in the open both
+> times rather than quietly edited.
 
 Adding a new exchange with same crypto scheme ≈ ~50 lines per venue.
 
@@ -320,7 +322,7 @@ against the AWS Nitro root. A value printed in a README goes stale silently; com
 your build against the live document, and use the number here only to know what to
 expect.
 
-KMS key policy refuses to release encrypted secrets unless the requesting enclave's PCR0 measurement matches the value pinned in `poc/policies/kms-policy-day3-attestation.json`. **Change one byte of the source code → new PCR0 → KMS denies → all existing customer secrets become unusable until the new measurement is added to the policy.** This is the security boundary.
+KMS key policy refuses to release encrypted secrets unless the requesting enclave's PCR0 measurement matches the value pinned in the KMS key policy (`kms:RecipientAttestation:ImageSha384`; the Terraform that pins it lives in the private infra tree, the condition itself is standard Nitro/KMS). **Change one byte of the source code → new PCR0 → KMS denies → all existing customer secrets become unusable until the new measurement is added to the policy.** This is the security boundary.
 
 ### Cross-vector regression tests
 
@@ -333,13 +335,13 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 - **Bug bounty:** $1,000 pool — see `SECURITY.md` (W3-W4 ship)
 - **Threat model:** internal red-team scenarios run before each phase; public version coming with audit publication
 - **Zero unsafe Rust:** see `cargo-geiger` output in CI (coming)
-- **Audit:** scheduled — Sentinel (Usenami in-house auditor) + optional external
+- **Audit:** none yet. No external audit has been commissioned or started; internal adversarial review only.
 
 ---
 
-## Project status (2026-08-11)
+## Project status (2026-08-22)
 
-**Live in production.** 5 venues signing on mainnet — 4 CEX (KuCoin, Binance, Bybit, OKX) plus the Asterdex EIP-712 DEX. Hyperliquid **mainnet has no key provisioned** — the in-enclave deny was removed on 2026-08-10 (below); Hyperliquid **testnet** signs. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
+**Mainnet, operator's own funds only (dogfood).** Three venues have signed on mainnet: Binance USD-M (completed round trip 2026-07-27), Hyperliquid (enclave-born agent key 2026-08-16, completed round trip 2026-08-19), OKX (signed, accepted into the book and cancelled 2026-08-18 — never filled; an hourly place→verify→cancel timer has run clean since). KuCoin, Bybit and Asterdex have adapters but no mainnet key; under a capped policy their generic path is fail-closed. Zero paying customers, zero third-party money in production, no external audit. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
 
 Production PCR0: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
 
