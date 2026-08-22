@@ -31,6 +31,41 @@ import httpx
 
 from usenami_signer.exchanges.base import BaseExchange
 
+# Canonical trigger key order per the official hyperliquid-python-sdk
+# (`order_type_to_wire`) and the enclave's own trigger vectors
+# (handler.rs: {"trigger": {"isMarket", "triggerPx", "tpsl"}}).
+_TRIGGER_KEY_ORDER = ("isMarket", "triggerPx", "tpsl")
+
+
+def _order_type_to_wire(order_type: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an order type to the official SDK's wire key order.
+
+    The msgpack action hash is order-sensitive all the way down, so a
+    caller-supplied ``{"trigger": {"tpsl": ..., "triggerPx": ..., ...}}``
+    would sign a different hash than the venue recomputes. ``limit`` carries
+    a single key and passes through; ``trigger`` is rebuilt in canonical
+    order. Anything else is refused rather than signed as-is: an order type
+    this SDK cannot canonicalize must not reach a signature.
+    """
+    if set(order_type) == {"limit"}:
+        return {"limit": order_type["limit"]}
+    if set(order_type) == {"trigger"}:
+        trig = order_type["trigger"]
+        if not isinstance(trig, dict):
+            raise ValueError("trigger order type must be a mapping")
+        missing = [k for k in _TRIGGER_KEY_ORDER if k not in trig]
+        unknown = [k for k in trig if k not in _TRIGGER_KEY_ORDER]
+        if missing or unknown:
+            raise ValueError(
+                f"trigger order type must have exactly the keys "
+                f"{list(_TRIGGER_KEY_ORDER)}; missing={missing} unknown={unknown}"
+            )
+        return {"trigger": {k: trig[k] for k in _TRIGGER_KEY_ORDER}}
+    raise ValueError(
+        "order_type must contain 'limit' or 'trigger' — refusing to sign an "
+        f"order type this SDK cannot canonicalize: {sorted(order_type)}"
+    )
+
 
 class HyperliquidMainExchange(BaseExchange):
     """Hyperliquid mainnet (`hyperliquid_main`) DEX wrapper.
@@ -40,9 +75,10 @@ class HyperliquidMainExchange(BaseExchange):
       - ``cancel(...)``: cancel an open order by ``(asset_index, oid)``
 
     Internally each method:
-      1. Builds the canonical ``action`` JSON with keys sorted as the
-         Hyperliquid Python SDK does (the msgpack encoding is order-
-         sensitive — see ``signer.rs::msgpack_action`` for context).
+      1. Builds the canonical ``action`` JSON with keys in the exact
+         insertion order of the official Hyperliquid Python SDK — NOT
+         alphabetical (the msgpack encoding is order-sensitive — see
+         ``signer.rs::msgpack_action`` for context).
       2. Calls ``signer.sign(...)`` with the EIP-712-specific kwargs
          (``kind``, ``action``, ``nonce``).
       3. Receives ``{r, s, v}`` back from the gateway.
@@ -102,25 +138,31 @@ class HyperliquidMainExchange(BaseExchange):
             order_type = {"limit": {"tif": "Gtc"}}
         nonce = nonce if nonce is not None else int(time.time() * 1000)
 
-        # Build the single-order action. Keys MUST be alphabetical because
-        # the Hyperliquid SDK's msgpack encoding is order-sensitive and
-        # our enclave's `msgpack_action` defaults to alphabetical (see
-        # signer.rs comment for the full reasoning).
+        # Build the single-order action. Key order is NOT alphabetical — it is
+        # the exact insertion order of the official hyperliquid-python-sdk
+        # (`order_request_to_order_wire`): a, b, p, s, r, t, then c. The
+        # msgpack action hash is order-sensitive and both the enclave
+        # (signer.rs `msgpack_action`, preserve_order) and the Hyperliquid
+        # server canonicalize to THIS order; an alphabetical dict signs a
+        # different hash and the venue rejects the signature. Golden vector:
+        # tests/test_hyperliquid_main.py::TestHyperliquidWireOrder.
         order_obj: dict[str, Any] = {
             "a": asset_index,
             "b": is_buy,
             "p": price,
-            "r": reduce_only,
             "s": size,
-            "t": order_type,
+            "r": reduce_only,
+            "t": _order_type_to_wire(order_type),
         }
         if cloid is not None:
             order_obj["c"] = cloid
 
+        # Same rule at the top level: type, orders, grouping — as emitted by
+        # the official SDK, byte-for-byte pinned by the golden-vector test.
         action: dict[str, Any] = {
-            "grouping": grouping,
-            "orders": [order_obj],
             "type": "order",
+            "orders": [order_obj],
+            "grouping": grouping,
         }
 
         return self._sign_and_post(
@@ -152,9 +194,10 @@ class HyperliquidMainExchange(BaseExchange):
             ``httpx.Response`` from ``POST /exchange``.
         """
         nonce = nonce if nonce is not None else int(time.time() * 1000)
+        # Wire order per official SDK: type first, then cancels ({a, o}).
         action: dict[str, Any] = {
-            "cancels": [{"a": asset_index, "o": oid}],
             "type": "cancel",
+            "cancels": [{"a": asset_index, "o": oid}],
         }
         return self._sign_and_post(
             kind="cancel",
