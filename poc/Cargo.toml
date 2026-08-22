@@ -33,7 +33,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 rmp-serde = "1.3"
 # Phase 0 Active Denial — TOFU policy signing (Ed25519).
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 
 # Phase 0 Active Denial — envelope encryption (AES-GCM-256).
 # RustCrypto, audited, no_std-compat. DEK wrapped under KMS, secret
