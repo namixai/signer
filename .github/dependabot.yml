@@ -2,15 +2,19 @@
 # Satisfies OSTIF best-practices guide §05 ("Up to Date Security → automate
 # updates / dependabot-core").
 #
-# ⚠️ Vendoring caveat (TEE / reproducible-build friction, documented honestly):
-# the *measured* enclave is built from crates VENDORED under `poc/vendor/`
-# (nsm-api and the patched kmstool) so its PCR0 is deterministic. Dependabot
-# reads Cargo.toml / Cargo.lock and cannot see or bump those vendored trees — a
-# cargo bump it proposes does NOT change what the enclave actually compiles until
-# the vendored source is re-synced by hand. So Dependabot here is an *early-warning
-# and github-actions* tool; the vendored crypto/attestation deps are re-vetted
-# manually at each PCR0 rotation, and cargo-audit in ci.yml scans the resolved
-# lockfile for known advisories. This split is called out in the OSTIF feedback.
+# ⚠️ PCR0 caveat (TEE / reproducible-build friction, documented honestly — and
+# corrected 2026-08-20): only TWO enclave inputs are vendored under `poc/vendor/`
+# (nsm-api and the patched kmstool); Dependabot cannot see or bump those. EVERY
+# OTHER crate in the enclave's dependency closure comes from the workspace
+# `Cargo.lock`, which the enclave Dockerfile copies into the builder — so a cargo
+# bump Dependabot proposes DOES change the compiled enclave and therefore PCR0.
+# An earlier version of this comment claimed the opposite; two auto-merged bumps
+# (anyhow, thiserror) then moved HEAD off the published measurement while CI
+# stayed green. The guard is now `scripts/enclave-closure-check.py` in ci.yml: a
+# bump that touches the enclave closure fails CI until the image is re-measured
+# and `poc/enclave/DEPENDENCY-CLOSURE.lock` + the README are updated in the same
+# PR. Host-side crates (gateway, parent, policy-cli) remain free to bump.
+# cargo-audit in ci.yml scans the resolved lockfile for known advisories.
 version: 2
 updates:
   # Rust workspace. `directory` points at the manifest root (poc/).
@@ -26,10 +30,10 @@ updates:
       - dependencies
       - rust
     ignore:
-      # Vendored under poc/vendor/ for deterministic PCR0. A Dependabot bump here
-      # updates Cargo.toml/Cargo.lock but NOT the compiled enclave (the build uses
-      # the vendored tree) → a misleading, no-op-on-the-artifact PR. These crypto/
-      # attestation deps are re-vetted by hand at each PCR0 rotation instead.
+      # Vendored under poc/vendor/ (the build uses the vendored tree, so a bump
+      # here would be a no-op on the artifact → misleading PR). Re-vetted by hand
+      # at each PCR0 rotation. NOTE: this is the ONLY vendored exception — see the
+      # header; other enclave deps DO change PCR0 and are guarded by CI instead.
       - dependency-name: "aws-nitro-enclaves-nsm-api"
 
   # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the SHA and the
