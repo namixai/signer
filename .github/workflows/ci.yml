@@ -52,6 +52,8 @@ jobs:
       # PCR0 input guard: the enclave's dependency closure from Cargo.lock must be
       # the one the published measurement was taken against. Pure Python, no
       # nitro-cli, runs in seconds. A red here means "re-measure before merging".
+      - name: Enclave closure guard — self-test (stdlib unittest, no deps)
+        run: python3 -m unittest scripts/test_enclave_closure_check.py
       - name: Enclave dependency closure matches the measured snapshot
         run: python3 scripts/enclave-closure-check.py
       - name: Build (locked)

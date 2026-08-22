@@ -58,7 +58,10 @@ def parse_lock(text: str) -> dict[PkgKey, list[tuple[str, str | None, str | None
         name = re.search(r'^name = "([^"]+)"', block, re.M)
         ver = re.search(r'^version = "([^"]+)"', block, re.M)
         if not name or not ver:
-            continue
+            # Skipping would yield a PARTIAL closure, and --write would persist
+            # it as the truth. Refuse (CodeRabbit).
+            head = block.strip().splitlines()[0] if block.strip() else "<empty>"
+            raise ValueError(f"malformed [[package]] entry (missing name/version) near: {head!r}")
         src_m = re.search(r'^source = "([^"]+)"', block, re.M)
         source = src_m.group(1) if src_m else "path"
         deps: list[tuple[str, str | None, str | None]] = []
@@ -116,11 +119,17 @@ def main() -> int:
     ap.add_argument("--snapshot", type=Path, default=SNAPSHOT)
     ap.add_argument("--write", action="store_true", help="rewrite the snapshot body from --lock (header kept)")
     args = ap.parse_args()
-
     try:
-        current = closure(parse_lock(args.lock.read_text(encoding="utf-8")), ROOT_PACKAGE)
-    except ValueError as e:
+        return run(args.lock, args.snapshot, args.write)
+    except (ValueError, OSError) as e:
+        # One controlled exit for both bad content and bad paths — never a
+        # traceback from a CI gate (CodeRabbit).
         sys.exit(f"enclave-closure-check: {e}")
+
+
+def run(lock: Path, snapshot: Path, write: bool) -> int:
+    args = argparse.Namespace(lock=lock, snapshot=snapshot, write=write)
+    current = closure(parse_lock(args.lock.read_text(encoding="utf-8")), ROOT_PACKAGE)
 
     if args.write:
         header = read_snapshot(args.snapshot)[0] if args.snapshot.exists() else [
@@ -132,7 +141,7 @@ def main() -> int:
         return 0
 
     if not args.snapshot.exists():
-        sys.exit(f"enclave-closure-check: snapshot {args.snapshot} missing")
+        raise OSError(f"snapshot {args.snapshot} missing")
     header, expected = read_snapshot(args.snapshot)
     if current == expected:
         print(f"enclave-closure-check: OK — {len(current)} crates, closure matches the measured snapshot")
