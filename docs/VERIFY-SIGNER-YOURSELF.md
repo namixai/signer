@@ -296,7 +296,7 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 
 🔴 **Read `active` for what it is: current, mutable state — and check the `owner`.**
 `registerPCR0` is permissionless: **any** address may register an unclaimed
-measurement and becomes its owner, and an owner may register a new measurement,
+measurement and become its owner, and an owner may register a new measurement,
 which auto-deprecates their previous one. So `active = true` on its own says
 "someone has this measurement registered right now", not "Usenami vouches for it".
 Two things make it meaningful:
