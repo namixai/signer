@@ -29,12 +29,73 @@ updates:
     labels:
       - dependencies
       - rust
+    # One grouped PR for the host-side crates (gateway, parent, policy-cli)
+    # instead of one PR per crate. These do NOT enter the enclave image, so a
+    # grouped bump is safe to review in one pass. Crates listed under `ignore`
+    # never reach a group — they are excluded before grouping happens.
+    groups:
+      host-side:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
     ignore:
       # Vendored under poc/vendor/ (the build uses the vendored tree, so a bump
       # here would be a no-op on the artifact → misleading PR). Re-vetted by hand
       # at each PCR0 rotation. NOTE: this is the ONLY vendored exception — see the
       # header; other enclave deps DO change PCR0 and are guarded by CI instead.
       - dependency-name: "aws-nitro-enclaves-nsm-api"
+
+      # ── Crates INSIDE the measured enclave image ──────────────────────────
+      # Every name below appears in poc/enclave/DEPENDENCY-CLOSURE.lock. A bump
+      # of ANY size changes the compiled enclave and therefore PCR0, so
+      # scripts/enclave-closure-check.py fails CI until the image is re-measured.
+      # Three such PRs (#46 thiserror, #47 ed25519-dalek, #49 sha2) were opened,
+      # failed CI and were closed by hand in August 2026. These crates move only
+      # in a deliberate PCR0 rotation, never on Dependabot's schedule.
+      #
+      # 🔴 WHY NO `update-types: [version-update:semver-major]` HERE.
+      # That was the obvious fix and it does not work. The closure guard compares
+      # a SET of crates; the semver level of a bump says nothing about whether
+      # that set changes. #46 was thiserror 2.0.18 → 2.0.20 — a PATCH by Cargo's
+      # own rules (dependabot-core has a Cargo-specific Version subclass) — and
+      # it still broke the closure, because thiserror-impl 2.0.20 pulled syn
+      # 3.0.3 in alongside syn 2.0.117. Filtering by level would have left open
+      # exactly the PR that broke first. So: bare `dependency-name`, all levels.
+      #
+      # SECURITY UPDATES ARE NOT SUPPRESSED. In dependabot-core, ignore rules
+      # with no `versions:` return an empty list for security updates, so a CVE
+      # in any crate below still opens a PR. It will go red on the closure guard,
+      # and that is correct: such a bump must ride a PCR0 re-measurement rather
+      # than an auto-merge.
+      #
+      # KEEPING THIS LIST HONEST: it is the intersection of the crates declared
+      # in poc/Cargo.toml with the names in DEPENDENCY-CLOSURE.lock. When the
+      # closure changes, re-derive it — a name that drops off this list silently
+      # brings the weekly noise back.
+      - dependency-name: "aes-gcm"
+      - dependency-name: "anyhow"
+      - dependency-name: "base64"
+      - dependency-name: "ed25519-dalek"
+      - dependency-name: "hex"
+      - dependency-name: "hmac"
+      - dependency-name: "k256"
+      - dependency-name: "rand"
+      - dependency-name: "rmp-serde"
+      - dependency-name: "serde"
+      - dependency-name: "serde_bytes"
+      - dependency-name: "serde_json"
+      - dependency-name: "sha2"
+      - dependency-name: "subtle"
+      - dependency-name: "thiserror"
+      - dependency-name: "tiny-keccak"
+      - dependency-name: "tokio"
+      - dependency-name: "tokio-vsock"
+      - dependency-name: "tracing"
+      - dependency-name: "tracing-subscriber"
+      - dependency-name: "zeroize"
 
   # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the SHA and the
   # trailing version comment together).
