@@ -31,6 +31,7 @@ mod kms_client;
 mod proto;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod rate_limiter;
+mod receipt;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod registry;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

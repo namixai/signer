@@ -56,6 +56,14 @@ jobs:
         run: python3 -m unittest scripts/test_enclave_closure_check.py
       - name: Enclave dependency closure matches the measured snapshot
         run: python3 scripts/enclave-closure-check.py
+      # ROT-8 stdin secret parser. The kmstool binary cannot be executed on a
+      # normal host — `aws_nitro_enclaves_library_init` aborts outside an enclave
+      # — so without this the parser would ship having never run anywhere, which
+      # is exactly the "unverified path in vendored C" risk that deferred ROT-8
+      # once already. The test compiles `vendor/kmstool-enclave-cli/secrets_stdin.h`
+      # standalone (plain C, no SDK types) and drives it; ubuntu-latest has cc.
+      - name: Vendored kmstool stdin parser (fail-closed cases)
+        run: python3 scripts/test_secrets_stdin.py
       - name: Build (locked)
         run: cargo build --workspace --locked
       # Clippy is split because the enclave crate is PCR0-frozen (see header).

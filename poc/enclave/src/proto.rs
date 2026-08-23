@@ -425,6 +425,12 @@ pub struct SignResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provision: Option<ProvisionDataKeyResponse>,
     pub error: Option<String>,
+    /// Decision receipt (`receipt.rs`): the enclave's signed record of THIS
+    /// decision — allow or deny — verifiable against the attestation document's
+    /// `public_key`. `None` before the receipt key is resident (no data key
+    /// provisioned / not yet decrypted this boot) and for non-tenant actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<crate::receipt::DecisionReceipt>,
     /// C24 (ZLODEY 2026-05-18): SHA-256 of the canonical policy JSON,
     /// hex-encoded. Customers verify the enclave loaded their intended
     /// policy, not a swapped permissive one. `None` for legacy blobs.
@@ -517,6 +523,7 @@ impl SignResponse {
             headers: None,
             hl_signature: None,
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -536,6 +543,7 @@ impl SignResponse {
             headers: None,
             hl_signature: None,
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: Some(plaintext_sha256_hex),
             plaintext_len: Some(plaintext_len),
@@ -556,6 +564,7 @@ impl SignResponse {
             headers: Some(headers),
             hl_signature: None,
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -572,6 +581,7 @@ impl SignResponse {
             headers: None,
             hl_signature: None,
             error: Some(code.to_owned()),
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -591,6 +601,7 @@ impl SignResponse {
             headers: None,
             hl_signature: None,
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -611,6 +622,7 @@ impl SignResponse {
             headers: None,
             hl_signature: Some(sig),
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -629,6 +641,7 @@ impl SignResponse {
             headers: None,
             hl_signature: None,
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -646,6 +659,7 @@ impl SignResponse {
             headers: None,
             hl_signature: None,
             error: None,
+            receipt: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -1682,4 +1696,12 @@ pub mod err_code {
     /// The request targets a withdrawal / transfer primitive, which is never
     /// signable under the policy's withdrawal-deny (a useful, safe signal).
     pub const WITHDRAWAL_NOT_SIGNABLE: &str = "withdrawal_not_signable";
+    /// PR-4 (kill switch, enclave floor): the tenant's SIGNED registry mode is
+    /// `cancel_only` and this action would create exposure (order / x402 /
+    /// opaque non-read body). Decided INSIDE the enclave — the gateway cannot
+    /// lift it; only a signed registry refresh can. Distinct from the gateway's
+    /// own `tenant_cancel_only` so the origin is never ambiguous on the wire.
+    pub const MODE_CANCEL_ONLY: &str = "mode_cancel_only";
+    /// PR-4: the tenant's SIGNED registry mode is `halted` — nothing is signed.
+    pub const MODE_HALTED: &str = "mode_halted";
 }

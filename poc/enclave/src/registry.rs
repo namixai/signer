@@ -53,6 +53,43 @@ const REGISTRY_PUBKEY_ENV: &str = "SIGNER_REGISTRY_PUBKEY";
 pub struct ResolvedIdentity {
     pub customer_id: String,
     allowed_venues: Vec<String>,
+    /// PR-4 (kill switch, enclave floor): the tenant's operating mode as
+    /// signed into the registry by the control plane. Enforced in `handle()`
+    /// before any action runs — a mode the gateway cannot lift, because only
+    /// a signed refresh changes it.
+    pub mode: TenantMode,
+}
+
+/// Per-tenant operating mode, carried in the SIGNED registry entry (so the
+/// gateway cannot change it). Mirrors the gateway's three states
+/// (docs/TENANT-KILL-SWITCH-DESIGN.md §5, PR-4): `Active` — everything the
+/// venue ACL + policy allow; `CancelOnly` — no new exposure (orders, x402,
+/// opaque POST bodies refused), cancels and reads still signed; `Halted` —
+/// nothing signed for this tenant. Absent in older registry blobs ⇒ `Active`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TenantMode {
+    #[default]
+    Active,
+    CancelOnly,
+    Halted,
+}
+
+impl TenantMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(TenantMode::Active),
+            "cancel_only" => Some(TenantMode::CancelOnly),
+            "halted" => Some(TenantMode::Halted),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TenantMode::Active => "active",
+            TenantMode::CancelOnly => "cancel_only",
+            TenantMode::Halted => "halted",
+        }
+    }
 }
 
 impl ResolvedIdentity {
@@ -94,6 +131,7 @@ impl ResolvedIdentity {
         ResolvedIdentity {
             customer_id: "attested-data".to_owned(),
             allowed_venues: vec!["data-signing".to_owned()],
+            mode: TenantMode::Active,
         }
     }
 
@@ -115,6 +153,7 @@ impl ResolvedIdentity {
         ResolvedIdentity {
             customer_id: customer_id.to_owned(),
             allowed_venues: vec![venue.to_owned()],
+            mode: TenantMode::Active,
         }
     }
 }
@@ -126,6 +165,7 @@ struct TenantEntry {
     token_hmac: [u8; 32],
     customer_id: String,
     allowed_venues: Vec<String>,
+    mode: TenantMode,
 }
 
 /// Immutable resolved registry. Swapped wholesale under the `RwLock` on each
@@ -210,11 +250,16 @@ pub enum RegistryError {
     BadSignature,
     SignatureInvalid,
     ContentHashMismatch,
-    NonMonotonicVersion { got: u64, max_known: u64 },
+    NonMonotonicVersion {
+        got: u64,
+        max_known: u64,
+    },
     Empty,
     MalformedEntries,
     UnsafeId,
     ReservedVenue,
+    /// PR-4: `mode` present but not one of active | cancel_only | halted.
+    BadMode,
 }
 
 impl RegistryError {
@@ -248,7 +293,8 @@ impl RegistryError {
             RegistryError::MalformedEntries
             | RegistryError::Empty
             | RegistryError::UnsafeId
-            | RegistryError::ReservedVenue => err_code::REGISTRY_ENTRIES_REJECTED,
+            | RegistryError::ReservedVenue
+            | RegistryError::BadMode => err_code::REGISTRY_ENTRIES_REJECTED,
             RegistryError::NonMonotonicVersion { .. } => err_code::REGISTRY_VERSION_REJECTED,
         }
     }
@@ -282,6 +328,12 @@ impl std::fmt::Display for RegistryError {
                     "registry entry grants a reserved platform venue to a non-owner customer"
                 )
             }
+            RegistryError::BadMode => {
+                write!(
+                    f,
+                    "registry entry mode must be active | cancel_only | halted"
+                )
+            }
         }
     }
 }
@@ -302,6 +354,12 @@ pub struct RefreshEntry {
     pub token: String,
     pub customer_id: String,
     pub allowed_venues: Vec<String>,
+    /// PR-4: `"active" | "cancel_only" | "halted"`. Optional so every registry
+    /// blob signed before PR-4 still validates (⇒ `active`); an unknown value
+    /// rejects the whole refresh (`RegistryError::BadMode`) — a typo must not
+    /// silently become `active`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// An id (customer_id / venue) safe to embed in the newline-delimited sealed
@@ -464,6 +522,11 @@ pub fn refresh(
         if grants_reserved_venue_to_non_reserved(&e.customer_id, &e.allowed_venues) {
             return Err(RegistryError::ReservedVenue);
         }
+        if let Some(m) = e.mode.as_deref() {
+            if TenantMode::parse(m).is_none() {
+                return Err(RegistryError::BadMode);
+            }
+        }
     }
 
     // 5-7 under ONE write guard (crypto review C7 — version TOCTOU). The old
@@ -495,6 +558,11 @@ pub fn refresh(
                 token_hmac: token_hmac(&e.token),
                 customer_id: e.customer_id,
                 allowed_venues: e.allowed_venues,
+                mode: e
+                    .mode
+                    .as_deref()
+                    .and_then(TenantMode::parse)
+                    .unwrap_or_default(),
             })
             .collect();
         *guard = Arc::new(Registry {
@@ -567,6 +635,7 @@ pub fn resolve(token: &str) -> Option<ResolvedIdentity> {
         Some(ResolvedIdentity {
             customer_id: e.customer_id.clone(),
             allowed_venues: e.allowed_venues.clone(),
+            mode: e.mode,
         })
     }
 }
@@ -595,14 +664,25 @@ pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 /// blocklist on purpose (tests construct identities the refresh path would reject).
 #[cfg(test)]
 pub fn test_install(entries: &[(&str, &str, &[&str])]) {
+    let with_mode: Vec<(&str, &str, &[&str], TenantMode)> = entries
+        .iter()
+        .map(|(t, c, v)| (*t, *c, *v, TenantMode::Active))
+        .collect();
+    test_install_with_mode(&with_mode);
+}
+
+/// Like `test_install`, with an explicit per-tenant mode (PR-4 tests).
+#[cfg(test)]
+pub fn test_install_with_mode(entries: &[(&str, &str, &[&str], TenantMode)]) {
     let mut g = global().write().unwrap_or_else(|p| p.into_inner());
     let mut current: Vec<TenantEntry> = g.entries.clone();
-    for (tok, cid, venues) in entries {
+    for (tok, cid, venues, mode) in entries {
         let token_hmac = token_hmac(tok);
         let entry = TenantEntry {
             token_hmac,
             customer_id: (*cid).to_owned(),
             allowed_venues: venues.iter().map(|v| (*v).to_owned()).collect(),
+            mode: *mode,
         };
         match current.iter_mut().find(|e| e.token_hmac == token_hmac) {
             Some(slot) => *slot = entry,
@@ -675,6 +755,7 @@ mod tests {
             token: "tok-a".to_owned(),
             customer_id: "cust-a".to_owned(),
             allowed_venues: vec!["binance".to_owned(), "okx".to_owned()],
+            mode: None,
         }];
         let nonce = [1u8; 32];
         let version = 1u64;
@@ -728,11 +809,13 @@ mod tests {
                 token: "tok-a".to_owned(),
                 customer_id: "cust-a".to_owned(),
                 allowed_venues: vec!["binance".to_owned(), "okx".to_owned()],
+                mode: None,
             },
             RefreshEntry {
                 token: "tok-b".to_owned(),
                 customer_id: "cust-b".to_owned(),
                 allowed_venues: vec!["kucoin".to_owned()],
+                mode: None,
             },
         ];
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -750,6 +833,7 @@ mod tests {
             token: "nxai_alpha".to_owned(),
             customer_id: "cust-a".to_owned(),
             allowed_venues: vec!["binance".to_owned(), "okx".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &entries, &nonce, 1);
@@ -775,6 +859,7 @@ mod tests {
             token: "t".to_owned(),
             customer_id: "c".to_owned(),
             allowed_venues: vec!["binance".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &entries, &nonce, 1);
@@ -796,6 +881,7 @@ mod tests {
             token: "t".to_owned(),
             customer_id: "cust-a".to_owned(),
             allowed_venues: vec!["binance".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, bad_sig) = sign_refresh(&attacker, &entries, &nonce, 1);
@@ -820,6 +906,7 @@ mod tests {
             token: "t".to_owned(),
             customer_id: "cust-a\nvenue_id=binance".to_owned(), // injection
             allowed_venues: vec!["binance".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &entries, &nonce, 1);
@@ -843,6 +930,7 @@ mod tests {
             token: "evil".to_owned(),
             customer_id: "cust-a".to_owned(),
             allowed_venues: vec!["binance".to_owned(), "x402".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &tenant, &nonce, 1);
@@ -858,6 +946,7 @@ mod tests {
             token: "x402-platform".to_owned(),
             customer_id: crate::handler::X402_CUSTOMER_ID.to_owned(),
             allowed_venues: vec!["x402".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &reserved, &nonce, 1);
@@ -882,6 +971,7 @@ mod tests {
             token: "evil-ds".to_owned(),
             customer_id: "cust-a".to_owned(),
             allowed_venues: vec!["binance".to_owned(), "data-signing".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &tenant, &nonce, 1);
@@ -896,6 +986,7 @@ mod tests {
             token: "data-signing-svc".to_owned(),
             customer_id: DATA_SIGNING_OWNER.to_owned(),
             allowed_venues: vec!["data-signing".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&sk, &owner, &nonce, 1);
@@ -915,6 +1006,7 @@ mod tests {
                 token: tok.to_owned(),
                 customer_id: "c".to_owned(),
                 allowed_venues: vec!["binance".to_owned()],
+                mode: None,
             }]
         };
         let n1 = challenge();
@@ -941,6 +1033,7 @@ mod tests {
             token: "t".to_owned(),
             customer_id: "c".to_owned(),
             allowed_venues: vec!["binance".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (json, sig) = sign_refresh(&attacker, &entries, &nonce, 1);
@@ -957,6 +1050,7 @@ mod tests {
             token: "t".to_owned(),
             customer_id: "c".to_owned(),
             allowed_venues: vec!["binance".to_owned()],
+            mode: None,
         }];
         let nonce = challenge();
         let (_json, sig) = sign_refresh(&sk, &entries, &nonce, 1);
@@ -967,11 +1061,36 @@ mod tests {
         assert!(matches!(err, RegistryError::SignatureInvalid), "{err:?}");
     }
 
+    /// PR-4: `mode` is optional (old blobs ⇒ active), parsed when present, and
+    /// an unknown value rejects the refresh — a typo must not become `active`.
+    #[test]
+    fn refresh_entry_mode_is_optional_parsed_and_validated() {
+        let absent: RefreshEntry =
+            serde_json::from_str(r#"{"token":"t","customer_id":"c","allowed_venues":["binance"]}"#)
+                .unwrap();
+        assert!(absent.mode.is_none());
+        let co: RefreshEntry = serde_json::from_str(
+            r#"{"token":"t","customer_id":"c","allowed_venues":["binance"],"mode":"cancel_only"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            TenantMode::parse(co.mode.as_deref().unwrap()),
+            Some(TenantMode::CancelOnly)
+        );
+        assert_eq!(TenantMode::parse("halted"), Some(TenantMode::Halted));
+        assert_eq!(TenantMode::parse("active"), Some(TenantMode::Active));
+        assert_eq!(TenantMode::parse("HALTED"), None, "exact spelling only");
+        assert_eq!(TenantMode::parse("paused"), None);
+        // Serialization omits an absent mode — byte-identical blobs for old tooling.
+        assert!(!serde_json::to_string(&absent).unwrap().contains("mode"));
+    }
+
     #[test]
     fn sealed_aad_is_canonical_and_identity_bound() {
         let id = ResolvedIdentity {
             customer_id: "cust-a".to_owned(),
             allowed_venues: vec!["binance".to_owned()],
+            mode: TenantMode::Active,
         };
         assert_eq!(
             id.sealed_aad("binance", 1),
@@ -981,6 +1100,7 @@ mod tests {
         let other = ResolvedIdentity {
             customer_id: "cust-b".to_owned(),
             allowed_venues: vec!["binance".to_owned()],
+            mode: TenantMode::Active,
         };
         assert_ne!(id.sealed_aad("binance", 1), other.sealed_aad("binance", 1));
     }

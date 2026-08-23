@@ -208,8 +208,19 @@ RUN git clone https://github.com/aws/aws-nitro-enclaves-sdk-c.git && \
 # the surface minimal — CMakeLists.txt and other files come from upstream.
 # Patch sourced from vendor/kmstool-enclave-cli/main.c; see the README in that
 # directory for upstream provenance and patch rationale.
+# ROT-8 adds a second file to the overlay: `secrets_stdin.h`, the plain-C stdin
+# parser main.c includes. It is a HEADER on purpose — headers need no CMake
+# change, so the vendored footprint stays "files we overlay", not "upstream build
+# files we edit". Both land in the same directory, which is what makes the bare
+# `#include "secrets_stdin.h"` resolve.
+#
+# 🔴 Forgetting this line is not a subtle failure: the pre-gate caught exactly
+# that on 2026-08-09 with `fatal error: secrets_stdin.h: No such file or
+# directory`. Cheap to catch here, expensive to catch at gate-0 after a full
+# uncached build — which is the entire argument for the pre-gate existing.
 COPY vendor/kmstool-enclave-cli/main.c \
-    /tmp/crt-builder/aws-nitro-enclaves-sdk-c/bin/kmstool-enclave-cli/main.c
+     vendor/kmstool-enclave-cli/secrets_stdin.h \
+    /tmp/crt-builder/aws-nitro-enclaves-sdk-c/bin/kmstool-enclave-cli/
 
 # Build the SDK (with our patched kmstool-enclave-cli compiled in).
 RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
@@ -251,10 +262,13 @@ ENV SIGNER_REGISTRY_PUBKEY=cd1ede5b3a58181236bfb98ebaf20fda530a39d5f4c14257603c0
 # key. Generated 2026-07-03 (key ceremony); the private seed is vault-only
 # (`SIGNER_POLICY_PRIVKEY`, manual signing ceremony, NEVER on-box/cron/auto-
 # refresh). Baking this value is PCR0-determining ⇒ a re-attestation event (ops
-# runbook C1). The gate stays INERT until a box also sets `SIGNER_REQUIRE_POLICY=1`
-# (mainnet profile) — the permissive demo box (REQUIRE_POLICY unset) is unaffected
-# even though it now carries this pubkey. Empty/absent ⇒ money-venue signing is
-# refused under the strict regime (fail-closed).
+# runbook C1). The gate is INERT unless the box also sets `SIGNER_REQUIRE_POLICY=1`.
+# 🔴 As deployed today that condition holds EVERYWHERE: since 2026-08-10 the demo
+# box runs the same strict measurement as mainnet, so the sentence that used to
+# stand here — "the permissive demo box (REQUIRE_POLICY unset) is unaffected" —
+# describes no box we operate. Kept as a property of the flag, not of a lane.
+# Empty/absent ⇒ money-venue signing is refused under the strict regime
+# (fail-closed).
 ENV SIGNER_POLICY_PUBKEY=96d54fbe908f6b7dbc348843b06c2626be85d86ca631b406d17f62ad262548fd
 
 # Strict-regime enforcement flag (B1, mainnet floor). `enclave/src/handler.rs`
@@ -279,7 +293,14 @@ ENV SIGNER_POLICY_PUBKEY=96d54fbe908f6b7dbc348843b06c2626be85d86ca631b406d17f62a
 # Default 0 = permissive (identical enforcement behavior to the flag being unset;
 # see parse_require_policy_env: only 1/true/yes/on are truthy). Build the strict
 # (mainnet/B1) EIF with `--build-arg SIGNER_REQUIRE_POLICY=1`
-# (or `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`); the demo EIF stays 0.
+# (or `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`).
+#
+# 🔴 STALE-COMMENT FIX 2026-08-23: this line used to end with "the demo EIF
+# stays 0". Not true since 2026-08-10 — the demo box was moved onto the same
+# strict measurement as mainnet (`32d25d8c…`), so BOTH lanes run with
+# SIGNER_REQUIRE_POLICY=1 and the default below is a build default, not a
+# description of what is deployed anywhere. Wording only: the ARG default is
+# unchanged, so no image content and no PCR0 changes from this edit.
 ARG SIGNER_REQUIRE_POLICY=0
 ENV SIGNER_REQUIRE_POLICY=${SIGNER_REQUIRE_POLICY}
 

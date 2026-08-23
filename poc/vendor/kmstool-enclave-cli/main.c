@@ -9,6 +9,10 @@
 
 #include <json-c/json.h>
 
+/* ROT-8: secrets via stdin. Header-only, plain C, no SDK types — see the file
+ * for why it is a header and how it is tested outside the enclave. */
+#include "secrets_stdin.h"
+
 #include <linux/vm_sockets.h>
 #include <sys/socket.h>
 
@@ -62,6 +66,11 @@ struct app_ctx {
     uint32_t port;
     /* vsock port on which vsock-proxy is available in parent. */
     uint32_t proxy_port;
+
+    /* ROT-8: secrets arrived on stdin rather than argv. Kept on the context so
+     * the required-argument checks can tell "absent" from "supplied elsewhere"
+     * without re-reading the stream. */
+    bool secrets_from_stdin;
 
     /* KMS credentials */
     const struct aws_string *aws_access_key_id;
@@ -200,6 +209,9 @@ static struct aws_cli_option s_long_options[] = {
      * --key-spec and the codes are a single flat namespace shared by all
      * subcommands. */
     {"plaintext", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'P'},
+    /* ROT-8: read the four secret-bearing values from stdin instead of argv.
+     * No argument of its own — the secrets are the payload, not the flag. */
+    {"secrets-from-stdin", AWS_CLI_OPTIONS_NO_ARGUMENT, NULL, 'S'},
     {"help", AWS_CLI_OPTIONS_NO_ARGUMENT, NULL, 'h'},
     {NULL, 0, NULL, 0},
 };
@@ -278,7 +290,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
         int option_index = 0;
 
         /* ROT-7: `P:` added for --plaintext (encrypt). */
-        int c = aws_cli_getopt_long(argc, argv, "r:x:k:s:t:c:K:p:a:e:l:P:h", s_long_options, &option_index);
+        int c = aws_cli_getopt_long(argc, argv, "r:x:k:s:t:c:K:p:a:e:l:P:Sh", s_long_options, &option_index);
         if (c == -1) {
             break;
         }
@@ -291,6 +303,9 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
                 break;
             case 'x':          
                 ctx->proxy_port = atoi(aws_cli_optarg);
+                break;
+            case 'S':
+                ctx->secrets_from_stdin = true;
                 break;
             case 'k':
                 ctx->aws_access_key_id = aws_string_new_from_c_str(ctx->allocator, aws_cli_optarg);
@@ -385,6 +400,56 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
                     }
                 }
         }
+    }
+
+    /* ─── ROT-8: pull the secrets off stdin ──────────────────────────────────
+     *
+     * Runs AFTER the option loop so `--secrets-from-stdin` has been seen, and
+     * BEFORE the required-argument checks so a value delivered on stdin
+     * satisfies them exactly as a flag would.
+     *
+     * MIXING IS REFUSED, not merged. If a secret arrives both ways we cannot
+     * know which the caller meant, and picking one silently is how a rotation
+     * ends up signing with a credential nobody intended. Refusing costs one
+     * clear error; guessing costs an investigation.
+     */
+    if (ctx->secrets_from_stdin) {
+        if (ctx->aws_access_key_id != NULL || ctx->aws_secret_access_key != NULL ||
+            ctx->aws_session_token != NULL || ctx->plaintext_b64 != NULL) {
+            fprintf(stderr,
+                    "--secrets-from-stdin was given together with a secret flag "
+                    "(--aws-access-key-id / --aws-secret-access-key / "
+                    "--aws-session-token / --plaintext). Refusing to guess which "
+                    "one you meant: pass the secrets on stdin only.\n");
+            exit(1);
+        }
+        struct kmstool_stdin_secrets secrets;
+        enum kmstool_stdin_status st = kmstool_stdin_read_secrets(stdin, &secrets);
+        if (st != KMSTOOL_STDIN_OK) {
+            /* The message names the SHAPE problem and never the content — a
+             * parse error must not become a way to echo a secret into a log. */
+            fprintf(stderr, "--secrets-from-stdin: %s\n", kmstool_stdin_strerror(st));
+            kmstool_stdin_secrets_clean_up(&secrets);
+            exit(1);
+        }
+        if (secrets.access_key_id != NULL) {
+            ctx->aws_access_key_id = aws_string_new_from_c_str(ctx->allocator, secrets.access_key_id);
+        }
+        if (secrets.secret_access_key != NULL) {
+            ctx->aws_secret_access_key =
+                aws_string_new_from_c_str(ctx->allocator, secrets.secret_access_key);
+        }
+        if (secrets.session_token != NULL) {
+            ctx->aws_session_token = aws_string_new_from_c_str(ctx->allocator, secrets.session_token);
+        }
+        if (secrets.plaintext_b64 != NULL) {
+            ctx->plaintext_b64 = aws_string_new_from_c_str(ctx->allocator, secrets.plaintext_b64);
+        }
+        /* Wipe the intermediate copies immediately: from here the values live
+         * only in the aws_string fields, which are wiped at exit (see
+         * s_app_ctx_secure_clean_up). Two copies of a secret are one more than
+         * necessary and the extra one has no owner. */
+        kmstool_stdin_secrets_clean_up(&secrets);
     }
 
     /* Check if AWS access key ID is set */
@@ -946,6 +1011,34 @@ cleanup:
     return rc;
 }
 
+/* ROT-8: wipe the secret-bearing strings before the process exits.
+ *
+ * Moving secrets off argv is only half the job: until now these four
+ * `aws_string`s were never destroyed at all — they lived in the heap until the
+ * process died, and a heap that is never wiped is a smaller version of the
+ * problem argv was. `aws_string_destroy_secure` zeroes before freeing.
+ *
+ * Only these four. `region`, `key_id`, `ciphertext_b64` and friends are not
+ * secrets, and destroying them here would be churn without a security story. */
+static void s_app_ctx_secure_clean_up(struct app_ctx *ctx) {
+    if (ctx->aws_access_key_id != NULL) {
+        aws_string_destroy_secure((struct aws_string *)ctx->aws_access_key_id);
+        ctx->aws_access_key_id = NULL;
+    }
+    if (ctx->aws_secret_access_key != NULL) {
+        aws_string_destroy_secure((struct aws_string *)ctx->aws_secret_access_key);
+        ctx->aws_secret_access_key = NULL;
+    }
+    if (ctx->aws_session_token != NULL) {
+        aws_string_destroy_secure((struct aws_string *)ctx->aws_session_token);
+        ctx->aws_session_token = NULL;
+    }
+    if (ctx->plaintext_b64 != NULL) {
+        aws_string_destroy_secure((struct aws_string *)ctx->plaintext_b64);
+        ctx->plaintext_b64 = NULL;
+    }
+}
+
 int main(int argc, char **argv) {
     struct app_ctx app_ctx;
     int rc;
@@ -1070,6 +1163,11 @@ int main(int argc, char **argv) {
 cleanup_hash_table:
     aws_hash_table_clean_up(&app_ctx.encryption_context);
 cleanup_sdk:
+    /* ROT-8: before the SDK goes away, and on every exit path that reaches the
+     * end of main. The `exit(1)` paths in option parsing are deliberately left
+     * alone — at that point nothing has been assigned yet, or the stdin reader
+     * has already wiped its own copies. */
+    s_app_ctx_secure_clean_up(&app_ctx);
     aws_nitro_enclaves_library_clean_up();
 
     return exit_rc;

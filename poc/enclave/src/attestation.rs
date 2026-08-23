@@ -27,13 +27,16 @@ pub enum AttestationError {
 }
 
 /// Ask the NSM driver for a COSE-signed attestation document binding the
-/// caller `nonce` (and optional `user_data`). Returns the raw `COSE_Sign1`
-/// bytes. `public_key` is intentionally omitted — `/attestation` proves the
-/// enclave IMAGE (PCR0), not a per-request keypair.
+/// caller `nonce` (and optional `user_data`) and — since decision receipts —
+/// the enclave's resident receipt/attested-data PUBLIC key in `public_key`
+/// (`None` while no key is resident: the document then proves the image only,
+/// and a verifier sees that no receipt epoch is active on this enclave).
+/// Returns the raw `COSE_Sign1` bytes.
 #[cfg(target_os = "linux")]
 pub fn nsm_attestation(
     nonce: Option<Vec<u8>>,
     user_data: Option<Vec<u8>>,
+    public_key: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, AttestationError> {
     use aws_nitro_enclaves_nsm_api::api::{Request, Response};
     use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
@@ -46,7 +49,7 @@ pub fn nsm_attestation(
     let request = Request::Attestation {
         user_data: user_data.map(ByteBuf::from),
         nonce: nonce.map(ByteBuf::from),
-        public_key: None,
+        public_key: public_key.map(ByteBuf::from),
     };
     let response = nsm_process_request(fd, request);
     // Always release the NSM fd, success or failure.
@@ -64,6 +67,7 @@ pub fn nsm_attestation(
 pub fn nsm_attestation(
     _nonce: Option<Vec<u8>>,
     _user_data: Option<Vec<u8>>,
+    _public_key: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, AttestationError> {
     Err(AttestationError::Unavailable)
 }
