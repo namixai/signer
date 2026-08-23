@@ -27,7 +27,7 @@ operating system, even by AWS engineers. Your trading bot sends a
 returns the authentication headers, and your bot forwards them to the
 exchange. The signing secret never leaves the enclave.
 
-Supported exchanges: KuCoin Futures, Binance (spot & futures), Bybit
+Supported exchanges: Binance USD-M futures (spot order signing is NOT implemented), OKX perpetual swap, Hyperliquid, Asterdex. KuCoin Futures and Bybit exist in the enclave but sign nowhere today. Bybit
 V5, OKX V5, Hyperliquid mainnet, and Asterdex.
 
 ---
@@ -54,12 +54,16 @@ yourself, no allowlist needed, in your browser or with one command.
 
 ## A note on access
 
-The HTTP signing endpoint at `signer-demo.usenami.io:8443` is reachable
-only from IPs on a closed allowlist. This is itself a security
-feature — it shrinks the attack surface during the closed-pilot phase.
-The transcripts in steps 2 and 3 are real responses; you cannot
-reproduce them by running the `curl` directly unless you are a pilot
-user (or your IP gets allowlisted on request).
+The signing routes at `signer-demo.usenami.io:8443` need a bearer token
+we issue; without one they answer `401`. What gates them is the token,
+not your address — this section claimed a closed IP allowlist until
+2026-08-23, and that is not how the endpoint is protected.
+
+Two consequences worth being plain about. The read-only routes are
+open: `/healthz` and `/attestation` answer anyone, by design, because
+the attestation document is the thing you are meant to check without
+asking us. And the transcripts in steps 2 and 3 are real responses you
+cannot reproduce without a token — ask and we will issue one.
 
 The on-chain verification in **Step 4 is fully public** and exists
 precisely so a skeptical reader does not have to trust this document.
@@ -644,8 +648,11 @@ To stay honest:
 
 ## How to try Usenami Signer
 
-The signing endpoint is available to a closed pilot group as of May
-2026. If you trade through CEX or DEX APIs and want to participate:
+The signing endpoint is issued per tenant, on request. The line here
+read "a closed pilot group as of May 2026" — a date three months stale
+by the time you are reading it, which is exactly how a document starts
+lying without anyone editing it. If you trade through CEX or DEX APIs
+and want to participate:
 
 1. Reach out via the contact channel where you received this document.
 2. Pilot users get free access to the live signer, source IP
