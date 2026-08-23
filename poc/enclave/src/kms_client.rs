@@ -12,20 +12,30 @@
 //! Plaintext NEVER reaches the log layer — only the redacted struct fields.
 //!
 //! Adversarial-mindset notes (from `_signer/06-АТАКУЕМ-СЕБЯ.md`):
-//!   - 🔴 **CORRECTED 2026-08-02.** This line used to read "Credentials are
-//!     passed via stdin to avoid /proc/<pid>/cmdline exposure." **They are
-//!     not.** Every call below passes credentials as `--aws-*` FLAGS and sets
-//!     `stdin(Stdio::null())`; the `kmstool_via_stdin` the note implies has
-//!     never existed — only a `_silence_write_import` stub referencing it. The
-//!     claim was aspirational and read as fact for months. Leaving a security
-//!     property documented-but-absent is worse than not documenting it, so it
-//!     is stated as it is: **secrets reach kmstool through argv.**
-//!   - Practical scope of that: inside a Nitro enclave the process space holds
-//!     only this binary and the kmstool child it spawns — there is no third
-//!     party to read `/proc`. It is a real property to fix, not a live hole.
-//!     Fixing it means adding a stdin input path to the vendored kmstool C.
-//!   - Our OWN heap copies of key material ARE zeroized: `build_encrypt_args`
-//!     returns `Zeroizing<String>` (CodeRabbit, #347).
+//!   - **Secrets reach kmstool on STDIN, not argv (ROT-8, 2026-08-09).** All
+//!     four — the three credential parts and the base64 DEK — are written to the
+//!     child's stdin as `KEY=VALUE` lines; argv carries only region, proxy port,
+//!     ciphertext and encryption context, none of which is secret. The wire
+//!     format and its fail-closed rules live in
+//!     `vendor/kmstool-enclave-cli/secrets_stdin.h`.
+//!   - 🔴 **The history matters more than the fix, so it stays written down.**
+//!     This block once claimed the stdin path as fact while the code passed
+//!     flags; the claim was aspirational, read as true for months, and was
+//!     corrected on 2026-08-02 to say plainly that secrets went through argv.
+//!     Now the code matches the original claim — and the lesson does not expire:
+//!     a security property that lives only in a comment is worth less than no
+//!     comment at all. The property is now pinned by tests
+//!     (`rot8_encrypt_argv_carries_no_secret` here,
+//!     `scripts/test_secrets_stdin.py` for the C parser) rather than by prose.
+//!   - Scope of what this bought: inside a Nitro enclave the process space holds
+//!     only this binary and the kmstool child it spawns, so there was never a
+//!     third party to read `/proc`. This was a property to fix, not a live hole
+//!     — the value is that "no secret appears in argv" is now a sentence we can
+//!     say without an asterisk.
+//!   - Our OWN heap copies of key material ARE zeroized: the stdin payload is
+//!     `Zeroizing<String>`, `build_encrypt_args` returns `Zeroizing<String>`
+//!     (CodeRabbit, #347), and since ROT-8 the C side wipes its copies too
+//!     (`s_app_ctx_secure_clean_up`) — before, they lived until process exit.
 //!   - The whole stdout is wrapped in `Zeroizing`; on parse failure we drop it.
 //!   - We never echo stderr back to the caller.
 
@@ -34,7 +44,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::proto::AwsCredentials;
 
@@ -69,6 +79,160 @@ pub enum GenKeyError {
     AccessDenied,
     /// Anything else — bad invocation, parse error, missing context, etc.
     Internal,
+}
+
+/// ROT-8: the secret payload the child reads on stdin, in the format
+/// `vendor/kmstool-enclave-cli/secrets_stdin.h` defines — one `KEY=VALUE` per
+/// line, order-independent, EOF-terminated.
+///
+/// Built by a PURE function for the same reason `build_encrypt_args` is: the
+/// property worth asserting is "no secret appears in argv", and a test can only
+/// assert that if the two sides — what goes to argv, what goes to stdin — are
+/// separately inspectable without a kmstool binary.
+///
+/// `Zeroizing` because this string holds all three credentials at once; it is
+/// the single largest concentration of secret material in the process.
+fn build_stdin_secrets(
+    creds: &AwsCredentials,
+    dek_b64: Option<&str>,
+) -> Result<Zeroizing<String>, ()> {
+    // 🔴 THE DELIMITER MUST NOT APPEAR IN A VALUE. The format is line-oriented,
+    // so a value carrying `\n` would end its own record and start another one —
+    // a credential that contains `\nPLAINTEXT_B64=…` injects a DEK the caller
+    // never passed. Found by Gemini and CodeRabbit independently on #417, and it
+    // is exactly the defect class this department keeps catching in others: a
+    // parser hardened at one end while the writer assumes well-formed input.
+    //
+    // Rejected, not escaped. Escaping would need the C side to unescape, and two
+    // implementations of one encoding is how they drift; none of these four
+    // values can legally contain a newline, so refusing is both correct and
+    // cheaper. `\r` too — the parser strips a trailing CR, so a value ending in
+    // one would arrive silently altered.
+    //
+    // Fail-closed via Result rather than `assert!`: a panic inside the enclave
+    // takes the whole process down, and the caller already maps this to a clean
+    // internal_error. The log names the FIELD and never the value.
+    for (field, value) in [
+        ("access_key_id", creds.access_key_id.as_str()),
+        ("secret_access_key", creds.secret_access_key.as_str()),
+        ("session_token", creds.session_token.as_str()),
+    ]
+    .into_iter()
+    .chain(dek_b64.map(|d| ("plaintext_b64", d)))
+    {
+        if value.contains('\n') || value.contains('\r') {
+            tracing::error!(
+                field = field,
+                "secret contains a line delimiter — refusing to build the stdin payload"
+            );
+            return Err(());
+        }
+        if value.is_empty() {
+            // The C parser rejects an empty value (an empty secret would satisfy
+            // a "was it provided" check). Catch it here so the failure names the
+            // field instead of arriving as a generic parse error.
+            tracing::error!(field = field, "secret is empty");
+            return Err(());
+        }
+    }
+
+    let mut out = String::with_capacity(512);
+    out.push_str("AWS_ACCESS_KEY_ID=");
+    out.push_str(&creds.access_key_id);
+    out.push('\n');
+    out.push_str("AWS_SECRET_ACCESS_KEY=");
+    out.push_str(&creds.secret_access_key);
+    out.push('\n');
+    out.push_str("AWS_SESSION_TOKEN=");
+    out.push_str(&creds.session_token);
+    out.push('\n');
+    if let Some(dek) = dek_b64 {
+        out.push_str("PLAINTEXT_B64=");
+        out.push_str(dek);
+        out.push('\n');
+    }
+    Ok(Zeroizing::new(out))
+}
+
+/// The COMPLETE argv for `encrypt`, secret-free by construction.
+///
+/// Extracted so the property that matters — "no secret appears in the command
+/// line" — is asserted on the whole thing rather than on the tail fragment
+/// (CodeRabbit, #417). A test over a fragment cannot see a secret re-added to
+/// the head, which is precisely where the credentials used to live.
+fn encrypt_argv(tail: &[Zeroizing<String>]) -> Vec<String> {
+    let mut argv = vec![
+        "encrypt".to_owned(),
+        "--secrets-from-stdin".to_owned(),
+        "--region".to_owned(),
+        REGION.to_owned(),
+        "--proxy-port".to_owned(),
+        PROXY_PORT.to_string(),
+    ];
+    argv.extend(tail.iter().map(|a| a.to_string()));
+    argv
+}
+
+/// The head of the `decrypt` argv; the caller appends the encryption context.
+fn decrypt_argv(ciphertext_b64: &str) -> Vec<String> {
+    vec![
+        "decrypt".to_owned(),
+        "--secrets-from-stdin".to_owned(),
+        "--region".to_owned(),
+        REGION.to_owned(),
+        "--proxy-port".to_owned(),
+        PROXY_PORT.to_string(),
+        "--ciphertext".to_owned(),
+        ciphertext_b64.to_owned(),
+    ]
+}
+
+/// Spawn the child, write the secrets to its stdin, close it, and collect the
+/// output. Closing stdin is what ends the child's read loop — leaving it open
+/// would hang both processes, so it is not optional politeness.
+///
+/// The payload is small (three credentials plus a 44-byte base64 DEK, far under
+/// a pipe buffer), so writing before reading cannot deadlock.
+fn run_with_stdin_secrets(
+    mut cmd: Command,
+    payload: &Zeroizing<String>,
+    what: &'static str,
+) -> Result<std::process::Output, ()> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, op = what, "kmstool_enclave_cli spawn failed");
+            return Err(());
+        }
+    };
+    {
+        let Some(stdin) = child.stdin.as_mut() else {
+            tracing::error!(op = what, "child stdin unavailable after piped spawn");
+            let _ = child.kill();
+            // Reap it: kill() only signals. Without wait() the child stays a
+            // zombie for the life of the enclave process (Gemini, #417).
+            let _ = child.wait();
+            return Err(());
+        };
+        if let Err(e) = stdin.write_all(payload.as_bytes()) {
+            tracing::error!(error = %e, op = what, "writing secrets to child stdin failed");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(());
+        }
+    }
+    // Dropping the handle closes the pipe → the child sees EOF and stops reading.
+    drop(child.stdin.take());
+    match child.wait_with_output() {
+        Ok(o) => Ok(o),
+        Err(e) => {
+            tracing::error!(error = %e, op = what, "kmstool_enclave_cli wait failed");
+            Err(())
+        }
+    }
 }
 
 /// Wrap an ENCLAVE-GENERATED 32-byte DEK under `key_id`, bound to
@@ -124,32 +288,21 @@ pub fn wrap_dek_with_context(
     // Credential-free part of the argv, built by a PURE function so it can be
     // asserted in unit tests without a kmstool binary, an enclave or a network.
     // This is the piece that was silently wrong before ROT-7.
-    let tail = build_encrypt_args(key_id, dek_b64.as_str(), ctx)?;
+    let tail = build_encrypt_args(key_id, ctx)?;
 
+    // ROT-8: the four secrets travel on stdin; argv carries only the
+    // non-secret shape of the call.
+    let argv = encrypt_argv(&tail);
     let mut cmd = Command::new(KMSTOOL_BIN);
-    cmd.arg("encrypt")
-        .arg("--region")
-        .arg(REGION)
-        .arg("--proxy-port")
-        .arg(PROXY_PORT.to_string())
-        .arg("--aws-access-key-id")
-        .arg(&creds.access_key_id)
-        .arg("--aws-secret-access-key")
-        .arg(&creds.secret_access_key)
-        .arg("--aws-session-token")
-        .arg(&creds.session_token);
-    cmd.args(tail.iter().map(|a| a.as_str()));
+    cmd.args(argv.iter().map(|a| a.as_str()));
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = match cmd.output() {
+    let payload = match build_stdin_secrets(creds, Some(dek_b64.as_str())) {
+        Ok(p) => p,
+        Err(()) => return Err(GenKeyError::Internal),
+    };
+    let output = match run_with_stdin_secrets(cmd, &payload, "encrypt") {
         Ok(o) => o,
-        Err(e) => {
-            tracing::error!(error = %e, "kmstool_enclave_cli encrypt spawn failed");
-            return Err(GenKeyError::Internal);
-        }
+        Err(()) => return Err(GenKeyError::Internal),
     };
 
     // Kept Zeroizing even though `encrypt` stdout no longer carries a DEK: the
@@ -215,27 +368,12 @@ pub fn decrypt(
 ) -> Result<Zeroizing<Vec<u8>>, DecryptError> {
     let ciphertext_b64 = B64.encode(ciphertext);
 
-    // Build the command. Credentials go on argv (kmstool's only supported
-    // way today). We zeroize argv-equivalents in our process by keeping the
-    // creds in `Zeroizing<String>` only for the duration of this call.
-    //
-    // Note: kmstool_enclave_cli on Linux uses /proc/self/cmdline which is
-    // visible to root on the host normally, but inside an enclave there is
-    // no host visibility. The parent never sees the enclave's cmdline.
-    let mut cmd = Command::new(KMSTOOL_BIN);
-    cmd.arg("decrypt")
-        .arg("--region")
-        .arg(REGION)
-        .arg("--proxy-port")
-        .arg(PROXY_PORT.to_string())
-        .arg("--aws-access-key-id")
-        .arg(&creds.access_key_id)
-        .arg("--aws-secret-access-key")
-        .arg(&creds.secret_access_key)
-        .arg("--aws-session-token")
-        .arg(&creds.session_token)
-        .arg("--ciphertext")
-        .arg(&ciphertext_b64);
+    // ROT-8: credentials travel on stdin. argv now carries only the shape of
+    // the call — region, proxy port, ciphertext, encryption context — none of
+    // which is secret. The note that used to sit here ("inside an enclave there
+    // is no host visibility") stays true and is still why this was a property to
+    // fix rather than a live hole; it is simply no longer the whole answer.
+    let mut argv = decrypt_argv(&ciphertext_b64);
 
     // Append --encryption-context key=value for each entry. Sorted by key
     // for deterministic CLI invocation (aids debugging / log correlation).
@@ -246,20 +384,20 @@ pub fn decrypt(
         for k in keys {
             let v = &ctx[k];
             validate_context_pair(k, v)?;
-            cmd.arg("--encryption-context").arg(format!("{}={}", k, v));
+            argv.push("--encryption-context".to_owned());
+            argv.push(format!("{}={}", k, v));
         }
     }
+    let mut cmd = Command::new(KMSTOOL_BIN);
+    cmd.args(argv.iter().map(|a| a.as_str()));
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = match cmd.output() {
+    let payload = match build_stdin_secrets(creds, None) {
+        Ok(p) => p,
+        Err(()) => return Err(DecryptError::Internal),
+    };
+    let output = match run_with_stdin_secrets(cmd, &payload, "decrypt") {
         Ok(o) => o,
-        Err(e) => {
-            tracing::error!(error = %e, "kmstool_enclave_cli spawn failed");
-            return Err(DecryptError::Internal);
-        }
+        Err(()) => return Err(DecryptError::Internal),
     };
 
     // Wrap stdout in Zeroizing BEFORE the status check (same class as the genkey
@@ -344,15 +482,6 @@ fn parse_kmstool_line(stdout: &[u8], prefix: &str) -> Result<Zeroizing<String>> 
     bail!("no {prefix} line in kmstool stdout");
 }
 
-// Suppress the `Write` import warning when this module is built but
-// `kmstool_via_stdin` is unused — kept for forward compatibility.
-#[allow(dead_code)]
-fn _silence_write_import() {
-    let mut buf: Vec<u8> = Vec::new();
-    let _ = buf.write_all(b"");
-    buf.zeroize();
-}
-
 /// Reject keys/values that would corrupt kmstool's `key=value` parsing.
 /// kmstool splits on the first `=`, so `=` in keys is dangerous (shifts
 /// the split boundary). Null bytes and whitespace are disallowed for
@@ -397,14 +526,12 @@ fn build_context_args(ctx: &HashMap<String, String>) -> Vec<String> {
 /// drop that copy onto the heap un-wiped — `Zeroizing` on the *source*
 /// `dek_b64` does not reach a clone made here. This wipes OUR copies.
 ///
-/// ⚠️ It does NOT remove the DEK from the child's argv, which is the other half
-/// of that review comment and is not fixable in Rust: `kmstool_enclave_cli`
-/// takes its input only from flags. Closing it needs a stdin path in the
-/// vendored C — see the report; it is a CTO call because the EIF is built once
-/// and adding it later costs a whole rotation.
+/// ROT-8 closed the other half of that review comment: the DEK is no longer an
+/// argv element at all — it travels on stdin (`build_stdin_secrets`), so this
+/// function now builds a genuinely secret-free argument list. What remains here
+/// is the key id and the encryption context, neither of which is a secret.
 fn build_encrypt_args(
     key_id: &str,
-    dek_b64: &str,
     ctx: &HashMap<String, String>,
 ) -> Result<Vec<Zeroizing<String>>, GenKeyError> {
     if ctx.is_empty() {
@@ -414,8 +541,6 @@ fn build_encrypt_args(
     let mut args = vec![
         Zeroizing::new("--key-id".to_owned()),
         Zeroizing::new(key_id.to_owned()),
-        Zeroizing::new("--plaintext".to_owned()),
-        Zeroizing::new(dek_b64.to_owned()),
     ];
     let mut keys: Vec<&String> = ctx.keys().collect();
     keys.sort();
@@ -439,21 +564,212 @@ mod rot7_encrypt_args {
         c
     }
 
-    /// The regression this whole change exists for: the context MUST reach the
+    // ── ROT-8: the secrets are on stdin, and NOTHING secret is on argv ──────
+    //
+    // The test that did not exist before this change: nothing asserted the
+    // ABSENCE of credentials from the argument list, so the property could be
+    // lost by a one-line edit and no build would notice.
+
+    fn test_creds() -> AwsCredentials {
+        AwsCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_owned(),
+            session_token: "FwoGZXIvYXdzEExampleSessionToken".to_owned(),
+        }
+    }
+
+    /// Every secret we hold, in one place, so a test can assert none of them
+    /// appear somewhere they should not.
+    fn secret_values(creds: &AwsCredentials, dek_b64: &str) -> Vec<String> {
+        vec![
+            creds.access_key_id.clone(),
+            creds.secret_access_key.clone(),
+            creds.session_token.clone(),
+            dek_b64.to_owned(),
+        ]
+    }
+
+    #[test]
+    fn rot8_encrypt_argv_carries_no_secret() {
+        let creds = test_creds();
+        // The COMPLETE argv, head included — a fragment cannot see a secret
+        // re-added where the credentials used to live (CodeRabbit, #417).
+        let tail = build_encrypt_args("cec983ce", &data_signing_ctx()).expect("build");
+        let args = encrypt_argv(&tail);
+        let joined = args.join(" ");
+        for secret in secret_values(&creds, "ZGVr") {
+            assert!(!joined.contains(&secret), "a secret reached argv: {joined}");
+        }
+        // …and the flags that used to carry them are gone entirely, so a future
+        // edit cannot re-add a value under an existing flag name.
+        for flag in [
+            "--aws-access-key-id",
+            "--aws-secret-access-key",
+            "--aws-session-token",
+            "--plaintext",
+        ] {
+            assert!(!args.iter().any(|a| a == flag), "{flag} is back in argv");
+        }
+    }
+
+    #[test]
+    fn rot8_decrypt_argv_carries_no_secret() {
+        let creds = test_creds();
+        let mut args = decrypt_argv("Y2lwaGVy");
+        args.push("--encryption-context".to_owned());
+        args.push("customer_id=attested-data".to_owned());
+        let joined = args.join(" ");
+        for secret in secret_values(&creds, "ZGVr") {
+            assert!(!joined.contains(&secret), "a secret reached argv: {joined}");
+        }
+        for flag in [
+            "--aws-access-key-id",
+            "--aws-secret-access-key",
+            "--aws-session-token",
+            "--plaintext",
+        ] {
+            assert!(!args.iter().any(|a| a == flag), "{flag} is back in argv");
+        }
+        // …and the flag that tells the child to read stdin must be present, or
+        // the child would sit waiting for flags that never come.
+        assert!(args.iter().any(|a| a == "--secrets-from-stdin"));
+    }
+
+    #[test]
+    fn rot8_both_argvs_request_stdin_mode() {
+        let tail = build_encrypt_args("k", &data_signing_ctx()).expect("build");
+        assert!(encrypt_argv(&tail)
+            .iter()
+            .any(|a| a == "--secrets-from-stdin"));
+        assert!(decrypt_argv("c")
+            .iter()
+            .any(|a| a == "--secrets-from-stdin"));
+    }
+
+    #[test]
+    fn rot8_stdin_payload_carries_every_secret_exactly_once() {
+        let creds = test_creds();
+        let payload = build_stdin_secrets(&creds, Some("ZGVr")).expect("clean creds build");
+        for line in [
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "AWS_SESSION_TOKEN=FwoGZXIvYXdzEExampleSessionToken",
+            "PLAINTEXT_B64=ZGVr",
+        ] {
+            assert_eq!(
+                payload.matches(line).count(),
+                1,
+                "expected exactly one {line} in the payload"
+            );
+        }
+        // Every line terminated: the C parser reads line-wise, and a missing
+        // final newline on a middle line would glue two secrets together.
+        assert_eq!(payload.lines().count(), 4);
+        assert!(payload.ends_with('\n'));
+    }
+
+    #[test]
+    fn rot8_decrypt_payload_omits_the_dek_key_entirely() {
+        // `decrypt` has no plaintext. The key must be ABSENT, not empty — an
+        // empty value is a parse error on the C side (deliberately), so an
+        // "always send all four" shortcut would break every decrypt.
+        let payload = build_stdin_secrets(&test_creds(), None).expect("clean creds build");
+        assert!(
+            !payload.contains("PLAINTEXT_B64"),
+            "decrypt payload must not carry a DEK key"
+        );
+        assert_eq!(payload.lines().count(), 3);
+    }
+
+    #[test]
+    fn rot8_a_newline_in_any_secret_is_refused_not_escaped() {
+        // The injection this format invites: a value carrying the record
+        // delimiter ends its own line and starts another, so a credential
+        // containing "\nPLAINTEXT_B64=…" would hand the child a DEK the caller
+        // never passed. Refused for every field, both delimiters.
+        for bad in ["A\nPLAINTEXT_B64=evil", "A\rB", "\n", "tail\n"] {
+            let mut creds = test_creds();
+            creds.access_key_id = bad.to_owned();
+            assert!(
+                build_stdin_secrets(&creds, None).is_err(),
+                "access_key_id={bad:?} must be refused"
+            );
+
+            let mut creds = test_creds();
+            creds.secret_access_key = bad.to_owned();
+            assert!(build_stdin_secrets(&creds, None).is_err());
+
+            let mut creds = test_creds();
+            creds.session_token = bad.to_owned();
+            assert!(build_stdin_secrets(&creds, None).is_err());
+
+            assert!(
+                build_stdin_secrets(&test_creds(), Some(bad)).is_err(),
+                "dek={bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rot8_empty_secret_is_refused_at_the_writer() {
+        // The C parser rejects an empty value; catching it here names the field
+        // instead of surfacing a generic parse error from the child.
+        let mut creds = test_creds();
+        creds.session_token = String::new();
+        assert!(build_stdin_secrets(&creds, None).is_err());
+        assert!(build_stdin_secrets(&test_creds(), Some("")).is_err());
+    }
+
+    #[test]
+    fn rot8_clean_secrets_still_build() {
+        // Falsification handle for the two tests above: the guard must reject
+        // delimiters, not everything.
+        assert!(build_stdin_secrets(&test_creds(), Some("ZGVr")).is_ok());
+        assert!(build_stdin_secrets(&test_creds(), None).is_ok());
+    }
+
+    #[test]
+    fn rot8_payload_shape_matches_the_c_parser_contract() {
+        // Guards the two sides against drifting apart: the C header splits on
+        // the FIRST '=' and rejects unknown keys, so the key names here are a
+        // contract, not a convention.
+        let payload =
+            build_stdin_secrets(&test_creds(), Some("ZGVr==")).expect("clean creds build");
+        for line in payload.lines() {
+            let (key, _) = line.split_once('=').expect("every line is KEY=VALUE");
+            assert!(
+                matches!(
+                    key,
+                    "AWS_ACCESS_KEY_ID"
+                        | "AWS_SECRET_ACCESS_KEY"
+                        | "AWS_SESSION_TOKEN"
+                        | "PLAINTEXT_B64"
+                ),
+                "unknown key {key} would be refused by the C parser"
+            );
+        }
+        // A base64 value containing '=' must survive — split-on-first-'=' only.
+        assert!(payload.contains("PLAINTEXT_B64=ZGVr=="));
+    }
+
+    /// The regression ROT-7 exists for: the encryption context MUST reach the
     /// argv. Falsification — drop the two `--encryption-context` pushes from
     /// `build_encrypt_args` and this test goes red, which is exactly what the
     /// old genkey path did silently.
     #[test]
     fn context_pairs_are_present_and_sorted() {
-        let built = build_encrypt_args("cec983ce", "ZGVr", &data_signing_ctx()).expect("build");
+        // ROT-8 removed `--plaintext ZGVr` from this list: the DEK now travels
+        // on stdin. The rest of the shape is unchanged and still asserted
+        // exactly — the context pairs are what ROT-7 got silently wrong, and a
+        // wrapped DEK with the wrong context is a key the read path can never
+        // open.
+        let built = build_encrypt_args("cec983ce", &data_signing_ctx()).expect("build");
         let args: Vec<&str> = built.iter().map(|a| a.as_str()).collect();
         assert_eq!(
             args,
             vec![
                 "--key-id",
                 "cec983ce",
-                "--plaintext",
-                "ZGVr",
                 "--encryption-context",
                 "customer_id=attested-data",
                 "--encryption-context",
@@ -465,7 +781,7 @@ mod rot7_encrypt_args {
     /// Fail-closed, not "default to no context".
     #[test]
     fn empty_context_is_refused() {
-        let err = build_encrypt_args("cec983ce", "ZGVr", &HashMap::new());
+        let err = build_encrypt_args("cec983ce", &HashMap::new());
         assert!(
             err.is_err(),
             "an empty context must be refused, not defaulted"
@@ -485,7 +801,7 @@ mod rot7_encrypt_args {
             let mut c = data_signing_ctx();
             c.insert(k.to_owned(), v.to_owned());
             assert!(
-                build_encrypt_args("k", "ZGVr", &c).is_err(),
+                build_encrypt_args("k", &c).is_err(),
                 "must refuse {k:?}={v:?}"
             );
         }
@@ -498,12 +814,12 @@ mod rot7_encrypt_args {
         let mut reversed = HashMap::new();
         reversed.insert("venue_id".to_owned(), "data-signing".to_owned());
         reversed.insert("customer_id".to_owned(), "attested-data".to_owned());
-        let a: Vec<String> = build_encrypt_args("k", "ZGVr", &reversed)
+        let a: Vec<String> = build_encrypt_args("k", &reversed)
             .expect("build")
             .iter()
             .map(|z| z.to_string())
             .collect();
-        let b: Vec<String> = build_encrypt_args("k", "ZGVr", &data_signing_ctx())
+        let b: Vec<String> = build_encrypt_args("k", &data_signing_ctx())
             .expect("build")
             .iter()
             .map(|z| z.to_string())
@@ -519,7 +835,7 @@ mod rot7_encrypt_args {
         // build_encrypt_args itself is length-agnostic (it takes base64), so the
         // guarantee lives in wrap_dek_with_context. Documented by this test so a
         // future refactor that moves the check cannot drop it unnoticed.
-        assert!(build_encrypt_args("k", "", &ctx).is_ok());
+        assert!(build_encrypt_args("k", &ctx).is_ok());
     }
 }
 

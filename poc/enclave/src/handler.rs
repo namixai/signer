@@ -463,6 +463,26 @@ fn enforce_policy(
     policy: Option<&Policy>,
     req: &SignRequest,
 ) -> Result<Option<String>, SignResponse> {
+    match enforce_policy_inner(policy, req) {
+        Ok(h) => Ok(h),
+        // Receipts (design §2): a DENIAL names the policy it was denied under —
+        // `policy_hash` used to ride only on success; now the refusing response
+        // carries it too, so the receipt can bind the decision to the policy.
+        Err(resp) => {
+            let hash = policy.and_then(|p| compute_policy_hash(p).ok());
+            Err(match hash {
+                Some(h) => resp.with_policy_hash(Some(h)),
+                None => resp,
+            })
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_policy_inner(
+    policy: Option<&Policy>,
+    req: &SignRequest,
+) -> Result<Option<String>, SignResponse> {
     let Some(p) = policy else {
         return Ok(None); // Legacy blob — no policy, no hash.
     };
@@ -1385,7 +1405,13 @@ fn handle_attestation(req: SignRequest) -> SignResponse {
         Ok(u) => u,
         Err(()) => return SignResponse::err(err_code::BAD_REQUEST),
     };
-    match crate::attestation::nsm_attestation(nonce, user_data) {
+    // Bind the resident receipt key (if any) into the SIGNED document — the
+    // only place an outsider should take it from (receipt.rs).
+    match crate::attestation::nsm_attestation(
+        nonce,
+        user_data,
+        crate::receipt::public_key_compressed(),
+    ) {
         Ok(doc) => SignResponse::ok_attestation(B64.encode(doc)),
         Err(e) => {
             tracing::error!(
@@ -1468,7 +1494,20 @@ pub fn handle(req: SignRequest) -> SignResponse {
         return SignResponse::err(err_code::BAD_REQUEST);
     };
 
-    match req.action.as_str() {
+    // PR-4 (kill switch, enclave floor): the tenant's SIGNED mode gates every
+    // action before it runs. This is the line a compromised gateway cannot
+    // lift — it lives in the registry the control plane signs, not in any
+    // gateway state. Runs after the rate limiter (a halted tenant's retries
+    // still spend its own bucket) and before any blob/KMS work.
+    // Receipt inputs are captured BEFORE the request moves into a handler
+    // (no clone of the credential-bearing request).
+    let receipt_pre = crate::receipt::Pre::capture(identity, &req);
+    if let Err(resp) = tenant_mode_gate(identity, &req) {
+        // A mode denial is a decision too — receipted like any other.
+        return crate::receipt::attach(&receipt_pre, resp);
+    }
+
+    let resp = match req.action.as_str() {
         "sign" => SignResponse::err(err_code::BAD_REQUEST),
         "sign_kucoin" => handle_sign_kucoin(req, identity),
         "sign_binance" => handle_sign_binance(req, identity),
@@ -1492,6 +1531,81 @@ pub fn handle(req: SignRequest) -> SignResponse {
         // Plaintext NEVER leaves the enclave — only the hex hash on the wire.
         "verify_blob" => handle_verify_blob(req, identity),
         _ => SignResponse::err(err_code::BAD_REQUEST),
+    };
+    // Every tenant decision leaves a signed receipt (allow and deny, one
+    // counter) once the receipt key is resident — see receipt.rs.
+    crate::receipt::attach(&receipt_pre, resp)
+}
+
+/// PR-4: classify a request by what it does to exposure and apply the tenant's
+/// signed mode (`registry::TenantMode`).
+///
+/// `Active` → everything. `Halted` → nothing, `verify_blob` excepted (it emits
+/// no signature and is how an operator proves, mid-incident, that the enclave
+/// can still decrypt). `CancelOnly` → only what reduces or merely observes
+/// exposure:
+///   - structured `*_cancel` actions — always;
+///   - `sign_binance_request` — unless `op == "order"` (the enclave's per-op
+///     param allow-list makes the DECLARED op sound to gate on);
+///   - the generic HMAC actions (`sign_kucoin` / `sign_binance` / `sign_bybit` /
+///     `sign_okx` / `sign_asterdex`) — when the method is `GET` (a signed read)
+///     or `DELETE` (a venue cancel; Binance cancels are DELETEs). A `POST`/`PUT`
+///     through the generic action is an opaque body the enclave cannot prove is
+///     not an order — refused, fail-closed. (OKX cancels go through
+///     `sign_okx_cancel`, which is allowed above.)
+///   - refused: `*_order`, `sign_x402_eip3009` (EIP-3009 moves funds),
+///     `sign_binance_request` with `op == "order"`, generic non-read bodies.
+///
+/// `sign_data` runs under the service identity (mode `Active` by
+/// construction) and is untouched.
+#[allow(clippy::result_large_err)]
+fn tenant_mode_gate(
+    identity: &crate::registry::ResolvedIdentity,
+    req: &SignRequest,
+) -> Result<(), SignResponse> {
+    use crate::registry::TenantMode;
+    let action = req.action.as_str();
+    match identity.mode {
+        TenantMode::Active => Ok(()),
+        TenantMode::Halted => {
+            if action == "verify_blob" {
+                return Ok(());
+            }
+            tracing::warn!(
+                event = "tenant_mode_denied",
+                customer_id = %identity.customer_id,
+                mode = "halted",
+                action,
+            );
+            Err(SignResponse::err(err_code::MODE_HALTED))
+        }
+        TenantMode::CancelOnly => {
+            let method = req
+                .method
+                .as_deref()
+                .map(|m| m.trim().to_ascii_uppercase())
+                .unwrap_or_default();
+            let allowed = action == "verify_blob"
+                || action.ends_with("_cancel")
+                || (action == "sign_binance_request"
+                    && req.op.as_deref().map(str::trim) != Some("order"))
+                || (matches!(
+                    action,
+                    "sign_kucoin" | "sign_binance" | "sign_bybit" | "sign_okx" | "sign_asterdex"
+                ) && matches!(method.as_str(), "GET" | "DELETE"));
+            if allowed {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    event = "tenant_mode_denied",
+                    customer_id = %identity.customer_id,
+                    mode = "cancel_only",
+                    action,
+                    method = %method,
+                );
+                Err(SignResponse::err(err_code::MODE_CANCEL_ONLY))
+            }
+        }
     }
 }
 
@@ -3782,6 +3896,10 @@ fn handle_sign_data(
         Ok(k) => k,
         Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
     };
+    // Make the key resident for decision receipts (receipt.rs): KMS released it
+    // to this measurement under the SERVICE identity; from here on tenant
+    // decisions are signed with it under a separate domain tag.
+    crate::receipt::install_key(&pk);
     // canonical-v1 -> keccak256(domain ‖ canonical) -> recoverable secp256k1.
     let signature = match crate::signer::sign_attested_data(&pk, &data) {
         Ok(sig) => sig,
@@ -5058,6 +5176,146 @@ mod tests {
             provision_customer_id: None,
             provision_policy: None,
         }
+    }
+
+    // ── PR-4: the tenant's SIGNED registry mode gates every action ──────────
+
+    /// Seed a tenant with an explicit mode and run `handle` under the shared
+    /// registry lock (same discipline as `handle_seeded`).
+    fn handle_with_mode(
+        token: &str,
+        customer: &str,
+        mode: crate::registry::TenantMode,
+        mut req: SignRequest,
+    ) -> SignResponse {
+        let _gl = crate::registry::GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::registry::test_install_with_mode(&[(
+            token,
+            customer,
+            &[
+                "kucoin",
+                "binance",
+                "okx",
+                "bybit",
+                "hyperliquid_main",
+                "asterdex",
+                "x402",
+            ],
+            mode,
+        )]);
+        req.opaque_token = Some(token.to_owned());
+        handle(req)
+    }
+
+    fn mode_req(action: &str, method: &str, op: Option<&str>) -> SignRequest {
+        SignRequest {
+            action: action.to_owned(),
+            method: Some(method.to_owned()),
+            op: op.map(str::to_owned),
+            ..req_template()
+        }
+    }
+
+    #[test]
+    fn mode_halted_refuses_everything_but_verify_blob() {
+        use crate::registry::TenantMode;
+        for (action, method) in [
+            ("sign_okx_cancel", "POST"),
+            ("sign_binance_order", "POST"),
+            ("sign_kucoin", "GET"),
+            ("sign_binance_request", "POST"),
+            ("sign_x402_eip3009", "POST"),
+            ("sign_hyperliquid_main_cancel", "POST"),
+        ] {
+            let resp = handle_with_mode(
+                "tok-halted",
+                "cust-halted",
+                TenantMode::Halted,
+                mode_req(action, method, Some("account")),
+            );
+            assert_eq!(
+                resp.error.as_deref(),
+                Some(err_code::MODE_HALTED),
+                "{action} {method}"
+            );
+        }
+        // verify_blob emits no signature — still allowed (operator forensics mid-incident).
+        let resp = handle_with_mode(
+            "tok-halted",
+            "cust-halted",
+            TenantMode::Halted,
+            mode_req("verify_blob", "POST", None),
+        );
+        assert_ne!(resp.error.as_deref(), Some(err_code::MODE_HALTED));
+    }
+
+    #[test]
+    fn mode_cancel_only_matrix() {
+        use crate::registry::TenantMode;
+        let denied = [
+            ("sign_binance_order", "POST", None),
+            ("sign_okx_order", "POST", None),
+            ("sign_hyperliquid_main_order", "POST", None),
+            ("sign_hyperliquid_testnet_order", "POST", None),
+            ("sign_x402_eip3009", "POST", None),
+            ("sign_binance_request", "POST", Some("order")),
+            ("sign_kucoin", "POST", None), // opaque body: cannot prove it is not an order
+            ("sign_okx", "POST", None),
+            ("sign_binance", "PUT", None),
+        ];
+        for (action, method, op) in denied {
+            let resp = handle_with_mode(
+                "tok-co",
+                "cust-co",
+                TenantMode::CancelOnly,
+                mode_req(action, method, op),
+            );
+            assert_eq!(
+                resp.error.as_deref(),
+                Some(err_code::MODE_CANCEL_ONLY),
+                "{action} {method} {op:?} must be refused"
+            );
+        }
+        let allowed = [
+            ("sign_okx_cancel", "POST", None),
+            ("sign_binance_cancel", "DELETE", None),
+            ("sign_hyperliquid_main_cancel", "POST", None),
+            ("sign_binance_request", "POST", Some("cancel")),
+            ("sign_binance_request", "POST", Some("account")),
+            ("sign_okx", "GET", None), // signed read (reconcile lists the book this way)
+            ("sign_binance", "DELETE", None), // Binance cancel-all is a DELETE
+            ("sign_kucoin", "get", None), // method case-insensitive
+            ("verify_blob", "POST", None),
+        ];
+        for (action, method, op) in allowed {
+            let resp = handle_with_mode(
+                "tok-co",
+                "cust-co",
+                TenantMode::CancelOnly,
+                mode_req(action, method, op),
+            );
+            assert_ne!(
+                resp.error.as_deref(),
+                Some(err_code::MODE_CANCEL_ONLY),
+                "{action} {method} {op:?} must pass the mode gate"
+            );
+            assert_ne!(resp.error.as_deref(), Some(err_code::MODE_HALTED));
+        }
+    }
+
+    #[test]
+    fn mode_active_is_transparent() {
+        use crate::registry::TenantMode;
+        let resp = handle_with_mode(
+            "tok-act",
+            "cust-act",
+            TenantMode::Active,
+            mode_req("sign_binance_order", "POST", None),
+        );
+        assert_ne!(resp.error.as_deref(), Some(err_code::MODE_CANCEL_ONLY));
+        assert_ne!(resp.error.as_deref(), Some(err_code::MODE_HALTED));
     }
 
     #[test]
@@ -10058,6 +10316,85 @@ mod tests {
         let resp = handle_seeded(req);
         assert_eq!(resp.error.as_deref(), Some(err_code::BAD_REQUEST));
         assert!(resp.plaintext_sha256.is_none());
+    }
+
+    // ── CR113@RECON2: the verify_blob failure-collapse (CR035) had NO test —
+    //    a mutation restoring the oracle (KmsDenied -> INTERNAL_ERROR) left the
+    //    suite 414/414 green. The collapse exists so a caller cannot tell
+    //    "your credentials are fine, your blob is malformed" from "you have no
+    //    access": both must read `verify_failed` on the wire. This pins the
+    //    reachable arm and, with it, the property that a POST-KMS failure is
+    //    never reported as `bad_request`.
+
+    #[test]
+    fn cr113_post_kms_failure_collapses_to_verify_failed() {
+        // Creds + a syntactically valid, non-envelope blob: clears every
+        // pre-KMS BadRequest check and reaches the KMS decrypt, which cannot
+        // succeed here (no kmstool in the test environment) -> LoadSecretError
+        // ::Internal -> the CR035 arm. The wire code MUST be verify_failed.
+        // PRECONDITION, stated rather than assumed (CodeRabbit on #422):
+        // this test reaches the post-KMS arm because `kms_client::decrypt`
+        // spawns /kmstool_enclave_cli and the spawn FAILS when that binary is
+        // absent. `run_with_stdin_secrets` waits via `wait_with_output()` with
+        // no timeout, so on a host where the binary DOES exist this test would
+        // block or take a different arm — silently testing nothing. Assert the
+        // precondition so that environment becomes an immediate, self-
+        // explaining failure instead of a hang or a false pass. The proper fix
+        // is a #[cfg(test)] injection seam in kms_client (CR113 remainder,
+        // pending CTO decision — it also unlocks the two arms still uncovered).
+        assert!(
+            !std::path::Path::new("/kmstool_enclave_cli").exists(),
+            "precondition broken: /kmstool_enclave_cli exists on this host, so \
+             spawn no longer fails and this test cannot reach the post-KMS arm. \
+             Land the #[cfg(test)] kms seam (CR113) before running here.",
+        );
+        let req = SignRequest {
+            action: "verify_blob".to_owned(),
+            path: Some("binance".to_owned()),
+            aws_credentials: Some(AwsCredentials {
+                access_key_id: "AKIA...".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                session_token: "session".to_owned(),
+            }),
+            // Not an envelope -> legacy KMS path. Non-empty, valid base64.
+            ciphertext_blob_base64: Some(B64.encode(b"not-an-envelope-blob")),
+            ..req_template()
+        };
+        let resp = handle_seeded(req);
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(err_code::VERIFY_FAILED),
+            "post-KMS failure must collapse to verify_failed (CR035), got {:?}",
+            resp.error,
+        );
+        // The oracle this guard denies: a post-KMS failure reported as
+        // bad_request would confirm decrypt succeeded and only the shape was
+        // wrong; internal_error would separate "denied" from "broken".
+        assert_ne!(resp.error.as_deref(), Some(err_code::BAD_REQUEST));
+        assert_ne!(resp.error.as_deref(), Some(err_code::INTERNAL_ERROR));
+        // And never a digest on the error path.
+        assert!(resp.plaintext_sha256.is_none());
+    }
+
+    #[test]
+    fn cr113_pre_kms_failure_stays_bad_request() {
+        // Counterpart: the collapse must NOT swallow pre-KMS validation.
+        // Undecodable base64 never reaches KMS, so it stays bad_request —
+        // otherwise a blanket "everything is verify_failed" would pass the
+        // test above while destroying operator diagnostics.
+        let req = SignRequest {
+            action: "verify_blob".to_owned(),
+            path: Some("binance".to_owned()),
+            aws_credentials: Some(AwsCredentials {
+                access_key_id: "AKIA...".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                session_token: "session".to_owned(),
+            }),
+            ciphertext_blob_base64: Some("!!!not-base64!!!".to_owned()),
+            ..req_template()
+        };
+        let resp = handle_seeded(req);
+        assert_eq!(resp.error.as_deref(), Some(err_code::BAD_REQUEST));
     }
 
     #[test]

@@ -1068,6 +1068,40 @@ pub fn sign_eip712_digest(private_key_bytes: &[u8; 32], digest: &[u8; 32]) -> Re
     })
 }
 
+/// `ecrecover`: the 20-byte Ethereum address that produced `sig` over `digest`
+/// (`v` Ethereum-style 27/28). The outsider's check for attested data AND
+/// decision receipts: recover, derive the address, compare with the published
+/// / attested public key. Errors on malformed hex, bad recovery id, or an
+/// unrecoverable signature.
+pub fn recover_eip712_signer(digest: &[u8; 32], sig: &HlSignature) -> Result<[u8; 20]> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    let r =
+        hex::decode(sig.r.trim_start_matches("0x")).map_err(|_| anyhow::anyhow!("bad r hex"))?;
+    let s =
+        hex::decode(sig.s.trim_start_matches("0x")).map_err(|_| anyhow::anyhow!("bad s hex"))?;
+    if r.len() != 32 || s.len() != 32 {
+        return Err(anyhow::anyhow!("r/s must be 32 bytes"));
+    }
+    let mut rs = [0u8; 64];
+    rs[..32].copy_from_slice(&r);
+    rs[32..].copy_from_slice(&s);
+    let signature = Signature::from_slice(&rs).map_err(|_| anyhow::anyhow!("bad signature"))?;
+    // `RecoveryId::try_from` accepts 0..=3, so a bare `v - 27` would also let
+    // v=29/30 through (CodeRabbit). Ethereum-style recoverable signatures use
+    // 27/28 only — anything else is malformed, not a compressed-key variant.
+    if sig.v != 27 && sig.v != 28 {
+        return Err(anyhow::anyhow!("v must be 27 or 28, got {}", sig.v));
+    }
+    let recid = RecoveryId::try_from(sig.v - 27).map_err(|_| anyhow::anyhow!("bad recovery id"))?;
+    let vk = VerifyingKey::recover_from_prehash(digest, &signature, recid)
+        .map_err(|_| anyhow::anyhow!("recovery failed"))?;
+    let uncompressed = vk.to_encoded_point(false);
+    let hash = keccak256(&uncompressed.as_bytes()[1..]);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash[12..]);
+    Ok(addr)
+}
+
 /// Decode a `0x`-prefixed hex private key into a 32-byte array. Returns
 /// an error if length / hex are wrong. We do NOT validate that the
 /// resulting scalar is `< n` (the secp256k1 order); `k256::ecdsa::
@@ -2952,6 +2986,24 @@ mod tests {
     }
 
     // ─── Attested-signed data (P2): canonical-v1 + sign + ecrecover ───
+
+    /// CodeRabbit: v=29/30 must be refused, not silently taken as recovery id
+    /// 2/3 — a recoverable Ethereum signature is 27 or 28.
+    #[test]
+    fn recover_rejects_out_of_range_v() {
+        let key = parse_evm_private_key(TEST_HL_PRIVATE_KEY).unwrap();
+        let digest = [7u8; 32];
+        let good = sign_eip712_digest(&key, &digest).unwrap();
+        assert!(recover_eip712_signer(&digest, &good).is_ok());
+        for bad_v in [0u8, 26, 29, 30, 31] {
+            let mut bad = good.clone();
+            bad.v = bad_v;
+            assert!(
+                recover_eip712_signer(&digest, &bad).is_err(),
+                "v={bad_v} must be refused"
+            );
+        }
+    }
 
     #[test]
     fn canonical_v1_sorts_keys_string_values_jcs() {
