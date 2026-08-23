@@ -16,8 +16,11 @@
 # Background: blobs currently in /var/lib/signer/blobs/*.enc were encrypted
 # under the live us-east-1 KMS key WITHOUT an EncryptionContext. ZN-200
 # closure requires re-encrypting each blob with context = {customer_id,
-# venue_id}, then activating SIGNER_REQUIRE_CONTEXT=1 so the enclave
-# hard-rejects context-less requests.
+# venue_id}. NOTE (2026-08-23): the second half of that sentence described a
+# world that no longer exists — there is no `SIGNER_REQUIRE_CONTEXT` flag to
+# activate. PR-B removed the migration gate and made the context unconditional
+# (`enclave/src/handler.rs`), so re-wrapping is not a step toward a later
+# hardening switch: it is the ONLY thing keeping these blobs decryptable.
 #
 # Operating modes (PR #48 Stage 3 dispatch convention):
 #
@@ -50,8 +53,37 @@
 #   - AWS creds with kms:Decrypt + kms:Encrypt on the live signer key
 #   - SSH key + EC2 reachable
 #
-# Rollback (after --apply): rename <venue>.enc.v1 → <venue>.enc and
-# `sudo systemctl restart signer-gateway` on EC2.
+# ── Rollback (after --apply) — A BLOB RENAME IS NOT SUFFICIENT ───────────────
+# This block used to say "rename <venue>.enc.v1 → <venue>.enc and restart the
+# gateway". Following that restores service in exactly zero cases, and the
+# reason is the whole point of this script: `.enc.v1` was wrapped with NO
+# EncryptionContext, while this enclave ALWAYS decrypts with
+# {customer_id, venue_id} — `enclave/src/handler.rs` `load_secret_for` does a
+# bare `let enc_ctx = Some(&ctx);` and the `SIGNER_REQUIRE_CONTEXT` migration
+# gate is GONE (handler.rs, "PR-B: the guard is GONE"). KMS answers
+# InvalidCiphertextException on every sign, and it surfaces as a generic
+# verify/sign failure, not as anything naming the context.
+#
+# 🔴 PREFER THE FORWARD FIX. Re-run this script with `--apply` to re-wrap under
+# the correct context. It is the only path that does not touch PCR0, and it is
+# almost always what you actually want.
+#
+# A real rollback means reverting the ENCLAVE, and that is a three-step
+# operation in this order — (c) alone leaves the service just as dead:
+#   (a) re-add the pre-PR-B PCR0 to the KMS key policy (dual-allow via
+#       put_key_policy on the venue AND registry keys — see poc/policies/README.md).
+#       After a post-soak collapse the old measurement is NO LONGER allowed, so
+#       booting that EIF gets AccessDenied on every Decrypt;
+#   (b) re-register that PCR0 on the Base attestation registry;
+#   (c) restore the blob and boot the pre-PR-B EIF:
+#         sudo cp <venue>.enc.v1 <venue>.enc     # cp, not mv: .enc.v1 is the ONLY
+#                                                # pre-migration copy, and the apply
+#                                                # path never re-creates it
+#         <boot the pre-PR-B EIF via run-enclave-prod.sh>
+#         sudo systemctl restart signer-gateway
+# The `<venue>.ctx.json` sidecar can be left in place: the gateway only warns
+# when it is absent and never forwards the field (gateway/src/state.rs marks it
+# dead_code), so removing it changes nothing.
 
 set -euo pipefail
 
@@ -132,6 +164,25 @@ SSH_HK="${SIGNER_SSH_STRICT:+yes}"; SSH_HK="${SSH_HK:-accept-new}"
 # then unlinks; macOS has no `shred`, so fall back to `rm -P` (BSD overwrite)
 # and finally plain removal. Best-effort on copy-on-write FS, but guarantees
 # the file does not linger after the run.
+# Shell-quote for a REMOTE bash -c / bash -s argument list. `${var@Q}` would be
+# the one-liner, but it is a bash 4.4+ parameter transformation and macOS ships
+# /bin/bash 3.2 — an operator on a Mac got `bad substitution` at the ssh line
+# (Gemini, signer#53), i.e. AFTER Steps 1-4 had already decrypted live blobs and
+# staged plaintext API keys on disk, and before a single blob was swapped: the
+# worst place in the script to die.
+#
+# `printf %q` alone is not a drop-in either: on bash 3.2 `printf %q ''` prints
+# NOTHING, and `remote_sub` is deliberately empty for the default customer
+# (`[[ $is_default -eq 0 ]] && remote_sub="$CID"`), so a naive swap would drop an
+# argument and shift $2/$3 on the remote side — a silent, much worse failure
+# than the loud one it replaces. Hence the explicit empty case.
+shq() { case "$1" in "") printf "''" ;; *) printf '%q' "$1" ;; esac; }
+shq_list() {
+  local a out=
+  for a in "$@"; do out="$out $(shq "$a")"; done
+  printf '%s' "${out# }"
+}
+
 secure_shred() {
   local f
   for f in "$@"; do
@@ -226,8 +277,18 @@ rewrap_customer() {
     fi
     local PT_SIZE; PT_SIZE=$(wc -c < "$pt_dir/${v}.json")
     [[ $PT_SIZE -lt 10 ]] && { echo "ERROR: $CID/$v plaintext suspiciously small ($PT_SIZE bytes)" >&2; exit 3; }
-    python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$pt_dir/${v}.json" 2>/dev/null \
-      || echo "WARN: $CID/$v plaintext is not valid JSON ($PT_SIZE bytes) — check before --apply" >&2
+    # "python3 is missing" and "this file is not JSON" are different facts and
+    # must not print the same line: without the guard, a machine with no python3
+    # (stock macOS since 12.3 without the Xcode CLT; minimal Linux images) prints
+    # the JSON warning for EVERY venue of EVERY customer, and an operator who
+    # sees six identical warnings learns to ignore the line — which is how a real
+    # malformed blob gets waved through (Gemini, signer#53).
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$pt_dir/${v}.json" 2>/dev/null \
+        || echo "WARN: $CID/$v plaintext is not valid JSON ($PT_SIZE bytes) — check before --apply" >&2
+    else
+      echo "WARN: python3 not found — JSON validation SKIPPED for $CID/$v" >&2
+    fi
     echo "  $CID/$v: plaintext $PT_SIZE bytes staged"
   done
 
@@ -269,14 +330,14 @@ JSON
   # is deferred to AFTER all customers (one restart for the whole batch).
   local stage="/tmp/signer-rewrap-staging-${CID}"
   ssh -i "$SSH_KEY" -o StrictHostKeyChecking=$SSH_HK "$EC2_USER@$EC2_HOST" \
-    "mkdir -p ${stage@Q} && chmod 700 ${stage@Q}"
+    "mkdir -p $(shq "$stage") && chmod 700 $(shq "$stage")"
   for v in "${VENUES[@]}"; do
     scp -i "$SSH_KEY" -o StrictHostKeyChecking=$SSH_HK -q \
       "$TMPDIR/${v}.enc.v2" "$TMPDIR/${v}.ctx.json" \
       "$EC2_USER@$EC2_HOST:${stage}/"
   done
   ssh -i "$SSH_KEY" -o StrictHostKeyChecking=$SSH_HK "$EC2_USER@$EC2_HOST" \
-    "bash -s -- ${remote_sub@Q} ${stage@Q} ${VENUES[*]@Q}" <<'EOSSH'
+    "bash -s -- $(shq "$remote_sub") $(shq "$stage") $(shq_list "${VENUES[@]}")" <<'EOSSH'
 set -euo pipefail
 SUB="$1"; STAGE="$2"; shift 2
 DEST="/var/lib/signer/blobs${SUB:+/$SUB}"
@@ -331,6 +392,8 @@ ssh -i "$SSH_KEY" -o StrictHostKeyChecking=$SSH_HK "$EC2_USER@$EC2_HOST" \
    sudo journalctl -u signer-gateway --since "40 sec ago" --no-pager | grep -E "has_context|blob loaded|per-customer" | head -40'
 
 log "REWRAP COMPLETE — customers: ${CUSTOMER_IDS}"
-echo "Next step: add SIGNER_REQUIRE_CONTEXT=1 to enclave systemd override,"
-echo "  reload + restart enclave, then run zn200-protocol-mismatch.sh"
-echo "  (expect PASS — KMS refuses no-context decrypt against the new blobs)."
+echo "Next step: verify a decrypt through the running enclave (operator-tier"
+echo "  /verify-blob, or scripts/verify-all-blobs.sh). There is NO"
+echo "  SIGNER_REQUIRE_CONTEXT flag to set any more — PR-B made the encryption"
+echo "  context unconditional in the enclave, so these re-wrapped blobs are"
+echo "  already the only decryptable form."
