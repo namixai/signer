@@ -466,13 +466,15 @@ secret in any obvious way.*
 
 There are two provisioning models, used in different phases:
 
-**Phase 1 (closed pilot, what we run today):** the pilot user shares
-their exchange API credentials with us through an out-of-band channel
-(typically a signed credential transfer agreed during onboarding). We
-encrypt the secret to an AWS KMS key whose policy locks decryption to
-the current PCR0. We never persist the plaintext after encryption; we
-verify by performing a live, paper-trading test call against the
-exchange in your presence. This is faster to set up but requires
+**Path A — we wrap the key for you.** This is how our own dogfood keys
+got in, and it is **not what we offer a customer**: it means handing us
+a plaintext credential, which is the exact thing this product exists to
+avoid. We keep it documented because it is what the screenshots above
+were recorded with, and because it is a reasonable choice for a
+throwaway testnet key while you evaluate. The mechanics: the key is
+transferred out-of-band, we encrypt it to a KMS key whose policy locks
+decryption to the current PCR0, and we never persist the plaintext.
+It is faster to set up but requires
 trusting Usenami operators *during the provisioning window only* — not
 during ongoing signing.
 
@@ -486,33 +488,41 @@ the window:
   down immediately after the KMS-encrypted blob is produced.
 - The plaintext is held in memory only and never written to disk or
   shell history.
-- Any pilot who is uncomfortable with this onboarding model should
-  wait for Phase 2; we will not pressure anyone to start during
-  Phase 1.
+- Anyone uncomfortable with handing over a plaintext credential should
+  not do it: take Path B below, which is available now. We will not
+  push a customer onto Path A.
 
-**Phase 2 (production target, in active development):**
-*customer-side encryption.* You run a small open-source provisioning
-tool that:
+**Path B — you encrypt it yourself. This is the one we sell, and as of
+2026-08 it works end to end.** You clone this repository, build
+`signer-policy-wrap`, and produce the encrypted blob on your own
+machine:
 
-1. Fetches our KMS public key + the canonical PCR0 from our public
-   on-chain registry (the same contract from Step 4).
-2. Asks you to paste your exchange API secret into a local terminal
-   prompt (no transmission yet).
-3. Encrypts the secret under our KMS key with an EncryptionContext
-   binding the ciphertext to *your enclave's PCR0 and a one-time
-   nonce* — this means the ciphertext can be decrypted *only* by an
-   enclave running our published code, and only once for you.
-4. Uploads the encrypted blob to our gateway.
+1. We give you a `customer_id`, the venue key alias, a policy signed by
+   our off-box authority key, and a short-lived credential that can
+   `kms:Encrypt` under that one key — never decrypt.
+2. You put your API secret in a local file and run the tool. It wraps
+   the secret together with the policy and encrypts it under the venue
+   KMS key with an EncryptionContext of exactly `customer_id` and
+   `venue_id`; the envelope form additionally binds the same identity as
+   AES-GCM associated data.
+3. You send us the ciphertext and a one-line context file. We stage the
+   blob on the gateway host and add your registry entry.
 
-The plaintext never leaves your machine in cleartext form. We never
-see it. The enclave is the only entity that can read it.
+The plaintext never leaves your machine. The ciphertext is useless
+without a Decrypt that only an attested enclave can obtain.
 
-Phase 2 is where the trust model becomes fully cryptographic — even
-the *initial provisioning window* no longer requires trusting the
-Usenami team. We have the design and the KMS policy in place; the
-provisioning CLI is on the Phase 2 roadmap. Pilot users today opt for
-Phase 1 with full awareness, and migrate to Phase 2 when the CLI
-ships.
+Three earlier sentences on this page described this path wrongly and are
+corrected rather than quietly deleted: there is no "KMS public key" to
+fetch (the key is symmetric — what you get is a scoped `kms:Encrypt`
+credential); the EncryptionContext binds `{customer_id, venue_id}`, not
+a PCR0 and a nonce; and there is no upload endpoint — staging a blob is
+an operator action with a human on it, on purpose.
+
+Step-by-step, with the commands and with an explicit list of what you
+can and cannot verify yourself: [`docs/CLIENT-ONBOARDING.md`](docs/CLIENT-ONBOARDING.md).
+The client tool's output is checked against the enclave's own decrypt
+code in CI, so "the published tool produces a blob this enclave can
+open" is a test, not a promise.
 
 ---
 
@@ -594,8 +604,10 @@ the entire architecture mean anything — if KMS could be persuaded to
 hand over plaintext to a non-enclave caller, all other defenses are
 decorative.
 
-We publish the production KMS key policy alongside the signer source
-under `poc/policies/`, and the Phase 2 roadmap includes a formal
+We commit a snapshot of the production KMS key policy alongside the
+signer source under `poc/policies/` — **as of this writing the snapshot
+is not there yet**, and `poc/policies/README.md` says so plainly rather
+than leaving the promise standing; and the Phase 2 roadmap includes a formal
 **KMS Key Policy Audit** as part of every pre-production release
 checklist — a second pair of eyes confirming no IAM-only decrypt path
 ever lands in production.
