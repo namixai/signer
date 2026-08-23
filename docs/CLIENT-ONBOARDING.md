@@ -52,6 +52,22 @@ cargo build --locked -p signer-policy-cli      # ~15 s, no network at run time
 
 Put your credentials in `secret.json` (the shape depends on the venue — Binance and
 OKX examples are in the tool's `--help`) and the policy we sent you in `policy.json`.
+
+Set your two identifiers **once**. Every command below reads them, so there is nothing
+to hand-substitute and no second paste to get wrong:
+
+```bash
+CUSTOMER_ID=...                              # the customer_id we sent you
+VENUE=binance                                # binance | okx | hyperliquid
+KEY_ALIAS=alias/signer-mainnet-$VENUE        # the venue key you were scoped to
+```
+
+`alias/signer-mainnet-<venue>` is the real alias of the live key, and those three are
+the venue keys that exist today. If you hold an older copy of this page naming
+`alias/signer/prod/<venue>/v1` — **that alias exists in no account of ours**; the first
+command would have failed with `NotFoundException`. Use the line above. (The alias we
+send you in writing is authoritative; if the two ever disagree, stop and ask.)
+
 Then, one of two forms. Both are accepted by the enclave; the first is fewer steps and
 keeps no key material on your disk.
 
@@ -61,9 +77,9 @@ keeps no key material on your disk.
 ./target/debug/signer-policy-wrap --policy policy.json --secret secret.json --output blob.plain.json
 
 aws kms encrypt \
-  --key-id alias/signer/prod/binance/v1 \
+  --key-id "$KEY_ALIAS" \
   --plaintext fileb://blob.plain.json \
-  --encryption-context customer_id=YOUR_CUSTOMER_ID,venue_id=binance \
+  --encryption-context customer_id=$CUSTOMER_ID,venue_id=$VENUE \
   --output text --query CiphertextBlob > blob.enc.b64
 
 shred -u blob.plain.json secret.json    # or your OS equivalent
@@ -74,10 +90,10 @@ key goes to KMS. It binds your identity a second time, as AES-GCM associated dat
 
 ```bash
 ./target/debug/signer-policy-wrap --policy policy.json --secret secret.json \
-  envelope --out-dir ./out --customer-id YOUR_CUSTOMER_ID --venue binance
+  envelope --out-dir ./out --customer-id "$CUSTOMER_ID" --venue "$VENUE"
 # prints the exact `aws kms encrypt` line for the data key, then:
 ./target/debug/signer-policy-wrap seal --envelope out/envelope.json \
-  --wrapped-dek-b64 THE_OUTPUT_FROM_KMS --output binance.enc
+  --wrapped-dek-b64 THE_OUTPUT_FROM_KMS --output "$VENUE.enc"
 shred -u out/dek.bin secret.json
 ```
 
@@ -95,10 +111,10 @@ Two details that decide whether this works at all:
 
 ## Step 3 — send us two files
 
-`blob.enc.b64` (or `binance.enc`) and a one-line context file so nobody guesses:
+`blob.enc.b64` (or `$VENUE.enc`) and a one-line context file so nobody guesses:
 
-```json
-{"customer_id": "YOUR_CUSTOMER_ID", "venue_id": "binance"}
+```bash
+printf '{"customer_id": "%s", "venue_id": "%s"}\n' "$CUSTOMER_ID" "$VENUE" > context.json
 ```
 
 Neither file contains your secret. The ciphertext is useless without a Decrypt that
@@ -132,9 +148,35 @@ You cannot yet, and we would rather say it than dress it up:
 
 - **Read the KMS key policy for yourself.** It is what makes "only an attested enclave
   can decrypt" true, and today it lives in our private infrastructure tree;
-  `aws kms get-key-policy` needs our IAM. Until we publish a snapshot of the live policy
-  next to this document, that link in the chain rests on our word. We are aware that is
-  the weakest sentence on this page.
+  `aws kms get-key-policy` needs our IAM. The snapshot lands as
+  `poc/policies/venue-key-policy-<venue>.json` — one file per live venue key, exported
+  from the live key, dated in its header, with IAM principal ARNs replaced by the role
+  each plays and the account id left intact. Until those three files are in the
+  repository, this link in the chain rests on our word, and it is the weakest sentence
+  on this page.
+
+## The limit of the guarantee — read this before you decide
+
+Even with that snapshot in your hands, the honest statement is narrower than "impossible",
+and you should have it from us rather than work it out later:
+
+- **An account admin can rewrite the key policy and then decrypt your blob.**
+  `kms:PutKeyPolicy` is deliberately *not* denied on these keys — PCR0 rotation needs it —
+  so a principal holding `kms:*` (the account root, and the admin the policy names) can
+  delete the `DenyDecryptWithoutAttestation` statement and call `kms:Decrypt` outside any
+  enclave. No condition in the policy stops that, and no attestation you verify from
+  outside proves it has not already happened.
+- **What exists instead is a record, not an impossibility.** `PutKeyPolicy` on these keys
+  is a CloudTrail event, and it is the event our alerting and auto-revert layers are
+  pointed at (`infra/cloudtrail.tf`, `infra/lambda-rollback.tf` in the private tree —
+  which you also cannot inspect from outside). You can ask us to re-export the policy at
+  any time and diff it against the snapshot you were given; a silent change survives that
+  only if the trail is also forged.
+- **So the boundary is:** the enclave measurement is something you verify *mathematically*;
+  "no human at Usenami quietly decrypted this" is something you verify *by audit trail*.
+  If your threat model includes our own account admin, that is the sentence that decides
+  it — and the mitigation is on the exchange side: IP allowlisting, withdrawal disabled,
+  a key you can rotate the moment a diff surprises you.
 
 ## If you are evaluating rather than committing
 
