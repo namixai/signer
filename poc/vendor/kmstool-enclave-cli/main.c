@@ -264,6 +264,11 @@ static void s_parse_encryption_context_arg(
     }
 }
 
+/* Defined near the bottom, beside `main`. Forward-declared because every
+ * validation failure in `s_parse_options` has to wipe the secrets before it
+ * exits — see the corrected block comment at `cleanup_sdk`. */
+static void s_app_ctx_secure_clean_up(struct app_ctx *ctx);
+
 /*
  * Function to parse the common command line arguments.
  *
@@ -421,6 +426,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
                     "(--aws-access-key-id / --aws-secret-access-key / "
                     "--aws-session-token / --plaintext). Refusing to guess which "
                     "one you meant: pass the secrets on stdin only.\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
         struct kmstool_stdin_secrets secrets;
@@ -430,6 +436,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
              * parse error must not become a way to echo a secret into a log. */
             fprintf(stderr, "--secrets-from-stdin: %s\n", kmstool_stdin_strerror(st));
             kmstool_stdin_secrets_clean_up(&secrets);
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
         if (secrets.access_key_id != NULL) {
@@ -455,18 +462,21 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
     /* Check if AWS access key ID is set */
     if (ctx->aws_access_key_id == NULL) {
         fprintf(stderr, "--aws-access-key-id must be set\n");
+        s_app_ctx_secure_clean_up(ctx);
         exit(1);
     }
 
     /* Check if AWS secret access key is set */
     if (ctx->aws_secret_access_key == NULL) {
         fprintf(stderr, "--aws-secret-access-key must be set\n");
+        s_app_ctx_secure_clean_up(ctx);
         exit(1);
     }
 
     /* Check if AWS session token is set */
     if (ctx->aws_session_token == NULL) {
         fprintf(stderr, "--aws-session-token must be set\n");
+        s_app_ctx_secure_clean_up(ctx);
         exit(1);
     }
 
@@ -480,10 +490,12 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
          * ciphertext carries it). */
         if (ctx->key_id == NULL) {
             fprintf(stderr, "--key-id must be set\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
         if (ctx->plaintext_b64 == NULL) {
             fprintf(stderr, "--plaintext must be set\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
         /* FAIL CLOSED on an empty context. This is the whole reason the
@@ -494,6 +506,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
          * silent-invalid-key trap that genkey's hard-fail saved us from. */
         if (aws_hash_table_get_entry_count(&ctx->encryption_context) == 0) {
             fprintf(stderr, "--encryption-context must be set at least once\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
 
@@ -501,6 +514,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
         /* Check if ciphertext is set */
         if (ctx->ciphertext_b64 == NULL) {
             fprintf(stderr, "--ciphertext must be set\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
 
@@ -508,30 +522,35 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
         /* Check if the key id is set */
         if (ctx->key_id == NULL) {
             fprintf(stderr, "--key-id must be set\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
 
         /* Check if key spec is set */
         if (ctx->key_spec == -1) {
             fprintf(stderr, "--key-spec must be set\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
     } else if (strncmp(subcommand, GENRANDOM_CMD, MAX_SUB_COMMAND_LENGTH) == 0) {
         /* Check if the length is set */
         if (ctx->length == -1) {
             fprintf(stderr, "--length must be set\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
 
         /* Check if the length greater than 0 (KMS limit) */
         if (ctx->length <= 0) {
             fprintf(stderr, "--length must be greater than 0\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
 
         /* Check if the length smaller or equal to 1024 (KMS limit) */
         if (ctx->length > 1024) {
             fprintf(stderr, "--length must be smaller or equal to 1024\n");
+            s_app_ctx_secure_clean_up(ctx);
             exit(1);
         }
     }
@@ -1157,6 +1176,9 @@ int main(int argc, char **argv) {
         aws_byte_buf_clean_up(&plaintext_b64);
         if (rc != AWS_OP_SUCCESS) goto cleanup_hash_table;
     } else {
+        /* ROT-8: ctx is fully populated by now — wipe before print_commands,
+         * which exits and therefore never reaches `cleanup_sdk`. */
+        s_app_ctx_secure_clean_up(&app_ctx);
         print_commands(1);
     }
 
@@ -1164,9 +1186,23 @@ cleanup_hash_table:
     aws_hash_table_clean_up(&app_ctx.encryption_context);
 cleanup_sdk:
     /* ROT-8: before the SDK goes away, and on every exit path that reaches the
-     * end of main. The `exit(1)` paths in option parsing are deliberately left
-     * alone — at that point nothing has been assigned yet, or the stdin reader
-     * has already wiped its own copies. */
+     * end of main.
+     *
+     * 🔴 CORRECTED 2026-08-23 (Gemini, signer#55). This comment used to say the
+     * `exit(1)` paths in option parsing were "deliberately left alone — at that
+     * point nothing has been assigned yet, or the stdin reader has already wiped
+     * its own copies." The second clause was the sleight of hand: the stdin
+     * reader wipes its own INTERMEDIATE buffers, but by then the values have been
+     * copied into `ctx->aws_*`, and every required-argument and subcommand check
+     * runs AFTER that block. So a stream that delivered a secret but omitted, say,
+     * the session token exited with the secret still live in the heap — while this
+     * comment asserted the opposite. A security property documented but absent is
+     * worse than one never claimed; that is ROT-8's own lesson, and it applied to
+     * ROT-8.
+     *
+     * Every one of those exits now wipes first. If you add a validation check to
+     * `s_parse_options`, call `s_app_ctx_secure_clean_up(ctx)` before its exit —
+     * a bare `exit(1)` after the stdin block is a leak. */
     s_app_ctx_secure_clean_up(&app_ctx);
     aws_nitro_enclaves_library_clean_up();
 
