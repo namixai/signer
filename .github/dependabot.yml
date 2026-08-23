@@ -29,12 +29,120 @@ updates:
     labels:
       - dependencies
       - rust
+    # One grouped PR for the host-side crates (gateway, parent, policy-cli)
+    # instead of one PR per crate. These do NOT enter the enclave image, so a
+    # grouped bump is safe to review in one pass. Crates listed under `ignore`
+    # never reach a group — they are excluded before grouping happens.
+    groups:
+      host-side:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
     ignore:
       # Vendored under poc/vendor/ (the build uses the vendored tree, so a bump
       # here would be a no-op on the artifact → misleading PR). Re-vetted by hand
       # at each PCR0 rotation. NOTE: this is the ONLY vendored exception — see the
       # header; other enclave deps DO change PCR0 and are guarded by CI instead.
       - dependency-name: "aws-nitro-enclaves-nsm-api"
+
+      # ── Crates INSIDE the measured enclave image ──────────────────────────
+      # Every name below appears in poc/enclave/DEPENDENCY-CLOSURE.lock. A bump
+      # of ANY size changes the compiled enclave and therefore PCR0, so
+      # scripts/enclave-closure-check.py fails CI until the image is re-measured.
+      # Three such PRs (#46 thiserror, #47 ed25519-dalek, #49 sha2) were opened,
+      # failed CI and were closed by hand in August 2026. These crates move only
+      # in a deliberate PCR0 rotation, never on Dependabot's schedule.
+      #
+      # 🔴 WHY ALL THREE LEVELS AND NOT JUST `semver-major`.
+      # That was the obvious fix and it does not work. The closure guard compares
+      # a SET of crates; the semver level of a bump says nothing about whether
+      # that set changes. #46 was thiserror 2.0.18 -> 2.0.20 — a PATCH by Cargo's
+      # own rules (dependabot-core carries a Cargo-specific Version subclass) —
+      # and it still broke the closure, because thiserror-impl 2.0.20 pulled syn
+      # 3.0.3 in alongside syn 2.0.117. Filtering by level alone would have left
+      # open exactly the PR that broke first. Hence all three levels.
+      #
+      # 🔴 WHAT THIS DOES AND DOES NOT GUARANTEE ABOUT SECURITY UPDATES.
+      # An earlier revision of this file claimed the docs guarantee that security
+      # PRs still arrive. They do not, and the claim was wrong — it cited a
+      # sentence that belongs to `allow`, not to `ignore`:
+      #
+      #   "`update-types` only affects version updates, not security updates.
+      #    Security updates will always be created regardless of the
+      #    `update-types` setting."
+      #
+      # That note sits under "Allowing specific semantic versioning levels for
+      # updates" and its own cross-reference points at `#update-types-allow`.
+      # For `ignore`, the docs say the opposite in spirit: Dependabot ignores
+      # those dependencies "when it opens pull requests for version updates AND
+      # security updates", and the `ignore` reference section is tagged with the
+      # security-updates icon. No carve-out is documented for `ignore` +
+      # `update-types` either — so this form buys clarity of intent, not a
+      # documented promise.
+      #
+      # The source tells a different story: in dependabot-core,
+      # common/lib/dependabot/config/ignore_condition.rb (current at commit
+      # a026401a, 2026-08-04) starts `ignored_versions` with
+      # `return versions if security_updates_only` — and `versions` is empty for
+      # every entry below, so nothing would be ignored for a security update.
+      # Docs and code disagree; we do not get to resolve that from outside.
+      #
+      # 🔴 SO THE REAL GUARANTEE IS OURS, NOT DEPENDABOT'S: the `audit` job in
+      # ci.yml runs `cargo audit --deny warnings` against poc/Cargo.lock on a
+      # WEEKLY schedule, so a newly published RustSec advisory turns CI red even
+      # with no commits and no Dependabot PR at all. CVE visibility for these
+      # crates does not depend on how the ignore rules are interpreted.
+      #
+      # KEEPING THIS LIST HONEST: it is the intersection of the crates declared
+      # in poc/Cargo.toml with the names in DEPENDENCY-CLOSURE.lock. When the
+      # closure changes, re-derive it — a name that drops off this list silently
+      # brings the weekly noise back.
+      - dependency-name: "aes-gcm"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "anyhow"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "base64"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "ed25519-dalek"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "hex"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "k256"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "rmp-serde"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "serde"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "serde_bytes"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "serde_json"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "subtle"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "thiserror"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "tiny-keccak"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "tokio"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "tokio-vsock"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "tracing"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "tracing-subscriber"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+      - dependency-name: "zeroize"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
+
 
   # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the SHA and the
   # trailing version comment together).
