@@ -1861,7 +1861,7 @@ dependencies = [
  "icu_locid_transform",
  "icu_normalizer",
  "icu_properties 1.5.0",
- "icu_provider 1.5.0",
+ "icu_provider 2.1.1",
  "idna_adapter",
  "litemap 0.8.2",
  "parking_lot",
