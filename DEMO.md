@@ -488,9 +488,9 @@ the window:
   down immediately after the KMS-encrypted blob is produced.
 - The plaintext is held in memory only and never written to disk or
   shell history.
-- Any pilot who is uncomfortable with this onboarding model should
-  wait for Phase 2; we will not pressure anyone to start during
-  Phase 1.
+- Anyone uncomfortable with handing over a plaintext credential should
+  not do it: take Path B below, which is available now. We will not
+  push a customer onto Path A.
 
 **Path B — you encrypt it yourself. This is the one we sell, and as of
 2026-08 it works end to end.** You clone this repository, build
