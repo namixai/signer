@@ -893,13 +893,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "icu_locid"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b1caaf463dca211ec77afa9210dfa507f99f76168faf15d650ab7ad03416fd"
+
+[[package]]
 name = "icu_locid_transform"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01d11ac35de8e40fdeda00d9e1e9d92525f3f9d887cdd7aa81d727596788b54e"
 dependencies = [
  "displaydoc",
- "icu_locid",
+ "icu_locid 1.5.0",
  "icu_locid_transform_data",
  "icu_provider 1.5.0",
  "tinystr 0.7.6",
@@ -983,7 +989,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ed421c8a8ef78d3e2dbc98a973be2f3770cb42b606e3ab18d6237c4dfde68d9"
 dependencies = [
  "displaydoc",
- "icu_locid",
+ "icu_locid 1.5.0",
  "icu_provider_macros",
  "stable_deref_trait",
  "tinystr 0.7.6",
@@ -1857,7 +1863,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "icu_collections 2.1.1",
- "icu_locid",
+ "icu_locid 2.0.0",
  "icu_locid_transform",
  "icu_normalizer",
  "icu_properties 1.5.0",
