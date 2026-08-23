@@ -322,7 +322,7 @@ against the AWS Nitro root. A value printed in a README goes stale silently; com
 your build against the live document, and use the number here only to know what to
 expect.
 
-KMS key policy refuses to release encrypted secrets unless the requesting enclave's PCR0 measurement matches the value pinned in the KMS key policy (`kms:RecipientAttestation:ImageSha384`; the Terraform that pins it lives in the private infra tree, the condition itself is standard Nitro/KMS). **Change one byte of the source code → new PCR0 → KMS denies → all existing customer secrets become unusable until the new measurement is added to the policy.** This is the security boundary.
+KMS key policy refuses to release encrypted secrets unless the requesting enclave's PCR0 measurement matches the value pinned in the KMS key policy (`kms:RecipientAttestation:ImageSha384`; the Terraform that pins it lives in the private infra tree; a snapshot of the LIVE policy belongs in `poc/policies/` for clients to read, and until it is committed there this link rests on our word — see `poc/policies/README.md`). **Change one byte of the source code → new PCR0 → KMS denies → all existing customer secrets become unusable until the new measurement is added to the policy.** This is the security boundary.
 
 ### Cross-vector regression tests
 
