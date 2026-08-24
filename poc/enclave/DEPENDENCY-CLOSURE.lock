@@ -4,13 +4,14 @@
 # closure differs from this file — see the script header for why.
 #
 # Header is maintained BY HAND, only together with a fresh measurement:
-#   closure commit : 1207d37d147cd0105c84f37bde549c151f09f10a (2026-08-19)
-#   strict PCR0    : b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9
-#                    (SIGNER_REQUIRE_POLICY=1; NOT deployed anywhere)
-#   measured on    : 2026-08-20, x86_64 EC2 build host i-0d332f8f, nitro-cli 1.4.4, clean anonymous clone, env -i
+#   closure commit : 96cd4e468d2e094271d6633e95e9d552001c7860 (2026-08-23, merge of #55)
+#   strict PCR0    : 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
+#                    (SIGNER_REQUIRE_POLICY=1; measured twice 2026-08-23, cutover to production IN PROGRESS)
+#   measured on    : 2026-08-23, x86_64 EC2 build host i-0d332f8f, nitro-cli 1.4.4, clean anonymous clone, env -i
 #   production     : 32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
-#                    measured on commit db68182 (2026-08-11) — a DIFFERENT closure (anyhow 1.0.102,
-#                    thiserror 1.0.69); reproduce it from that commit, not from HEAD. See README.
+#                    (still running until the 103ccd79 cutover completes; it was measured on commit
+#                    db68182 (2026-08-11) — a DIFFERENT closure. The live value is ALWAYS /attestation,
+#                    never this file.)
 
 aead 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)
 aes 0.8.4 (registry+https://github.com/rust-lang/crates.io-index)
