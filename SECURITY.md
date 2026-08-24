@@ -83,8 +83,11 @@ same address and will be triaged, but the components above are the priority.
 
 Some limitations are known and disclosed rather than hidden: the control plane is
 currently **single-operator** (no external multi-party control yet), the system has
-**not yet had a third-party audit**, and the deployed service runs at
-**testnet / pilot stage**. Pointing at these is appreciated but they are known; a
+**not yet had a third-party audit**, and the deployed service is **mainnet-live
+on three venues with our own funds** — Binance USD-M since 2026-07-27,
+Hyperliquid since 2026-08-16, OKX since 2026-08-18. It is not client traffic,
+but it is not testnet either; this paragraph said "testnet / pilot stage" until
+2026-08-23, which understated what a bug here can reach. Pointing at these is appreciated but they are known; a
 *new* angle on them is in scope.
 
 ---

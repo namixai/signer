@@ -4,7 +4,7 @@
 
 Your exchange API secrets never leave a measured AWS Nitro Enclave. Even root on the host VM can't read them. AWS KMS releases secrets only to a specific, attested binary — change one byte, KMS denies.
 
-🔗 **Live demo:** [signer-demo.usenami.io:8443/healthz](http://signer-demo.usenami.io:8443/healthz) (allowlisted pilots only) &middot; full walkthrough in [`DEMO.md`](DEMO.md)
+🔗 **Live demo:** [signer-demo.usenami.io:8443/healthz](http://signer-demo.usenami.io:8443/healthz) (open — it answers 200 to anyone; earlier revisions of this line said "allowlisted pilots only", which was never true of `/healthz`) &middot; full walkthrough in [`DEMO.md`](DEMO.md)
 📜 **License:** Apache-2.0
 
 ---
@@ -91,7 +91,9 @@ poc/
   gateway/    # Rust binary on host EC2 (port 8443, routes to enclave via vsock)
   parent/     # Helper scripts for vsock-proxy, S3 fetch, systemd integration
   policies/   # KMS key policies (PCR0-locked) + build pins
-  scripts/    # build-eif.sh, deploy.sh, check-drift.sh, reproducibility-check.sh
+  scripts/    # build-eif.sh, reproducibility-check.sh, enclave-closure-check.py,
+              # run-enclave-prod.sh, upl-smoke.sh (deploy.sh and check-drift.sh
+              # were listed here but do not exist in this repo)
   vendor/     # Vendored Rust crates for offline `cargo build --locked`
   contracts/  # Foundry workspace: UsenamiAttestationRegistry.sol (on-chain trust anchor, live on Base)
 
@@ -226,12 +228,12 @@ Source + tests + deploy script live in [`poc/contracts/`](./poc/contracts). 13/1
 Connect from any MCP-aware agent (Claude, Gemini, Cursor…):
 
 ```bash
-claude mcp add signer npx @usenami/signer-mcp@0.3.0 \
+claude mcp add signer npx @usenami/signer-mcp@0.6.0 \
   -e SIGNER_GATEWAY_URL=https://signer-demo.usenami.io:8443 \
   -e SIGNER_API_TOKEN=<your-token>
 ```
 
-Then ask your agent: *"place a 0.001 BTC limit order on Binance testnet."* Your API key never leaves the AWS Nitro enclave.
+Then ask your agent to place a small limit order. **Point the venue at testnet yourself if that is what you want** — the hosted gateway signs against Binance USD-M **mainnet**, so a request that does not say otherwise moves real funds. This line used to read "on Binance testnet", which described a deployment we no longer run. Your API key never leaves the AWS Nitro enclave.
 
 For direct programmatic use, the TypeScript SDK is on npm — `npm i @usenami/signer` (see [`sdk/typescript`](./sdk/typescript)).
 
@@ -375,7 +377,7 @@ The flag is baked into the image and therefore part of PCR0 — see
 [Reproducible build](#reproducible-build) for both measured values and why the
 flagless form is a different enclave rather than the same one unconfigured.
 
-For development without an actual Nitro Enclave (local-only signing), see `poc/enclave/README.md`.
+For development without an actual Nitro Enclave (local-only signing), read `poc/enclave/Dockerfile` and `poc/scripts/run-enclave-debug.sh`. (This pointed at `poc/enclave/README.md`, which does not exist in this repo.)
 
 ---
 

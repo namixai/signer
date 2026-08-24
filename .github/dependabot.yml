@@ -46,7 +46,13 @@ updates:
       # here would be a no-op on the artifact → misleading PR). Re-vetted by hand
       # at each PCR0 rotation. NOTE: this is the ONLY vendored exception — see the
       # header; other enclave deps DO change PCR0 and are guarded by CI instead.
+      # Spelled out like the 22 entries below rather than left bare. A bare
+      # `dependency-name` already ignores every update type, so this changes
+      # nothing Dependabot does — it changes what a reader can verify without
+      # knowing that default. One ignore rule written in a different shape from
+      # its neighbours reads like it means something different.
       - dependency-name: "aws-nitro-enclaves-nsm-api"
+        update-types: ["version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch"]
 
       # ── Crates INSIDE the measured enclave image ──────────────────────────
       # Every name below appears in poc/enclave/DEPENDENCY-CLOSURE.lock. A bump
