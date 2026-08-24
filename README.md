@@ -264,9 +264,9 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 >
 > | tree | build | PCR0 |
 > |---|---|---|
-> | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — **production** (also the public demo since the 2026-08-10 rotation) |
+> | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — previous production (2026-08-10 → 2026-08-24) |
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
-> | commit `96cd4e46` (2026-08-23, merge of #55: tenant mode + decision receipts + ROT-8) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured twice 2026-08-23 (`i-0d332f8f`, nitro-cli 1.4.4); **cutover to production in progress** — the live value is always `/attestation` |
+> | commit `96cd4e46` (2026-08-23, merge of #55: tenant mode + decision receipts + ROT-8) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — **production since 2026-08-24** (registry v108, decision receipts + enclave-level tenant stop live); the live value is always `/attestation` |
 > | commit `1207d37` (2026-08-19, current `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9` — **not deployed**; differs because `anyhow` and `thiserror` were bumped after the measurement |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
@@ -344,7 +344,7 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 
 **Mainnet, operator's own funds only (dogfood).** Three venues have signed on mainnet: Binance USD-M (completed round trip 2026-07-27), Hyperliquid (enclave-born agent key 2026-08-16, completed round trip 2026-08-19), OKX (signed, accepted into the book and cancelled 2026-08-18 — never filled; an hourly place→verify→cancel timer has run clean since). KuCoin, Bybit and Asterdex have adapters but no mainnet key; under a capped policy their generic path is fail-closed. Zero paying customers, zero third-party money in production, no external audit. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
 
-Production PCR0: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
+Production PCR0: `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` (since 2026-08-24; tag `pcr0-103ccd79`)
 
 Check it yourself rather than taking this file's word for it — `/attestation` returns an
 NSM-signed COSE document carrying the running measurement, and it is the authority here.
