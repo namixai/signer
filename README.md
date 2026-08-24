@@ -255,7 +255,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 ```
 
 > **Measured, not asserted — and here is the measurement record.**
-> Last independent re-run: **2026-08-20**, clean anonymous clone into an empty
+> Last re-run: **2026-08-23** (103ccd79 measurement; prior re-run 2026-08-20), clean anonymous clone into an empty
 > directory, `env -i`, x86_64 EC2 build host `i-0d332f8f`, **`nitro-cli 1.4.4`**.
 > PCR0 also depends on the `nitro-cli` release (it bundles the enclave kernel and
 > init), so use the same version or expect a different number for that reason alone.
@@ -266,6 +266,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > |---|---|---|
 > | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — **production** (also the public demo since the 2026-08-10 rotation) |
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
+> | commit `96cd4e46` (2026-08-23, merge of #55: tenant mode + decision receipts + ROT-8) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured twice 2026-08-23 (`i-0d332f8f`, nitro-cli 1.4.4); **cutover to production in progress** — the live value is always `/attestation` |
 > | commit `1207d37` (2026-08-19, current `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9` — **not deployed**; differs because `anyhow` and `thiserror` were bumped after the measurement |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
