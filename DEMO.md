@@ -27,8 +27,10 @@ operating system, even by AWS engineers. Your trading bot sends a
 returns the authentication headers, and your bot forwards them to the
 exchange. The signing secret never leaves the enclave.
 
-Supported exchanges: Binance USD-M futures (spot order signing is NOT implemented), OKX perpetual swap, Hyperliquid, Asterdex. KuCoin Futures and Bybit exist in the enclave but sign nowhere today. Bybit
-V5, OKX V5, Hyperliquid mainnet, and Asterdex.
+Supported exchanges: Binance USD-M futures (spot order signing is **not**
+implemented), OKX V5 perpetual swap, Hyperliquid mainnet, and Asterdex.
+KuCoin Futures and Bybit V5 are implemented in the enclave but sign
+nowhere today.
 
 ---
 
