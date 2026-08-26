@@ -284,9 +284,13 @@ PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
 # `[[ =~ ]]` is a bashism that dies in dash — which is /bin/sh on Debian.
 # `shopt -s nocasematch` also quietly makes both `[[ =~ ]]` and a bare `case`
 # accept uppercase, so normalise rather than rely on the match being strict.
-PCR0=$(printf '%s' "$PCR0" | tr 'A-F' 'a-f')
+# LC_ALL=C: `tr` ranges and `case` bracket expressions collate per locale, so a
+# range like a-f is not guaranteed to mean the six letters everywhere. Not
+# reproduced on this machine — every locale available here behaved correctly —
+# but the guard costs one line and removes the whole class.
+PCR0=$(printf '%s' "$PCR0" | LC_ALL=C tr 'A-F' 'a-f')
 case "$PCR0" in
-  *[!0-9a-f]*) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+  *[!0123456789abcdef]*) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
 esac
 [ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; }
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
