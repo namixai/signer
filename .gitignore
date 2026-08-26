@@ -1,0 +1,7 @@
+
+
+# Byte-compiled Python. Four of these were committed in the 2026-08-23 sync and
+# two embedded the absolute path of the machine they were built on, user name
+# included — a .pyc records the source path it was compiled from.
+__pycache__/
+*.py[cod]
