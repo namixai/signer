@@ -175,10 +175,10 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 # walk an empty value straight into the calldata.
 SIGNER_URL=https://signer-demo.usenami.io:8443   # or your production endpoint
 PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
-case "$PCR0" in
-  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; } ;;
-  *) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
-esac
+if [[ ! $PCR0 =~ ^[0-9a-f]{96}$ ]]; then
+  echo "no usable pcr0_sha384 from $SIGNER_URL" >&2
+  exit 1
+fi
 
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
