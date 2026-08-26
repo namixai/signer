@@ -330,10 +330,15 @@ is really an encoding mistake. It returns **two** values; decode both.
 # walk an empty value straight into the calldata.
 SIGNER_URL=${SIGNER_URL:-https://signer-demo.usenami.io:8443}
 PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
-if [[ ! $PCR0 =~ ^[0-9a-f]{96}$ ]]; then
-  echo "no usable pcr0_sha384 from $SIGNER_URL" >&2
-  exit 1
-fi
+# POSIX, and case-normalised first: an uppercase hash is the same hash, and
+# `[[ =~ ]]` is a bashism that dies in dash — which is /bin/sh on Debian.
+# `shopt -s nocasematch` also quietly makes both `[[ =~ ]]` and a bare `case`
+# accept uppercase, so normalise rather than rely on the match being strict.
+PCR0=$(printf '%s' "$PCR0" | tr 'A-F' 'a-f')
+case "$PCR0" in
+  *[!0-9a-f]*) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+esac
+[ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; }
 curl -s https://mainnet.base.org -H 'Content-Type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"eth_call","params":[{
     "to":"0x38b42eED740b0fDeb211bBDf773F2238cAEec240",
