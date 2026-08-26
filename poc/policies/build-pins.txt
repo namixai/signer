@@ -7,9 +7,14 @@
 # toolchain versions, vendored crates, yum packages. That part is current and
 # load-bearing: it is why two clean builds agree at all.
 #
-# What it is NOT, as of 2026-08-06: a record of the CURRENT measurement. The
-# PCR0 values further down are from May 2026 and are RETIRED. So is the
-# conclusion attached to them.
+# What it is NOT, as of 2026-08-06: a record of the CURRENT measurement. The PCR0
+# values in the "Finding J" section below are from May 2026 and are RETIRED, and
+# so is the conclusion attached to them.
+#
+# That retirement notice covers Finding J and nothing else. The measurement quoted
+# a few lines down is the current one and carries its own date; scoping this
+# warning to "everything further down" would have retired it too, which is the
+# kind of self-contradiction this file keeps being edited to remove.
 #
 # Specifically, the "Finding J" section below ends with:
 #
