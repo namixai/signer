@@ -229,35 +229,64 @@ single byte and PCR0 changes. AWS measures PCR0 in hardware, so we
 cannot forge it ourselves even if we wanted to.
 
 Usenami's production enclave build has its PCR0 registered in a public
-smart contract on Base mainnet. Since the 2026-08-10 rotation the demo
-endpoint above runs the SAME image as production and attests the SAME
-measurement, so one number covers both — you verify it live by requesting
-an attestation from the endpoint (see *The Nitro attestation document*
-below). The on-chain record tracks that same measurement again as of
-2026-08-12:
+smart contract on Base mainnet. Between 2026-08-10 and 2026-08-24 the demo
+endpoint ran the same image as production, and this page said one number
+covered both boxes. **That stopped being true on 2026-08-24**, and the sentence
+stayed. They are two separate facts now, each read from its own `/attestation`:
 
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
   (source verified on Basescan)
-- Registered PCR0 — the one now running, on the demo endpoint and in
-  production alike:
-  `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
 - Canonical owner address:
   `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
+- Active on-chain right now — the **production** enclave:
+  `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3`
+  (registered 2026-08-24 by the owner above)
+- What the **demo** box is running: `32d25d8c2f0b…`, which the 2026-08-24
+  rotation auto-deprecated. Ask the registry about it today and you get
+  `false`.
 
-> ⚠️ **An earlier revision of this page printed `7c9e8b26…` here** and told you to
-> expect `true`. That value was auto-deprecated by the 2026-08-10 rotation; pasting
-> it today returns `false`. If you followed this page between the rotation and this
-> correction, re-run the command below with the value above. The correction is
-> published, not quietly swapped.
+> ⚠️ **This page has now gone stale twice, and both corrections are published rather
+> than quietly swapped.** An earlier revision printed `7c9e8b26…` and told you to expect
+> `true`; the 2026-08-10 rotation auto-deprecated it. This revision fixes the second
+> case: from 2026-08-24 until 2026-08-26 the page called `32d25d8c2f0b…` the production
+> measurement, after rotation #4 had already moved production to `103ccd79de6c…`.
+>
+> 🔴 **The demo box is the one lagging now, and we are not going to hide it.** It still
+> runs `32d25d8c2f0b…`, so the on-chain check below returns `false` for the demo's own
+> measurement until the demo is rotated. `false` there is our rotation lag, not a
+> service failing to be what it claims. The production lane passes the same check
+> today; verified 2026-08-26. If you need the check to mean something about the
+> enclave that would hold your keys, run it against production.
 
 **Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required)** — and read carefully what a `true` here does and does not mean; the paragraphs after the command spell it out.
 
 ```bash
+# The production measurement — the one that answers "would this enclave be safe
+# with my keys":
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103 \
+  0x103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3 \
   --rpc-url https://mainnet.base.org
+
+# Or ask about whatever a box is actually running:
+# 🔴 `pcr0_sha384` is the CONVENIENCE MIRROR, not the signed document. A gateway
+# that wanted to fool you would put a registered measurement in this field while
+# the COSE document carries a different one — and the registry would answer
+# `true` about a measurement nothing is running. This shortcut is only worth
+# anything AFTER verify.py has validated the signed document; treat a `true`
+# here without that step as unproven, not as proof.
+# Fail closed on the fetch too: an error page or a missing field would otherwise
+# walk an empty value straight into the calldata.
+SIGNER_URL=https://signer-demo.usenami.io:8443
+PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+case "$PCR0" in
+  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; } ;;
+  *) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+esac
+cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
+  "isPCR0Active(bytes)(bool,address)" "0x$PCR0" --rpc-url https://mainnet.base.org
+# On the demo today this prints `false` — see the note above.
 ```
 
 Or with no tools at all, in your browser:
@@ -281,15 +310,17 @@ A sophisticated adversary controlling that RPC could return a fake
 The on-chain state itself is canonical; only your *view* of it is
 RPC-mediated.
 
-Expected output:
+Expected output, for the **production** measurement:
 
 ```
 true
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-Translation: *the registry reports PCR0 32d25d8c… as active right now, with owner
-0x21538eBF…, the canonical address Usenami publishes.*
+Translation: *the registry reports PCR0 103ccd79de6c… as active right now, with owner
+0x21538eBF…, the canonical address Usenami publishes.* Run the same command against
+the demo box's current measurement and you get `false` with a zero owner, because
+rotation #4 deprecated it and the demo has not been rotated yet.
 
 🔴 **Both lines matter, and the second one carries the weight.** `registerPCR0` is
 permissionless: **any** address can register a measurement nobody currently holds and
@@ -351,10 +382,12 @@ nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
 # Compare the output to the LIVE /attestation document, not to a number printed
 # in this file and not to the on-chain registry entry — both can lag the running
 # enclave, and as of 2026-08-06 the registry entry does (see Step 4).
-# Expected for the strict build, which is the MAINNET/PRODUCTION enclave:
-#   32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
-# Since the 2026-08-10 rotation the public DEMO endpoint runs the SAME image as
-# production and attests the SAME measurement — one published number covers both.
+# Expected for the strict build at commit 96cd4e46, which is the MAINNET/PRODUCTION
+# enclave as of 2026-08-24:
+#   103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
+# The demo endpoint is a SEPARATE box on a SEPARATE measurement — it still runs the
+# pre-rotation image. One number stopped covering both on 2026-08-24. Build the commit
+# you mean to check, and compare against that box's own /attestation.
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you
