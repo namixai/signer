@@ -106,15 +106,21 @@ sdk/
 
 ## On-chain trust anchor
 
-> ## The registry now tracks the running enclave again — and an earlier revision of this page did not
+> ## What the registry says today, and why the demo box answers `false`
 >
-> Measured against Base on **2026-08-12** by the `cast` call below:
+> Every row re-measured against Base on **2026-08-26**, with the `cast` call below:
 >
-> | PCR0 | `isPCR0Active` → `(active, owner)` |
-> |---|---|
-> | `32d25d8c…` (**currently running**, both demo and production) | **`(true, 0x21538eBF…)`** |
-> | `7c9e8b26…` (registered 2026-06-23, auto-deprecated) | `(false, 0x0000…0000)` |
-> | `ff53e1fe…` (retired 2026-08-10) | `(false, 0x0000…0000)` |
+> | PCR0 | what it is | `isPCR0Active` → `(active, owner)` |
+> |---|---|---|
+> | `103ccd79…` | **production**, since rotation #4 on 2026-08-24 | **`(true, 0x21538eBF…)`** |
+> | `32d25d8c…` | what the **demo box still runs**; was production 2026-08-10 → 08-24 | `(false, 0x0000…0000)` |
+> | `7c9e8b26…` | registered 2026-06-23, auto-deprecated | `(false, 0x0000…0000)` |
+> | `ff53e1fe…` | retired 2026-08-10 | `(false, 0x0000…0000)` |
+>
+> 🔴 **Read row two before you test us with the demo endpoint.** The demo box has not
+> been rotated onto the production image yet, so asking the registry about the
+> measurement the demo attests returns `false`. That is our rotation lag, printed here
+> rather than left for you to trip over. Production passes the same check today.
 >
 > **Why this notice stays.** Between the 2026-08-10 rotation and the re-registration,
 > this section told you the opposite — that `7c9e8b26…` was the active value — and it
@@ -133,7 +139,12 @@ actually guarantees before leaning on it:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
 - **Canonical owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Currently registered and running PCR0**: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103`
+- **Active on-chain, production lane**: `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — registered 2026-08-24 by the owner
+  above. That is what the registry says. What a box is *running* is a separate fact from
+  a separate source: that box's `/attestation`. This file used to print one number for
+  both, and that is how it went stale.
+- **What the demo box runs**: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103` — deprecated by that
+  same rotation, so it answers `false` on-chain. See the table above before you check it.
 
 > 🔴 **`isPCR0Active` reads mutable state, and `registerPCR0` is permissionless.** Any
 > address may register an unclaimed measurement and become its owner; an owner's next
@@ -151,13 +162,21 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 **1. PCR0 registered, owned by us, currently active:**
 
 ```bash
+# Take the measurement from the /attestation of the endpoint you intend to use, then
+# ask the registry about THAT value. Do not paste a number out of this file: files lag,
+# attestation documents do not.
+SIGNER_URL=https://signer-demo.usenami.io:8443   # or your production endpoint
+PCR0=$(curl -s "$SIGNER_URL/attestation" | jq -r .pcr0_sha384)
+
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103 \
+  "0x$PCR0" \
   --rpc-url https://mainnet.base.org
 # → true
 #   0x21538eBF6598e5866BA496A954dE8E39097bFB59
 # BOTH lines must match: `false` or a different owner = stop, do not use the service.
+# For the production lane today that is 0x103ccd79de6c… — see the demo caveat above
+# before you run this against the demo box.
 ```
 
 The argument is the raw **48 bytes** — `cast` encodes the `0x…` literal for you. Passing
@@ -250,10 +269,12 @@ branch: dependency bumps on `main` change the enclave binary and therefore PCR0.
 
 ```bash
 git clone https://github.com/namixai/signer.git && cd signer
-git checkout db68182                    # the commit the production PCR0 was measured on
+git checkout 96cd4e46                   # the commit the production PCR0 was measured on
 cd poc
 SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
-# → PCR0 32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
+# → PCR0 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
+# Compare that against the production /attestation, not against this line. The table
+# below records which commit produced which measurement, and when each was deployed.
 ```
 
 > **Measured, not asserted — and here is the measurement record.**
@@ -286,10 +307,12 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 >
 > | build | PCR0 |
 > |---|---|
-> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `32d25d8c…` — **this is production** |
+> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `103ccd79…` — **this is production** |
 > | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh` | `9f80b8d4…` — not deployed anywhere |
 >
-> Both values are measured on commit `db68182`, not asserted. Set **both** variables
+> The strict value is measured on commit `96cd4e46` (production since 2026-08-24), the
+> permissive one on `db68182`. Measured, not asserted, and each measurement belongs to
+> the commit it was taken on. Set **both** variables
 > explicitly for the permissive build: the script honours whatever
 > `SIGNER_REQUIRE_POLICY` it inherits from your shell before falling back to its
 > permissive default, so if you exported `=1` for the strict build above, passing

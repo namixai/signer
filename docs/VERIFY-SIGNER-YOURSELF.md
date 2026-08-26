@@ -98,27 +98,40 @@ def check(cond, msg):
     if not cond:
         raise SystemExit(f"ATTESTATION VERIFY FAILED: {msg}")
 
-# 🔴 THIS DEFAULT IS PAIRED WITH THE DEFAULT `SIGNER_URL` ABOVE. Change one and you
-# MUST change the other. They describe two different enclaves:
+# 🔴 THERE IS NO DEFAULT HERE ON PURPOSE. This script will not run until you say
+# which measurement you expect.
 #
-#   SIGNER_URL=https://signer-demo.usenami.io:8443  ->  32d25d8c…  (the DEMO enclave;
-#                                                        both defaults here)
-#   the mainnet/production enclave                  ->  32d25d8c…  (same image since
-#                                                        the 2026-08-10 rotation)
+# It used to ship a baked-in value, and that value went stale twice — most recently on
+# 2026-08-24, when rotation #4 moved production off it while this file kept offering it
+# as the answer. A verifier that quietly substitutes last season's number is worse than
+# one that refuses: it hands you a mismatch that looks exactly like a dishonest
+# service, or a match that proves nothing.
 #
-# The two were never linked, which is why this file could drift: a reader who
-# repointed the URL kept an expectation belonging to the other enclave and got a
-# mismatch that looks exactly like a dishonest service. If yours mismatches,
-# check WHICH enclave you queried before concluding anything, and confirm against
-# the live /attestation document rather than against this constant.
+# Where to get the value you should expect, best source first:
+#   1. Build the enclave yourself from the commit you intend to trust (README,
+#      "Reproducible build"). This is the only source that owes nothing to us
+#      telling you the truth.
+#   2. Ask the on-chain registry which measurement is active and who owns it, then
+#      hold this endpoint to that. Production as of 2026-08-24:
+#      103ccd79…
+#   3. The measurement table in the README: commit -> flag -> value, and when each
+#      was deployed.
+#
+# Whichever you pick, the enclaves are SEPARATE and their measurements differ. The
+# demo box and the mainnet box have not run the same image since 2026-08-24. Check
+# WHICH one you queried before concluding anything.
 #
 # `.strip()` before `.lower()`: a value pasted from a terminal or a CI variable
 # routinely carries a trailing newline, and an invisible character is the worst
 # possible reason for a verification to fail.
-EXPECTED_PCR0 = os.environ.get(
-    "EXPECTED_PCR0",
-    "32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103",
-).strip().lower()
+EXPECTED_PCR0 = os.environ.get("EXPECTED_PCR0", "").strip().lower()
+if not EXPECTED_PCR0:
+    raise SystemExit(
+        "EXPECTED_PCR0 is not set, and this script will not guess one for you.\n"
+        "Set it to the measurement you expect this endpoint to be running - see the\n"
+        "comment above for where to source it - then run again:\n"
+        "  EXPECTED_PCR0=<96 hex chars> SIGNER_URL=<endpoint> python3 verify.py"
+    )
 
 # The endpoint to query, and the root pin to hold it to. These are read from the
 # SAME environment variable names the bash block below offers — an earlier
@@ -222,14 +235,23 @@ check; a non-AWS chain fails the pinned-root path validation.
 
 ### Where the expected PCR0 comes from
 
-The value baked in above — `32d25d8c…7103` — is the PCR0 the **public demo**
-enclave currently attests, and it is paired with this file's default
-`SIGNER_URL`. Since the 2026-08-10 rotation the **mainnet/production** enclave
-runs the *same* image and attests the *same* measurement, so this value holds for
-both endpoints. That was not true before: the two lanes rotated separately and
-carried different PCR0s. If you ever see them diverge again, trust neither until
-the mismatch is explained — a shared measurement is the property that makes one
-published number meaningful for both.
+Nothing is baked in above, and that is the point. Earlier revisions of this file
+carried a default, which is how it drifted: between 2026-08-10 and 2026-08-24 the two
+lanes did run the same image, the file said so, and then rotation #4 moved production
+onto `103ccd79…` while the default kept naming the old value.
+
+The lanes have diverged again, and this time the file says so instead of averaging
+over it:
+
+| endpoint | measurement it attests | on-chain, checked 2026-08-26 |
+|---|---|---|
+| mainnet / production | `103ccd79…` | `(true, 0x21538eBF…)` |
+| `signer-demo.usenami.io:8443` | `32d25d8c…` | `(false, 0x0000…0000)` — awaiting rotation |
+
+So pick your expectation deliberately. Build the commit you intend to trust and use
+what your own build produced; or take the active measurement from the registry and
+hold the production endpoint to it. What you should not do is let a document choose
+for you.
 
 The demo measurement has two independent sources, in increasing order of trust:
 
@@ -277,7 +299,10 @@ is really an encoding mistake. It returns **two** values; decode both.
 # Read-only eth_call — no key, no wallet, nothing is sent or created.
 # 0x05d85549 = selector of isPCR0Active(bytes); then offset=32, length=48, the
 # 48 raw bytes, right-padded to a 32-byte boundary.
-PCR0=32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
+# Same rule as the script above: nothing baked in. Read the measurement from the
+# endpoint you are actually asking about, so the question stays "is what this box
+# runs registered, and to whom".
+PCR0=$(curl -s "${SIGNER_URL:-https://signer-demo.usenami.io:8443}/attestation" | jq -r .pcr0_sha384)
 curl -s https://mainnet.base.org -H 'Content-Type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"eth_call","params":[{
     "to":"0x38b42eED740b0fDeb211bBDf773F2238cAEec240",
