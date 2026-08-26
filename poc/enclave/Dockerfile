@@ -295,12 +295,36 @@ ENV SIGNER_POLICY_PUBKEY=96d54fbe908f6b7dbc348843b06c2626be85d86ca631b406d17f62a
 # (mainnet/B1) EIF with `--build-arg SIGNER_REQUIRE_POLICY=1`
 # (or `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh`).
 #
-# 🔴 STALE-COMMENT FIX 2026-08-23: this line used to end with "the demo EIF
-# stays 0". Not true since 2026-08-10 — the demo box was moved onto the same
-# strict measurement as mainnet (`32d25d8c…`), so BOTH lanes run with
-# SIGNER_REQUIRE_POLICY=1 and the default below is a build default, not a
-# description of what is deployed anywhere. Wording only: the ARG default is
-# unchanged, so no image content and no PCR0 changes from this edit.
+# 🔴 STALE-COMMENT FIX 2026-08-23, revised 2026-08-26: this line used to end
+# with "the demo EIF stays 0". Not true since 2026-08-10 — the demo box was
+# moved onto a strict image too, so BOTH lanes bake SIGNER_REQUIRE_POLICY=1 and
+# the default below is a build default, not a description of what runs anywhere.
+#
+# Which MEASUREMENT each lane runs is deliberately not named here any more. It
+# was named here, it went stale on 2026-08-24 when the two boxes began rotating
+# on separate schedules, and a number sitting in a Dockerfile comment has no way
+# to notice. Ask the box: `/attestation` carries the running measurement, signed
+# by the NSM.
+#
+# The 2026-08-23 revision claimed this edit changes no image content and no
+# PCR0. True — but asserted, not measured, which is the move this file exists to
+# stop. So it was measured on 2026-08-26: three builds of tag `pcr0-103ccd79` on
+# one host, `env -i`, nitro-cli 1.4.4.
+#
+#   clean tree                 -> PCR0 103ccd79…8392e3, EIF sha256 f2a75885…
+#   after this comment edit    -> PCR0 103ccd79…8392e3, EIF sha256 f62ce23e…
+#   clean tree again (control) -> PCR0 103ccd79…8392e3, EIF sha256 a2ea3c48…
+#
+# PCR0, PCR1 and PCR2 identical across all three. The mechanism is the stage
+# split below: enclave sources reach `rust-builder`, and the runtime stage
+# copies the compiled binary out of it rather than the tree.
+#
+# The control run is the part worth keeping. Two builds of an IDENTICAL tree
+# produced two different EIF sha256, so the EIF container is NOT byte-stable and
+# `sha256sum signer.eif` cannot be used to check reproducibility — it would
+# report a mismatch on a perfectly honest rebuild. The reproducible identifier
+# is PCR0, which is what KMS gates on anyway. `describe-eif` shows where the
+# whole difference lives: BuildTime, docker image id, LastTagTime.
 ARG SIGNER_REQUIRE_POLICY=0
 ENV SIGNER_REQUIRE_POLICY=${SIGNER_REQUIRE_POLICY}
 
