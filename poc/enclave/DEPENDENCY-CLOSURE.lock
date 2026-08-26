@@ -6,12 +6,20 @@
 # Header is maintained BY HAND, only together with a fresh measurement:
 #   closure commit : 96cd4e468d2e094271d6633e95e9d552001c7860 (2026-08-23, merge of #55)
 #   strict PCR0    : 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
-#                    (SIGNER_REQUIRE_POLICY=1; measured twice 2026-08-23, cutover to production IN PROGRESS)
-#   measured on    : 2026-08-23, x86_64 EC2 build host i-0d332f8f, nitro-cli 1.4.4, clean anonymous clone, env -i
-#   production     : 32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
-#                    (still running until the 103ccd79 cutover completes; it was measured on commit
-#                    db68182 (2026-08-11) — a DIFFERENT closure. The live value is ALWAYS /attestation,
-#                    never this file.)
+#                    (SIGNER_REQUIRE_POLICY=1; measured twice 2026-08-23, three more times 2026-08-26)
+#   measured on    : 2026-08-23 and 2026-08-26, x86_64 EC2 build host, nitro-cli 1.4.4, clean anonymous
+#                    clone at tag pcr0-103ccd79, env -i
+#   production     : the same 103ccd79de6c… — the cutover COMPLETED on 2026-08-24. Read live from
+#                    https://signer.usenami.io:8443/attestation on 2026-08-26: that value, nonce
+#                    echoed. The previous production measurement, 32d25d8c2f0bde… on commit db68182
+#                    (2026-08-11), was a DIFFERENT closure. The live value is ALWAYS /attestation,
+#                    never this file — the line above went stale for two days saying the cutover was
+#                    still in progress after it had finished.
+#
+# Compare PCR0, never `sha256sum signer.eif`. Measured 2026-08-26: two builds of an
+# IDENTICAL tree gave two different EIF sha256 (f2a75885… and a2ea3c48…) with identical
+# PCR0/1/2. The EIF container carries BuildTime and docker image ids that the measurement
+# does not, so a sha256 comparison fails an honest rebuild.
 
 aead 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)
 aes 0.8.4 (registry+https://github.com/rust-lang/crates.io-index)

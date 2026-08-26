@@ -7,9 +7,14 @@
 # toolchain versions, vendored crates, yum packages. That part is current and
 # load-bearing: it is why two clean builds agree at all.
 #
-# What it is NOT, as of 2026-08-06: a record of the CURRENT measurement. The
-# PCR0 values further down are from May 2026 and are RETIRED. So is the
-# conclusion attached to them.
+# What it is NOT, as of 2026-08-06: a record of the CURRENT measurement. The PCR0
+# values in the "Finding J" section below are from May 2026 and are RETIRED, and
+# so is the conclusion attached to them.
+#
+# That retirement notice covers Finding J and nothing else. The measurement quoted
+# a few lines down is the current one and carries its own date; scoping this
+# warning to "everything further down" would have retired it too, which is the
+# kind of self-contradiction this file keeps being edited to remove.
 #
 # Specifically, the "Finding J" section below ends with:
 #
@@ -22,9 +27,18 @@
 #
 # reproduces the production measurement
 #
-#     32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103
+#     103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
 #
-# byte-for-byte, on a machine that had never built this tree. The May history is
+# byte-for-byte — provided you check out the commit that measurement was taken on
+# (tag `pcr0-103ccd79`, commit 96cd4e46) and not HEAD, which carries later
+# dependency bumps. First shown on a machine that had never built this tree;
+# shown again on 2026-08-26 from a fresh anonymous clone.
+#
+# "Byte-for-byte" means the MEASUREMENT, not the file. Compare PCR0 from
+# `describe-eif`; do not compare `sha256sum signer.eif`. Measured 2026-08-26: two
+# builds of an identical tree produced different EIF sha256 and identical PCR0/1/2,
+# because the container carries BuildTime and docker image ids that the measurement
+# does not. A sha256 check would fail an honest rebuild. The May history is
 # kept below deliberately — it is the honest record of how the determinism was
 # won, and deleting it would hide that it took several attempts — but it must
 # not be read as the current state.
