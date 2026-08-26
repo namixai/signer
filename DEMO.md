@@ -270,7 +270,20 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   --rpc-url https://mainnet.base.org
 
 # Or ask about whatever a box is actually running:
-PCR0=$(curl -s https://signer-demo.usenami.io:8443/attestation | jq -r .pcr0_sha384)
+# 🔴 `pcr0_sha384` is the CONVENIENCE MIRROR, not the signed document. A gateway
+# that wanted to fool you would put a registered measurement in this field while
+# the COSE document carries a different one — and the registry would answer
+# `true` about a measurement nothing is running. This shortcut is only worth
+# anything AFTER verify.py has validated the signed document; treat a `true`
+# here without that step as unproven, not as proof.
+# Fail closed on the fetch too: an error page or a missing field would otherwise
+# walk an empty value straight into the calldata.
+SIGNER_URL=https://signer-demo.usenami.io:8443
+PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+case "$PCR0" in
+  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; } ;;
+  *) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+esac
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" "0x$PCR0" --rpc-url https://mainnet.base.org
 # On the demo today this prints `false` — see the note above.

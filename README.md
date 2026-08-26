@@ -165,8 +165,20 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 # Take the measurement from the /attestation of the endpoint you intend to use, then
 # ask the registry about THAT value. Do not paste a number out of this file: files lag,
 # attestation documents do not.
+# 🔴 `pcr0_sha384` is the CONVENIENCE MIRROR, not the signed document. A gateway
+# that wanted to fool you would put a registered measurement in this field while
+# the COSE document carries a different one — and the registry would answer
+# `true` about a measurement nothing is running. This shortcut is only worth
+# anything AFTER verify.py has validated the signed document; treat a `true`
+# here without that step as unproven, not as proof.
+# Fail closed on the fetch too: an error page or a missing field would otherwise
+# walk an empty value straight into the calldata.
 SIGNER_URL=https://signer-demo.usenami.io:8443   # or your production endpoint
-PCR0=$(curl -s "$SIGNER_URL/attestation" | jq -r .pcr0_sha384)
+PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+case "$PCR0" in
+  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; } ;;
+  *) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+esac
 
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \

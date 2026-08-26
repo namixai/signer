@@ -87,7 +87,7 @@ the **pinned** AWS Nitro root: we do **not** hand-roll chain building.
 # (never `assert`; `python -O` strips asserts). The cert path is validated by
 # certvalidator, anchored to the PINNED root and as-of the attestation timestamp
 # (the leaf certs are short-lived); COSE ES384 / PCR0 / nonce are checked explicitly.
-import base64, hashlib, os, datetime, requests, cbor2
+import base64, hashlib, os, re, datetime, requests, cbor2
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives import hashes
@@ -131,6 +131,12 @@ if not EXPECTED_PCR0:
         "Set it to the measurement you expect this endpoint to be running - see the\n"
         "comment above for where to source it - then run again:\n"
         "  EXPECTED_PCR0=<96 hex chars> SIGNER_URL=<endpoint> python3 verify.py"
+    )
+# Shape first, before any network call or certificate work: a typo should cost
+# you a line of output, not a full path validation against the Nitro root.
+if not re.fullmatch(r"[0-9a-f]{96}", EXPECTED_PCR0):
+    raise SystemExit(
+        f"EXPECTED_PCR0 must be 96 hex characters (SHA-384); got {len(EXPECTED_PCR0)}."
     )
 
 # The endpoint to query, and the root pin to hold it to. These are read from the
@@ -219,15 +225,27 @@ check(doc["nonce"] == bytes.fromhex(nonce), "nonce not bound — possible replay
 print(f"OK — path valid to pinned root, COSE signature valid, PCR0={pcr0} matches, nonce fresh.")
 ```
 
-Run it — the published pins are baked in as defaults, so it works as-is against the
-public demo:
+Run it. There is no baked-in expectation any more, so you have to say what you
+expect — that refusal is the point, not an inconvenience:
 
 ```bash
-python3 verify.py
-# For real assurance, supply your OWN rebuilt PCR0 (Part 2) and independently-pinned root:
-EXPECTED_PCR0=<your rebuild's PCR0> NITRO_ROOT_SHA256=<pinned> \
+# Strongest form, and the only one that owes us nothing: hold the endpoint to the
+# measurement YOUR OWN rebuild produced (Part 2).
+EXPECTED_PCR0="$(cat pcr0-from-my-build.txt)" \
   SIGNER_URL=https://signer-demo.usenami.io:8443 python3 verify.py
+
+# Weaker but still useful: hold it to a measurement you decided to trust from
+# somewhere other than this file — the registry, the README table, an auditor.
+# Whatever you pick, you are the one picking it. That is the whole change.
+EXPECTED_PCR0="$MEASUREMENT_YOU_TRUST" SIGNER_URL="$ENDPOINT" python3 verify.py
+
+# For real assurance, pin the root yourself instead of trusting this file too:
+#   NITRO_ROOT_SHA256=<the value you sourced> ...
 ```
+
+Deliberately absent: a copy-paste line with a measurement already filled in. One
+lived here for months, went stale twice, and the second time it told readers a
+healthy production service was untrustworthy.
 
 Any tampering fails loudly: a forged document breaks the COSE signature; a document
 from a different image fails the PCR0 check; a stale/cached document fails the nonce
@@ -302,7 +320,20 @@ is really an encoding mistake. It returns **two** values; decode both.
 # Same rule as the script above: nothing baked in. Read the measurement from the
 # endpoint you are actually asking about, so the question stays "is what this box
 # runs registered, and to whom".
-PCR0=$(curl -s "${SIGNER_URL:-https://signer-demo.usenami.io:8443}/attestation" | jq -r .pcr0_sha384)
+# 🔴 `pcr0_sha384` is the CONVENIENCE MIRROR, not the signed document. A gateway
+# that wanted to fool you would put a registered measurement in this field while
+# the COSE document carries a different one — and the registry would answer
+# `true` about a measurement nothing is running. This shortcut is only worth
+# anything AFTER verify.py has validated the signed document; treat a `true`
+# here without that step as unproven, not as proof.
+# Fail closed on the fetch too: an error page or a missing field would otherwise
+# walk an empty value straight into the calldata.
+SIGNER_URL=${SIGNER_URL:-https://signer-demo.usenami.io:8443}
+PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+case "$PCR0" in
+  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; } ;;
+  *) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+esac
 curl -s https://mainnet.base.org -H 'Content-Type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"eth_call","params":[{
     "to":"0x38b42eED740b0fDeb211bBDf773F2238cAEec240",
