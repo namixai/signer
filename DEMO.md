@@ -280,10 +280,19 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 # walk an empty value straight into the calldata.
 SIGNER_URL=https://signer-demo.usenami.io:8443
 PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
-if [[ ! $PCR0 =~ ^[0-9a-f]{96}$ ]]; then
-  echo "no usable pcr0_sha384 from $SIGNER_URL" >&2
-  exit 1
-fi
+# POSIX, and case-normalised first: an uppercase hash is the same hash, and
+# `[[ =~ ]]` is a bashism that dies in dash — which is /bin/sh on Debian.
+# `shopt -s nocasematch` also quietly makes both `[[ =~ ]]` and a bare `case`
+# accept uppercase, so normalise rather than rely on the match being strict.
+# LC_ALL=C: `tr` ranges and `case` bracket expressions collate per locale, so a
+# range like a-f is not guaranteed to mean the six letters everywhere. Not
+# reproduced on this machine — every locale available here behaved correctly —
+# but the guard costs one line and removes the whole class.
+PCR0=$(printf '%s' "$PCR0" | LC_ALL=C tr 'A-F' 'a-f')
+case "$PCR0" in
+  *[!0123456789abcdef]*) echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1 ;;
+esac
+[ ${#PCR0} -eq 96 ] || { echo "no usable pcr0_sha384 from $SIGNER_URL" >&2; exit 1; }
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" "0x$PCR0" --rpc-url https://mainnet.base.org
 # On the demo today this prints `false` — see the note above.
