@@ -258,13 +258,14 @@ carried a default, which is how it drifted: between 2026-08-10 and 2026-08-24 th
 lanes did run the same image, the file said so, and then rotation #4 moved production
 onto `103ccd79…` while the default kept naming the old value.
 
-The lanes have diverged again, and this time the file says so instead of averaging
-over it:
+The lanes diverged on 2026-08-24. This file no longer averages over that, and it no
+longer prints for the demo box a number that a rotation can retire behind its back — it
+names the source instead:
 
-| endpoint | measurement it attests | on-chain, checked 2026-08-26 |
+| endpoint | measurement it attests | on-chain |
 |---|---|---|
-| mainnet / production | `103ccd79…` | `(true, 0x21538eBF…)` |
-| `signer-demo.usenami.io:8443` | `32d25d8c…` | `(false, 0x0000…0000)` — awaiting rotation |
+| mainnet / production | `103ccd79…`, registered 2026-08-24 | `(true, 0x21538eBF…)` |
+| `signer-demo.usenami.io:8443` | read it from that endpoint's `/attestation` | `true` while the box is on the registered image; `false` inside a rotation window (as on 2026-08-26) |
 
 So pick your expectation deliberately. Build the commit you intend to trust and use
 what your own build produced; or take the active measurement from the registry and
@@ -329,7 +330,16 @@ is really an encoding mistake. It returns **two** values; decode both.
 # Fail closed on the fetch too: an error page or a missing field would otherwise
 # walk an empty value straight into the calldata.
 SIGNER_URL=${SIGNER_URL:-https://signer-demo.usenami.io:8443}
-PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+# Bind the answer to THIS request. Without a nonce an endpoint may hand you a
+# document it prepared earlier — including one measured on an image it no longer
+# runs. The nonce does not make the mirror field trustworthy; it removes replay
+# from the list of things that can be wrong before verify.py has run at all.
+NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+ATT=$(curl -sf "$SIGNER_URL/attestation?nonce=$NONCE") \
+  || { echo "no attestation from $SIGNER_URL" >&2; exit 1; }
+[ "$(printf '%s' "$ATT" | jq -r '.nonce // empty')" = "$NONCE" ] \
+  || { echo "nonce not echoed — document not bound to this request" >&2; exit 1; }
+PCR0=$(printf '%s' "$ATT" | jq -r '.pcr0_sha384 // empty')
 # POSIX, and case-normalised first: an uppercase hash is the same hash, and
 # `[[ =~ ]]` is a bashism that dies in dash — which is /bin/sh on Debian.
 # `shopt -s nocasematch` also quietly makes both `[[ =~ ]]` and a bare `case`

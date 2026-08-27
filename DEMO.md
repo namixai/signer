@@ -232,7 +232,9 @@ Usenami's production enclave build has its PCR0 registered in a public
 smart contract on Base mainnet. Between 2026-08-10 and 2026-08-24 the demo
 endpoint ran the same image as production, and this page said one number
 covered both boxes. **That stopped being true on 2026-08-24**, and the sentence
-stayed. They are two separate facts now, each read from its own `/attestation`:
+stayed: for two days, this page named a retired measurement as production. The sentence is
+not coming back even when the boxes next agree, because they rotate on separate schedules
+and agreement is a coincidence with a date on it, not a property. Two facts, two sources:
 
 - Registry contract:
   [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240)
@@ -242,9 +244,10 @@ stayed. They are two separate facts now, each read from its own `/attestation`:
 - Active on-chain right now — the **production** enclave:
   `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3`
   (registered 2026-08-24 by the owner above)
-- What the **demo** box is running: `32d25d8c2f0b…`, which the 2026-08-24
-  rotation auto-deprecated. Ask the registry about it today and you get
-  `false`.
+- What the **demo** box is running: ask the box, with the command below. From 2026-08-24 to
+  2026-08-27 it attested `32d25d8c2f0b…`, which that rotation auto-deprecated, so the registry
+  answered `false` for it; it was rotated onto the production measurement on 2026-08-27. Both
+  of those are dated readings, and the box is the only thing that can tell you what is true now.
 
 > ⚠️ **This page has now gone stale twice, and both corrections are published rather
 > than quietly swapped.** An earlier revision printed `7c9e8b26…` and told you to expect
@@ -252,12 +255,12 @@ stayed. They are two separate facts now, each read from its own `/attestation`:
 > case: from 2026-08-24 until 2026-08-26 the page called `32d25d8c2f0b…` the production
 > measurement, after rotation #4 had already moved production to `103ccd79de6c…`.
 >
-> 🔴 **The demo box is the one lagging now, and we are not going to hide it.** It still
-> runs `32d25d8c2f0b…`, so the on-chain check below returns `false` for the demo's own
-> measurement until the demo is rotated. `false` there is our rotation lag, not a
-> service failing to be what it claims. The production lane passes the same check
-> today; verified 2026-08-26. If you need the check to mean something about the
-> enclave that would hold your keys, run it against production.
+> 🔴 **When a demo measurement answers `false`, that is a rotation lag — and you should
+> not have to take our word for which it is.** The two boxes rotate on separate schedules,
+> so a demo endpoint inside a window attests a measurement the registry has already
+> deprecated; from 2026-08-24 to 2026-08-27 that was exactly the state. Read the measurement from the
+> endpoint you are asking about, ask the registry about that value, and if you need the
+> answer to mean something about an enclave that would hold your keys, ask production.
 
 **Verify with [Foundry's `cast`](https://book.getfoundry.sh/cast/) (one command, no auth required)** — and read carefully what a `true` here does and does not mean; the paragraphs after the command spell it out.
 
@@ -279,7 +282,16 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 # Fail closed on the fetch too: an error page or a missing field would otherwise
 # walk an empty value straight into the calldata.
 SIGNER_URL=https://signer-demo.usenami.io:8443
-PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+# Bind the answer to THIS request. Without a nonce an endpoint may hand you a
+# document it prepared earlier — including one measured on an image it no longer
+# runs. The nonce does not make the mirror field trustworthy; it removes replay
+# from the list of things that can be wrong before verify.py has run at all.
+NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+ATT=$(curl -sf "$SIGNER_URL/attestation?nonce=$NONCE") \
+  || { echo "no attestation from $SIGNER_URL" >&2; exit 1; }
+[ "$(printf '%s' "$ATT" | jq -r '.nonce // empty')" = "$NONCE" ] \
+  || { echo "nonce not echoed — document not bound to this request" >&2; exit 1; }
+PCR0=$(printf '%s' "$ATT" | jq -r '.pcr0_sha384 // empty')
 # POSIX, and case-normalised first: an uppercase hash is the same hash, and
 # `[[ =~ ]]` is a bashism that dies in dash — which is /bin/sh on Debian.
 # `shopt -s nocasematch` also quietly makes both `[[ =~ ]]` and a bare `case`
@@ -328,8 +340,9 @@ true
 
 Translation: *the registry reports PCR0 103ccd79de6c… as active right now, with owner
 0x21538eBF…, the canonical address Usenami publishes.* Run the same command against
-the demo box's current measurement and you get `false` with a zero owner, because
-rotation #4 deprecated it and the demo has not been rotated yet.
+whatever a box attests and you learn whether that box's measurement is registered. A
+`false` with a zero owner means the measurement has been deprecated, which inside a
+rotation window is what a lagging box looks like.
 
 🔴 **Both lines matter, and the second one carries the weight.** `registerPCR0` is
 permissionless: **any** address can register a measurement nobody currently holds and
@@ -394,9 +407,10 @@ nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
 # Expected for the strict build at commit 96cd4e46, which is the MAINNET/PRODUCTION
 # enclave as of 2026-08-24:
 #   103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
-# The demo endpoint is a SEPARATE box on a SEPARATE measurement — it still runs the
-# pre-rotation image. One number stopped covering both on 2026-08-24. Build the commit
-# you mean to check, and compare against that box's own /attestation.
+# The demo endpoint is a SEPARATE box that rotates on its own schedule: it ran the
+# pre-rotation image from 2026-08-24 until 2026-08-27. One number stopped covering both
+# boxes on 2026-08-24, covers both again since 2026-08-27, and can stop in any window.
+# Build the commit you mean to check, and compare against that box's own /attestation.
 ```
 
 If your locally-built PCR0 matches the on-chain registered PCR0, you
