@@ -50,7 +50,7 @@ The enclave keeps an **in-memory (RAM-only) registry** mapping each bearer token
 | `POST /hedge` | tenant | place_hedge |
 | `GET /account/:venue` | tenant | signed read (balances) |
 | `POST /verify-blob` | operator | anti-oracle pre-flight: confirm a blob decrypts under the current PCR0 (returns attestation, never the key) |
-| `GET /attestation` | — (public) | PCR0 + on-chain registration proof; edge-cached, exempt from the `/sign` pool |
+| `GET /attestation` | — (public) | PCR0 + on-chain registration proof; `Cache-Control: no-store` (never edge-cached, so a nonce round-trip is honest), exempt from the `/sign` pool |
 | `GET /healthz` | — (public) | liveness |
 
 ## PCR0 lifecycle (enclave rotation / cutover)
