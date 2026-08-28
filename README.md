@@ -106,21 +106,24 @@ sdk/
 
 ## On-chain trust anchor
 
-> ## What the registry says today, and why the demo box answers `false`
+> ## What the registry says, and how to hold a live box to it
 >
-> Every row re-measured against Base on **2026-08-26**, with the `cast` call below:
+> Every row re-measured against Base on **2026-08-27**, with the `cast` call below:
 >
 > | PCR0 | what it is | `isPCR0Active` → `(active, owner)` |
 > |---|---|---|
 > | `103ccd79…` | **production**, since rotation #4 on 2026-08-24 | **`(true, 0x21538eBF…)`** |
-> | `32d25d8c…` | what the **demo box still runs**; was production 2026-08-10 → 08-24 | `(false, 0x0000…0000)` |
+> | `32d25d8c…` | production 2026-08-10 → 08-24, then the demo box alone until 2026-08-27 | `(false, 0x0000…0000)` |
 > | `7c9e8b26…` | registered 2026-06-23, auto-deprecated | `(false, 0x0000…0000)` |
 > | `ff53e1fe…` | retired 2026-08-10 | `(false, 0x0000…0000)` |
 >
-> 🔴 **Read row two before you test us with the demo endpoint.** The demo box has not
-> been rotated onto the production image yet, so asking the registry about the
-> measurement the demo attests returns `false`. That is our rotation lag, printed here
-> rather than left for you to trip over. Production passes the same check today.
+> 🔴 **The two boxes rotate on separate schedules, so they are not always on the same
+> measurement.** From 2026-08-24 to 2026-08-27 the demo box ran the pre-rotation image while
+> production had moved on, and the registry answered `false` for what the demo attested. We
+> printed that rather than leave you to trip over it. The demo was rotated on 2026-08-27 and
+> both boxes now attest the same measurement — but that is a state with a date on it, not a
+> property, and the next window will separate them again. Whether they agree when you read
+> this, only the boxes can say. The command below asks them instead of guessing.
 >
 > **Why this notice stays.** Between the 2026-08-10 rotation and the re-registration,
 > this section told you the opposite — that `7c9e8b26…` was the active value — and it
@@ -143,8 +146,10 @@ actually guarantees before leaning on it:
   above. That is what the registry says. What a box is *running* is a separate fact from
   a separate source: that box's `/attestation`. This file used to print one number for
   both, and that is how it went stale.
-- **What the demo box runs**: `32d25d8c2f0bde55610e6a25b9ae51678a50b3a3929c70cdb5a497ec0a5f8c1f34520c5fb67b20912677ecc47d377103` — deprecated by that
-  same rotation, so it answers `false` on-chain. See the table above before you check it.
+- **What the demo box runs**: read it from that box's own `/attestation` — the command
+  below does exactly that. It is deliberately not a number in this file. This page printed
+  one number for both boxes as though that were a single fact, and that is how it went
+  stale, twice.
 
 > 🔴 **`isPCR0Active` reads mutable state, and `registerPCR0` is permissionless.** Any
 > address may register an unclaimed measurement and become its owner; an owner's next
@@ -174,7 +179,16 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 # Fail closed on the fetch too: an error page or a missing field would otherwise
 # walk an empty value straight into the calldata.
 SIGNER_URL=https://signer-demo.usenami.io:8443   # or your production endpoint
-PCR0=$(curl -sf "$SIGNER_URL/attestation" | jq -r '.pcr0_sha384 // empty')
+# Bind the answer to THIS request. Without a nonce an endpoint may hand you a
+# document it prepared earlier — including one measured on an image it no longer
+# runs. The nonce does not make the mirror field trustworthy; it removes replay
+# from the list of things that can be wrong before verify.py has run at all.
+NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+ATT=$(curl -sf "$SIGNER_URL/attestation?nonce=$NONCE") \
+  || { echo "no attestation from $SIGNER_URL" >&2; exit 1; }
+[ "$(printf '%s' "$ATT" | jq -r '.nonce // empty')" = "$NONCE" ] \
+  || { echo "nonce not echoed — document not bound to this request" >&2; exit 1; }
+PCR0=$(printf '%s' "$ATT" | jq -r '.pcr0_sha384 // empty')
 # POSIX, and case-normalised first: an uppercase hash is the same hash, and
 # `[[ =~ ]]` is a bashism that dies in dash — which is /bin/sh on Debian.
 # `shopt -s nocasematch` also quietly makes both `[[ =~ ]]` and a bare `case`
@@ -196,8 +210,9 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 # → true
 #   0x21538eBF6598e5866BA496A954dE8E39097bFB59
 # BOTH lines must match: `false` or a different owner = stop, do not use the service.
-# For the production lane today that is 0x103ccd79de6c… — see the demo caveat above
-# before you run this against the demo box.
+# The production lane has been 0x103ccd79de6c… since 2026-08-24. Whether the demo box is
+# on the same measurement depends on where the rotation windows fall — which is why the
+# value above is read from /attestation rather than pasted out of this file.
 ```
 
 The argument is the raw **48 bytes** — `cast` encodes the `0x…` literal for you. Passing
