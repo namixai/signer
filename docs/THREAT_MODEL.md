@@ -50,7 +50,7 @@ Everything else in the system is replaceable. The plaintext key is the only thin
 - **UPL (Usenami Policy Layer) is live and enforced enclave-side** (shipped 2026-05-14 — this is the current build, not a future phase). Each customer key is co-encrypted with a JSON policy inside a single KMS ciphertext; the enclave decrypts both atomically and validates every request against the policy *after* decryption but *before* any signing work, returning `policy_denied` on a violation. A malicious gateway cannot forge, weaken, or swap a policy without re-encrypting through KMS — which it can't do without enclave attestation. So a malicious gateway is bounded to the venues, actions, HTTP methods, and path prefixes the customer pre-declared (deny-by-default on empty lists, fail-closed on malformed wrappers), plus a per-minute request cap.
 - Signing-request volume is observable. Anomalous spikes show up in metrics.
 
-**Residual risk:** UPL bounds *which* actions / venues / paths a malicious gateway can reach on every path, plus a per-minute rate cap. On the **structured order paths (Hyperliquid, Asterdex)** it additionally enforces per-policy **order-size caps** enclave-side, returning `policy_denied` on an over-cap request. On the **generic HMAC sign path** (`/sign/binance-request`, used by the keyless demo) a withdrawal- or transfer-class request is **refused by the gateway, before it reaches the enclave** — an outer layer, not an enclave policy decision (see *Where the withdraw refusal happens* below). Order *size* on that path is **not** yet capped — size caps on that path are a documented, pending hook, not a current guarantee. So a malicious gateway is confined to the declared action / venue / path envelope and the rate cap everywhere, and to per-policy size caps on the structured paths; **treat the generic sign path as deny-withdraw-bound, not cap-bound.** Defense in depth (disable exchange-side withdrawals, sandbox the bot) stays recommended.
+**Residual risk:** UPL bounds *which* actions / venues / paths a malicious gateway can reach on every path, plus a per-minute rate cap. On the **structured order paths (Hyperliquid, Asterdex)** it additionally enforces per-policy **order-size caps** enclave-side, returning `policy_denied` on an over-cap request. On the **generic HMAC sign path** (`/sign/binance-request`, used by the keyless demo) the enclave enforces a per-operation parameter allow-list that **denies withdraw/transfer outright** — that refusal is enclave-side. On the **structured `/sign` path** the refusal happens one layer earlier, in the gateway, before the enclave is called at all (see *Where the withdraw refusal happens* below). Order *size* on the generic path is **not** yet capped — size caps on that path are a documented, pending hook, not a current guarantee. So a malicious gateway is confined to the declared action / venue / path envelope and the rate cap everywhere, and to per-policy size caps on the structured paths; **treat the generic sign path as deny-withdraw-bound, not cap-bound.** Defense in depth (disable exchange-side withdrawals, sandbox the bot) stays recommended.
 
 ---
 
@@ -114,9 +114,9 @@ Everything else in the system is replaceable. The plaintext key is the only thin
 **What stops them (UPL, live and enforced enclave-side):**
 - **UPL is live and enforced inside the enclave.** A compromised bot is bounded to the actions, venues, HTTP methods, and path prefixes in the customer's policy (deny-by-default, fail-closed), plus a per-minute rate cap. If the policy doesn't permit a given venue's order action, an injected agent can't get the enclave to sign one.
 
-- **Order-size caps are enforced enclave-side on the structured order paths. On the generic sign path, withdraw/transfer is refused by the gateway — an outer layer — and order size is not yet capped.** On the **Hyperliquid / Asterdex structured order paths**, the enclave validates per-policy size caps *after* decryption but *before* signing, returning `policy_denied` on an over-cap request. On the **generic HMAC sign path** (the one the keyless demo uses), a withdrawal- or transfer-class request is **refused by the gateway before the enclave sees it** — a different layer from the enclave-side checks in the same sentence (see *Where the withdraw refusal happens* below). Order *size* is **not** capped there yet — that is a documented pending hook, not a shipped guarantee. Treat the generic path as **deny-withdraw-bound, not cap-bound**: an over-size order on that path will be signed.
+- **Order-size caps are enforced enclave-side on the structured order paths; on the generic sign path withdraw/transfer is denied enclave-side, while on the structured `/sign` path the same class is refused earlier by the gateway. Order size is not yet capped on the generic path.** On the **Hyperliquid / Asterdex structured order paths**, the enclave validates per-policy size caps *after* decryption but *before* signing, returning `policy_denied` on an over-cap request. On the **generic HMAC sign path** (the one the keyless demo uses), the per-operation parameter allow-list **denies withdraw/transfer entirely**, enclave-side. Order *size* is **not** capped there yet — that is a documented pending hook, not a shipped guarantee. Treat the generic path as **deny-withdraw-bound, not cap-bound**: an over-size order on that path will be signed.
 
-**Residual risk:** Order-size limits do not yet cover the generic sign path (pending hook), and one narrow policy-enforcement edge on the structured paths remains under active hardening. As defense in depth — independent of UPL — customers should still disable withdrawals on the exchange-side API key wherever the venue allows it, sandbox the bot, and guard the bearer token. A compromised bot is bounded to the customer's declared action / venue / path envelope and the per-minute rate cap on every path (plus size caps on the structured paths) — withdrawal- and transfer-class requests are refused everywhere, though on the generic path that refusal is a **gateway** one rather than an enclave decision (see *Where the withdraw refusal happens*). Do not rely on size caps on the generic path.
+**Residual risk:** Order-size limits do not yet cover the generic sign path (pending hook), and one narrow policy-enforcement edge on the structured paths remains under active hardening. As defense in depth — independent of UPL — customers should still disable withdrawals on the exchange-side API key wherever the venue allows it, sandbox the bot, and guard the bearer token. A compromised bot is bounded to the customer's declared action / venue / path envelope and the per-minute rate cap on every path (plus size caps on the structured paths) — withdrawal- and transfer-class requests are refused everywhere, though by **different layers depending on the path** (see *Where the withdraw refusal happens*). Do not rely on size caps on the generic path.
 
 ---
 
@@ -140,36 +140,39 @@ Everything else in the system is replaceable. The plaintext key is the only thin
 | Attacker | Can extract plaintext key? | Mitigation |
 |---|---|---|
 | A1 — Host root | No | Nitro hypervisor isolation |
-| A2 — Backdoored gateway | No (can be a signing oracle, scoped by UPL) | UPL enforces action/venue/path enclave-side (live); withdraw/transfer refused on every path — **by the gateway, an outer layer, not by the enclave** (see note below the table); order-size caps on structured order paths only — generic sign path is deny-withdraw-bound, not cap-bound |
+| A2 — Backdoored gateway | No (can be a signing oracle, scoped by UPL) | UPL enforces action/venue/path enclave-side (live); withdraw/transfer refused on every path — **enclave-side on the generic path, and one layer earlier by the gateway on the structured `/sign` path** (see note below the table); order-size caps on structured order paths only — generic sign path is deny-withdraw-bound, not cap-bound |
 | A3 — Backdoored enclave | No | PCR0 attestation binding |
 | A4 — Compromised AWS IAM | Hard | Least-privilege, CloudTrail alarms, separation of duties |
 | A5 — Network MITM | No | Bearer-token auth + Cloudflare-edge TLS (gateway-native TLS = Phase 2); exchange-side nonce. **No mTLS.** |
-| A6 — Compromised bot / injected agent | No — key never leaves the enclave; can use it as a signing oracle, scoped by UPL | UPL (live) bounds action/venue/path enclave-side; withdraw/transfer refused everywhere — **by the gateway, not the enclave** (see note below the table); order-size caps on structured paths only (generic sign path not cap-bound — pending hook); one narrow edge under hardening |
+| A6 — Compromised bot / injected agent | No — key never leaves the enclave; can use it as a signing oracle, scoped by UPL | UPL (live) bounds action/venue/path enclave-side; withdraw/transfer refused everywhere — **enclave-side on the generic path, gateway-side on the structured `/sign` path** (see note below the table); order-size caps on structured paths only (generic sign path not cap-bound — pending hook); one narrow edge under hardening |
 | A7 — Multi-role insider | Hard | Separation of duties + public PCR0 commitments |
 
 ### Where the withdraw refusal happens
 
-Withdrawal- and transfer-class requests never reach the enclave. The gateway matches the
-venue-native action name against a fixed list — `withdraw`, `withdraw3`, `withdrawal`, `usdSend`,
+Withdrawal- and transfer-class requests are refused on every path, but **not by the same layer**,
+and the difference matters if you are reasoning about who has to be trusted.
+
+**On the structured `/sign` path — the gateway, before the enclave is called.** It matches the
+venue-native action name against a fixed list: `withdraw`, `withdraw3`, `withdrawal`, `usdSend`,
 `spotSend`, `cWithdraw`, and the internal transfers `usdClassTransfer`, `vaultTransfer`,
-`subAccountTransfer`, `hip3LiquidatorTransfer` — and refuses before any signing call is made.
+`subAccountTransfer`, `hip3LiquidatorTransfer`. The request never reaches the enclave.
 
-That is an outer layer, and this page is being precise about it because earlier revisions were not:
-they described the refusal as something the enclave enforces. It is not. The enclave only ever
-produces order and cancel signatures; a withdrawal-class request is turned away one layer before it.
+**On the generic HMAC sign path (`/sign/binance-request`) — the enclave.** The gateway performs no
+withdrawal check there; the request is forwarded, and the enclave's per-operation parameter
+allow-list refuses it, with path matching deliberately cautious enough that denying `/withdraw`
+also denies `/withdrawal/...` and `/withdraw-anything`.
 
-Two consequences follow, and both are worth knowing:
+Two consequences follow:
 
-- The refusal does not depend on attestation or on the enclave's policy state. It holds even while
-  the enclave is mid-restart with an empty registry.
-- It is a gateway decision, so it carries the gateway's trust level, not the enclave's. If you want
-  a guarantee that survives a fully compromised gateway, the enclave-side control is the UPL
-  action/venue/path envelope — and, as the rows above say, disabling withdrawals on the
-  exchange-side API key stays the recommended defence in depth.
+- The gateway-side refusal does not depend on attestation or on enclave policy state — it holds
+  even while the enclave restarts with an empty registry. But it carries the **gateway's** trust
+  level: against a fully compromised gateway it is the enclave-side controls that hold, and on the
+  generic path the withdraw refusal is one of them.
+- Neither layer is a substitute for disabling withdrawals on the exchange-side API key. That
+  remains the recommended defence in depth, as the rows above say.
 
-On the wire the refusal currently looks like a policy denial (`policy_denied`), which is part of why
-the distinction was lost here in the first place. Do not read that code as proof of an enclave
-decision — check which layer answered, not what the code is called.
+On the wire both refusals currently look alike (`policy_denied`). Do not read that code as evidence
+of which layer decided — check the path you called.
 
 ---
 
