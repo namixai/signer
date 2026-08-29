@@ -180,11 +180,20 @@ properties are different in both directions:
 - but it is the **gateway's** decision, so it carries the gateway's trust level. Against a fully
   compromised gateway, the two enclave-side mechanisms are what remain.
 
-🔴 **All three currently answer `policy_denied` on the wire.** You cannot tell from the response
-code which layer refused, and an attested-looking denial may have been decided outside the attested
-boundary. Reason from the path you called, not from the code you got back. None of the three is a
-substitute for disabling withdrawals on the exchange-side API key, which remains the recommended
-defence in depth.
+🔴 **All three currently answer with the same response shape.** On the deployed gateway a refusal
+comes back as HTTP 403 with:
+
+```json
+{"denied": true, "reason_code": "policy_denied", "rule_class": "policy", "error": "policy_denied"}
+```
+
+That is a shared *response shape*, not a distinct wire code per mechanism — and `rule_class:
+"policy"` does **not** mean the enclave decided. The gateway echelon answers the same way, from
+outside the attested boundary. You cannot tell the layer from the response; reason from the path you
+called, not from the code you got back.
+
+None of the three is a substitute for disabling withdrawals on the exchange-side API key, which
+remains the recommended defence in depth.
 
 ---
 
