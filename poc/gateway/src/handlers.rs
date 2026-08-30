@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::auth::{RawToken, ResolvedCustomer};
 use crate::proto::{
     enclave_action_for, err_code, http_status_for, is_withdrawal_kind, timestamp_in_window,
-    ErrorResponse, HealthResponse, SignDataHttpResponse, SignDataRequest, SignHttpRequest,
+    ErrorResponse, HealthResponse, HealthUnavailableResponse, SignDataHttpResponse, SignDataRequest, SignHttpRequest,
     SignHttpResponse, VerifyBlobRequest, VerifyBlobResponse, ALLOWED_EXCHANGES,
 };
 use crate::state::{blob_key, AppState, DATA_SIGNING_CUSTOMER, DATA_SIGNING_STEM};
@@ -564,9 +564,14 @@ fn build_sha() -> &'static str {
 }
 
 /// Which repository `build_sha()` belongs to. See `HealthResponse::source`.
+///
+/// The vocabulary is CLOSED: anything outside it becomes `"unknown"`. A typo
+/// like `publics` must not reach `/healthz` looking like a meaningful answer —
+/// a reader would take it for a third kind of tree rather than a mistake.
 fn build_source() -> &'static str {
     match option_env!("SIGNER_BUILD_SOURCE") {
-        Some(s) if !s.is_empty() => s,
+        Some("public") => "public",
+        Some("internal") => "internal",
         _ => "unknown",
     }
 }
@@ -624,7 +629,11 @@ pub async fn get_healthz(State(state): State<AppState>) -> Response {
             .into_response(),
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(err_code::ENCLAVE_UNREACHABLE)),
+            Json(HealthUnavailableResponse {
+                error: err_code::ENCLAVE_UNREACHABLE,
+                build: build_sha(),
+                source: build_source(),
+            }),
         )
             .into_response(),
     }

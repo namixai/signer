@@ -870,6 +870,23 @@ pub struct HealthResponse {
     pub source: &'static str,
 }
 
+/// `/healthz` when the enclave is unreachable.
+///
+/// Carries the build identity even though the probe failed — and that is the
+/// point. The failure state is exactly when an operator asks "which binary is
+/// this?", and answering only in the healthy case would withhold it precisely
+/// when it is needed.
+///
+/// Deliberately NOT folded into the shared `ErrorResponse`: that type answers
+/// every denial on every route, and build identity has no business travelling
+/// with a policy refusal.
+#[derive(Debug, Serialize)]
+pub struct HealthUnavailableResponse {
+    pub error: &'static str,
+    pub build: &'static str,
+    pub source: &'static str,
+}
+
 /// Generic error codes returned to HTTP clients.
 ///
 /// We keep this list short and intentionally vague — the gateway never
