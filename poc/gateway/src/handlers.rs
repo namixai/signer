@@ -549,6 +549,28 @@ pub async fn post_sign(
 ///
 /// We keep this distinct from `/sign` so a load balancer probing health
 /// doesn't decrypt the blob or burn a KMS call per check.
+/// Short commit SHA this binary was built from, or `"unknown"`.
+///
+/// Read at COMPILE time, deliberately not at run time: a run-time lookup would
+/// report whichever tree happens to sit next to the binary, which is exactly the
+/// confusion this is meant to end. An undeclared build says `"unknown"` rather
+/// than guessing — a wrong build id is worse than an absent one, because it
+/// would be believed.
+fn build_sha() -> &'static str {
+    match option_env!("SIGNER_BUILD_SHA") {
+        Some(s) if !s.is_empty() => s,
+        _ => "unknown",
+    }
+}
+
+/// Which repository `build_sha()` belongs to. See `HealthResponse::source`.
+fn build_source() -> &'static str {
+    match option_env!("SIGNER_BUILD_SOURCE") {
+        Some(s) if !s.is_empty() => s,
+        _ => "unknown",
+    }
+}
+
 pub async fn get_healthz(State(state): State<AppState>) -> Response {
     let req = VsockRequest {
         action: "ping".to_owned(),
@@ -590,6 +612,8 @@ pub async fn get_healthz(State(state): State<AppState>) -> Response {
             StatusCode::OK,
             Json(HealthResponse {
                 status: "ok",
+                build: build_sha(),
+                source: build_source(),
                 enclave_cid: state.enclave.cid,
                 enclave_port: state.enclave.port,
                 sign_checked,
