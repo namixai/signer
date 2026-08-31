@@ -710,9 +710,29 @@ pub struct ErrorResponse {
     pub rule_class: String,
     /// Raw wire code (existing SDK field — unchanged for back-compat).
     pub error: String,
+    /// WHICH LAYER decided: `enclave` when this response was built from an
+    /// enclave reply (`from_enclave`), `gateway` when the gateway refused on its
+    /// own (`new`).
+    ///
+    /// Without this field the layer was not determinable from a response at all:
+    /// `rule_class: "policy"` is set by the gateway's classifier and says nothing
+    /// about who ruled. An attested-looking denial could have been decided
+    /// outside the attested boundary, and a reader had no way to tell.
+    pub decided_by: &'static str,
+    /// The enclave's signed decision receipt, when one was issued
+    /// (`enclave/src/receipt.rs`). Verify it against the `public_key` carried by
+    /// the attestation document — that is what makes an enclave-decided refusal
+    /// checkable without trusting us.
+    ///
+    /// Absent by construction on gateway-decided denials, and absent before the
+    /// receipt epoch starts on an enclave (no resident key → no receipts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl ErrorResponse {
+    /// A denial the GATEWAY decided on its own (auth, tenant state, limits,
+    /// request shape, its withdrawal pre-check). No receipt by construction.
     pub fn new(code: &str) -> Self {
         let (denied, reason_code, rule_class) = denial_meta(code);
         Self {
@@ -720,7 +740,17 @@ impl ErrorResponse {
             reason_code: reason_code.to_owned(),
             rule_class: rule_class.to_owned(),
             error: code.to_owned(),
+            decided_by: "gateway",
+            receipt: None,
         }
+    }
+
+    /// A denial mapped from an ENCLAVE reply, carrying the receipt it came with.
+    pub fn from_enclave(code: &str, receipt: Option<serde_json::Value>) -> Self {
+        let mut r = Self::new(code);
+        r.decided_by = "enclave";
+        r.receipt = receipt;
+        r
     }
 }
 
@@ -1141,6 +1171,8 @@ mod tests {
                 reason_code,
                 rule_class,
                 error,
+                decided_by: _,
+                receipt: _,
             } = ErrorResponse::new(code);
             for field in [&reason_code, &rule_class, &error] {
                 assert!(

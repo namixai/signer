@@ -22,6 +22,7 @@ mod handlers;
 mod hedge;
 mod limits;
 mod proto;
+mod receipts;
 mod state;
 mod vsock;
 

@@ -37,6 +37,29 @@ fn now_ms() -> u64 {
 
 /// Convert a wire error code to an axum `Response`. Centralizes the
 /// status-mapping so handler bodies stay focused on the happy path.
+/// A denial mapped from an ENCLAVE reply: `decided_by: enclave` plus the receipt
+/// it came with (`receipts.rs`). Use at every site that maps an enclave code.
+fn enclave_error_response(code: &str, receipt: Option<serde_json::Value>) -> Response {
+    let status =
+        StatusCode::from_u16(http_status_for(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(ErrorResponse::from_enclave(code, receipt))).into_response()
+}
+
+/// Take the enclave's receipt off a reply and archive it for `customer`.
+///
+/// The gateway is a courier and an archivist here, never an author: it cannot
+/// mint a receipt, because the signing key lives only inside the enclave.
+fn take_receipt(
+    resp: &mut crate::vsock::VsockResponse,
+    customer: &str,
+) -> Option<serde_json::Value> {
+    let receipt = resp.receipt.take();
+    if let Some(r) = &receipt {
+        crate::receipts::record(customer, r);
+    }
+    receipt
+}
+
 fn error_response(code: &str) -> Response {
     let status =
         StatusCode::from_u16(http_status_for(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -416,7 +439,10 @@ pub async fn post_sign(
         }
     };
 
-    // 8. Translate the enclave's response into HTTP shape.
+    // 8. Translate the enclave's response into HTTP shape. The decision
+    //    receipt (if the enclave issued one) rides along on BOTH branches and
+    //    is archived either way.
+    let receipt = take_receipt(&mut resp, &customer);
     if let Some(code) = resp.error.as_deref() {
         info!(
             event = "enclave_response",
@@ -432,7 +458,12 @@ pub async fn post_sign(
         if mapped == err_code::RATE_LIMITED {
             state.backoff.report_rate_limited(&scope);
         }
-        return finish_log(error_response(mapped), started, false, Some(mapped));
+        return finish_log(
+            enclave_error_response(mapped, receipt),
+            started,
+            false,
+            Some(mapped),
+        );
     }
 
     // Phase 1 Stage 2 — split success path: EIP-712 venues populate

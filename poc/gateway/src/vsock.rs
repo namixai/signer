@@ -232,6 +232,12 @@ pub struct VsockResponse {
     #[serde(default)]
     #[zeroize(skip)]
     pub attestation_document_b64: Option<String>,
+    /// Decision receipt signed by the enclave (`enclave/src/receipt.rs`). Opaque
+    /// to the gateway: forwarded to the client and archived verbatim, never
+    /// parsed for meaning. Carries no secret.
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl fmt::Debug for VsockResponse {
