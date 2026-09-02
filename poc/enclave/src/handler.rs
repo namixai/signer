@@ -1699,7 +1699,7 @@ fn handle_receipt_heartbeat(
         return SignResponse::err(err_code::BAD_REQUEST);
     }
     match crate::receipt::issue_heartbeat(identity, nonce) {
-        Some(hb) => {
+        Ok(hb) => {
             let mut resp = SignResponse::ok(String::new());
             resp.heartbeat = Some(hb);
             resp
@@ -1707,10 +1707,24 @@ fn handle_receipt_heartbeat(
         // No resident key: the receipt epoch has not started on this enclave.
         // Said plainly rather than dressed as a failure — the same absence is
         // independently visible in the attestation document's missing
-        // `public_key`, so the two agree.
-        None => {
+        // `public_key`, so the two agree and a caller can check us.
+        Err(crate::receipt::HeartbeatUnavailable::NoKey) => {
             tracing::info!(event = "heartbeat_no_receipt_key");
             SignResponse::err(err_code::RECEIPTS_UNAVAILABLE)
+        }
+        // 🔴 Key IS resident and something else failed. Answering
+        // `receipts_unavailable` here would publish a contradiction: the
+        // attestation shows the `public_key` while the wire claims there is
+        // none. The code documents itself as cross-checkable, so using it where
+        // the cross-check fails would be a claim outliving its mechanism — in
+        // the one document whose whole job is to be checkable.
+        Err(crate::receipt::HeartbeatUnavailable::Internal(why)) => {
+            tracing::error!(
+                event = "heartbeat_internal_failure",
+                reason = why,
+                "receipt key IS resident — this is not `receipts_unavailable`"
+            );
+            SignResponse::err(err_code::INTERNAL_ERROR)
         }
     }
 }
@@ -5201,7 +5215,7 @@ mod tests {
         );
     }
 
-    /// 🔴 Cross-language fixture for `scripts/policy_cap_recover.py`.
+    /// 🔴 Cross-language fixture: this hash is reproduced OUTSIDE this codebase.
     ///
     /// The live caps of a production tenant are readable nowhere: the policy
     /// lives inside a sealed blob, and the venue ceremony writes `policy.json`
@@ -5214,8 +5228,23 @@ mod tests {
     /// That recovery is only sound if the offline canonical bytes are the same
     /// bytes this enclave hashes, and they are easy to get wrong: the canonical
     /// order is the `Policy` STRUCT declaration order, where `label` precedes
-    /// `order_caps` — while the ceremony's own dict emits them the other way
-    /// round. This test pins the two implementations to one number.
+    /// `order_caps`. This test pins the number so an outside implementation can
+    /// check itself against it — reproduce with any JCS + SHA-256 pair, e.g.
+    ///
+    /// ```text
+    /// python3 -c 'import json,hashlib; print(hashlib.sha256(json.dumps({
+    ///   "allowed_actions":["sign_binance_order","sign_binance_cancel"],
+    ///   "allowed_methods":["GET","POST","DELETE"],
+    ///   "allowed_path_prefixes":["/fapi/"],
+    ///   "denied_path_prefixes":["/sapi/"],
+    ///   "label":"binance-mainnet-abcd1234",
+    ///   "order_caps":[{"symbol":"BTCUSDT","max_qty":"0.01","max_notional":"1000"}],
+    /// }, separators=(",",":")).encode()).hexdigest())'
+    /// ```
+    ///
+    /// Note the key ORDER in that snippet: it is the struct's, not alphabetical
+    /// and not the order a policy file is usually written in. Getting it wrong
+    /// produces a different digest and a silent "no match".
     ///
     /// Note what the input proves as a side effect: the JSON below is written in
     /// the CEREMONY's order, and the hash still matches, because the hash is

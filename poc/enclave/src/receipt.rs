@@ -273,7 +273,7 @@ pub fn issue_pre(pre: &Pre, resp: &SignResponse) -> Option<DecisionReceipt> {
     // Copy the key out and release the key lock before signing.
     let pk: Zeroizing<[u8; 32]> = {
         let slot = key_slot().lock().unwrap_or_else(|p| p.into_inner());
-        Zeroizing::new(**slot.as_ref()?)
+        slot.as_ref()?.clone()
     };
     let (decision, reason_code) = match resp.error.as_deref() {
         None => ("allow", "ok".to_owned()),
@@ -419,6 +419,27 @@ pub struct ReceiptHeartbeat {
     pub signature: HlSignature,
 }
 
+/// Why no heartbeat was produced — and the distinction is not cosmetic.
+///
+/// 🔴 `receipts_unavailable` documents its own absence as **verifiable**: the
+/// attestation document carries no `public_key` either, so a caller can check
+/// the claim. That holds for exactly one of the three ways this can fail.
+///
+/// If the key IS resident and something else went wrong, answering
+/// `receipts_unavailable` would publish a contradiction — the attestation shows
+/// the key, the wire says there is none. That is a claim outliving its
+/// mechanism, in a document whose entire job is to be checkable. Those paths
+/// answer `internal_error` and log, which is honest: something broke, and it
+/// was not the absence of a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatUnavailable {
+    /// No resident key — the receipt epoch has not started on this enclave.
+    /// Cross-checkable against the attestation document.
+    NoKey,
+    /// Key present, something else failed. Never `receipts_unavailable`.
+    Internal(&'static str),
+}
+
 /// How many receipts this customer has been issued since boot. `0` for a
 /// customer with no decisions yet — indistinguishable, and correctly so, from a
 /// customer the enclave has never seen.
@@ -463,11 +484,14 @@ pub fn heartbeat_digest_v1(canonical: &[u8]) -> [u8; 32] {
 pub fn issue_heartbeat(
     identity: &crate::registry::ResolvedIdentity,
     client_nonce: &str,
-) -> Option<ReceiptHeartbeat> {
+) -> Result<ReceiptHeartbeat, HeartbeatUnavailable> {
     let customer_id = identity.customer_id.as_str();
     let pk: Zeroizing<[u8; 32]> = {
         let slot = key_slot().lock().unwrap_or_else(|p| p.into_inner());
-        Zeroizing::new(**slot.as_ref()?)
+        match slot.as_ref() {
+            Some(k) => k.clone(),
+            None => return Err(HeartbeatUnavailable::NoKey),
+        }
     };
     // Two different absences reach the caller as one wire code, so the one that
     // does NOT cross-check against the attestation document has to say so in the
@@ -481,7 +505,7 @@ pub fn issue_heartbeat(
             customer_id = %customer_id,
             "registry entry does not canonicalise — refusing to sign a blank where a digest belongs"
         );
-        return None;
+        return Err(HeartbeatUnavailable::Internal("entry_not_canonical"));
     };
     let mut hb = ReceiptHeartbeat {
         v: "1".to_owned(),
@@ -497,10 +521,22 @@ pub fn issue_heartbeat(
             v: 0,
         },
     };
-    let canonical = heartbeat_signing_payload(&hb).ok()?;
+    let canonical = match heartbeat_signing_payload(&hb) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(event = "heartbeat_canonical_failed", error = %e);
+            return Err(HeartbeatUnavailable::Internal("canonical_failed"));
+        }
+    };
     let digest = heartbeat_digest_v1(&canonical);
-    hb.signature = crate::signer::sign_eip712_digest(&pk, &digest).ok()?;
-    Some(hb)
+    hb.signature = match crate::signer::sign_eip712_digest(&pk, &digest) {
+        Ok(sig) => sig,
+        Err(e) => {
+            tracing::error!(event = "heartbeat_sign_failed", error = %e);
+            return Err(HeartbeatUnavailable::Internal("sign_failed"));
+        }
+    };
+    Ok(hb)
 }
 
 #[cfg(test)]
