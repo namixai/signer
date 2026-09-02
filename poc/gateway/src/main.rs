@@ -1441,20 +1441,39 @@ mod tests {
     #[test]
     fn heartbeat_answers_the_tenant_not_only_the_operator() {
         let src = include_str!("main.rs");
+        // Every needle is assembled at compile time rather than written as one
+        // literal: `include_str!` pulls in THIS test too, so a whole-string
+        // needle would also match itself and the counts below would be off by
+        // one. `concat!` leaves no single matching literal in the source.
         let sign = src
-            .find("let sign_router = Router::new()")
+            .find(concat!("let sign_router = ", "Router::new()"))
             .expect("sign_router is built in main()");
         let operator = src
-            .find("let operator_router = Router::new()")
+            .find(concat!("let operator_router = ", "Router::new()"))
             .expect("operator_router is built in main()");
-        let route = src
-            .find("\"/receipts/heartbeat\"")
-            .expect("the heartbeat route is registered");
+        // The HANDLER reference, not the path string: a path string also
+        // occurs in prose, so a guard anchored on it would keep passing after
+        // the `.route(...)` itself moved or went away (CodeRabbit, #78).
+        let needle = concat!("post(handlers::", "post_receipt_heartbeat)");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "the heartbeat handler must be wired exactly once, or `find` below \
+             would report an arbitrary one of several registrations"
+        );
+        let route = src.find(needle).expect("the heartbeat route is registered");
+        let decl = src[..route]
+            .rfind(".route(")
+            .expect("the handler is reached through a .route(...) registration");
         assert!(
-            sign < route && route < operator,
+            src[decl..route].contains(concat!("\"/receipts", "/heartbeat\"")),
+            "the handler must be registered under its own path"
+        );
+        assert!(
+            sign < decl && decl < operator,
             "the heartbeat must sit on the tenant router: a tenant bearer is \
              the only credential that makes it evidence rather than \
-             self-testimony (sign={sign}, route={route}, operator={operator})"
+             self-testimony (sign={sign}, decl={decl}, operator={operator})"
         );
     }
 

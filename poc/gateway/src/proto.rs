@@ -874,10 +874,10 @@ pub mod err_code {
     /// ZN-200 — SIGNER_REQUIRE_CONTEXT=1 + missing context.
     pub const CONTEXT_REQUIRED: &str = "context_required";
     /// C27 — policy carries an unimplemented field; fail-loud.
+    pub const UNIMPLEMENTED_POLICY_FIELD: &str = "unimplemented_policy_field";
     /// Mirror of the enclave code: this enclave has no resident receipt key,
     /// so it issues neither receipts nor counter heartbeats.
     pub const RECEIPTS_UNAVAILABLE: &str = "receipts_unavailable";
-    pub const UNIMPLEMENTED_POLICY_FIELD: &str = "unimplemented_policy_field";
     /// CR035 (red-team, 2026-05-29): collapsed code on the verify_blob
     /// path that hides "wrong key" vs "wrong inner ciphertext" vs
     /// "decrypted-but-wrong-shape" from the external caller.

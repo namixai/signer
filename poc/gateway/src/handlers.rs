@@ -2321,6 +2321,24 @@ pub struct AttestationQuery {
 ///
 /// Not an order and not a read of venue state — no daily counter, no KMS, no
 /// blob. Exempt from the tenant kill switch for the same reason `/tenant/halt`
+/// Is `nonce` a client-chosen freshness value this gateway will forward?
+///
+/// Extracted from the handler so the rule can be pinned by a test: it is the
+/// part of the heartbeat that keeps the gateway from choosing the value the
+/// enclave signs, and an inline check inside an async handler cannot be
+/// exercised without a live enclave.
+///
+/// Bound first, then charset — the cheap check should not run after the one
+/// that walks the bytes.
+fn heartbeat_nonce_ok(nonce: &str) -> bool {
+    if nonce.is_empty() || nonce.len() > 128 {
+        return false;
+    }
+    nonce
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// is: a stopped tenant is precisely the one who needs the evidence.
 #[derive(serde::Deserialize)]
 pub struct ReceiptHeartbeatRequest {
@@ -2348,19 +2366,7 @@ pub async fn post_receipt_heartbeat(
     //
     // Bound before scanning: the cheap check should not run after the one that
     // walks the bytes (Gemini, #668).
-    let nonce = req.client_nonce.as_str();
-    if nonce.is_empty() || nonce.len() > 128 {
-        return finish_log(
-            error_response(err_code::BAD_REQUEST),
-            started,
-            false,
-            Some(err_code::BAD_REQUEST),
-        );
-    }
-    let charset_ok = nonce
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if !charset_ok {
+    if !heartbeat_nonce_ok(req.client_nonce.as_str()) {
         return finish_log(
             error_response(err_code::BAD_REQUEST),
             started,
@@ -2394,7 +2400,7 @@ pub async fn post_receipt_heartbeat(
         data: None,
         intent_signature: None,
         intent_nonce: None,
-        client_nonce: Some(nonce.to_owned()),
+        client_nonce: Some(req.client_nonce.clone()),
     };
 
     let mut resp = match vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await
@@ -2878,7 +2884,7 @@ async fn sign_account_read(
             wire_code = mapped,
             vsock_latency_ms,
         );
-        return Err(error_response(mapped));
+        return Err(enclave_error_response(mapped, None));
     }
 
     state.backoff.report_success(&scope);
@@ -3729,6 +3735,40 @@ fn finish_log(
 
 #[cfg(test)]
 mod tests {
+
+    /// The nonce is what stops the GATEWAY from choosing the freshness value
+    /// the enclave signs, so each way of loosening it is pinned by name.
+    ///
+    /// The whitespace case is the one that matters: the handler's comment says
+    /// whitespace is rejected rather than trimmed, because trimming would
+    /// forward `"abc"` for a client that sent `" abc "` — the signed document
+    /// would then echo a value the client never chose, and the echo IS the
+    /// freshness proof. A later `trim()` would break that silently; this test
+    /// makes it fail loudly instead.
+    #[test]
+    fn heartbeat_nonce_rule_is_pinned_including_the_no_trim_promise() {
+        assert!(heartbeat_nonce_ok("aZ0-_"), "the allowed charset must pass");
+        assert!(
+            heartbeat_nonce_ok(&"a".repeat(128)),
+            "128 bytes is the bound"
+        );
+
+        assert!(
+            !heartbeat_nonce_ok(""),
+            "an empty nonce proves no freshness"
+        );
+        assert!(
+            !heartbeat_nonce_ok(&"a".repeat(129)),
+            "129 bytes is over it"
+        );
+        assert!(
+            !heartbeat_nonce_ok(" abc"),
+            "leading whitespace is REJECTED, never trimmed: forwarding a \
+             repaired value would echo something the client never chose"
+        );
+        assert!(!heartbeat_nonce_ok("abc "), "trailing whitespace likewise");
+        assert!(!heartbeat_nonce_ok("ab.c"), "'.' is outside the charset");
+    }
     use super::*;
 
     // ── H5: PCR0 extraction from a COSE_Sign1 attestation document ──────────
