@@ -393,6 +393,7 @@ pub async fn post_sign(
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -570,6 +571,7 @@ pub async fn get_healthz(State(state): State<AppState>) -> Response {
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -702,6 +704,7 @@ pub async fn post_verify_blob(
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -905,6 +908,7 @@ pub async fn post_sign_data(
         data: Some(req.data),
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -1100,6 +1104,7 @@ pub async fn post_sign_x402(
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -1348,6 +1353,7 @@ pub(crate) async fn sign_structured_request(
         data: None,
         intent_signature: intent.intent_signature,
         intent_nonce: intent.intent_nonce,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -1660,6 +1666,7 @@ pub async fn post_sign_binance_request(
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };
@@ -2271,6 +2278,143 @@ pub struct AttestationQuery {
     pub nonce: Option<String>,
 }
 
+/// `POST /receipts/heartbeat` — the tenant asks the ENCLAVE, not the gateway,
+/// how many decisions it has made for them.
+///
+/// The gateway is a courier here and nothing else. It cannot author the answer
+/// (the enclave signs it), cannot amend it (it is forwarded verbatim as an
+/// opaque value), and cannot usefully replay an old one (the caller's nonce is
+/// signed inside). That ordering is the entire point: this is the one call
+/// whose job is to catch the gateway hiding a decision, so every part of it
+/// that the gateway could influence has to be inert.
+///
+/// Not an order and not a read of venue state — no daily counter, no KMS, no
+/// blob. Exempt from the tenant kill switch for the same reason `/tenant/halt`
+/// is: a stopped tenant is precisely the one who needs the evidence.
+#[derive(serde::Deserialize)]
+pub struct ReceiptHeartbeatRequest {
+    /// Caller-chosen freshness nonce. Must be something the GATEWAY did not
+    /// pick — a client that lets the gateway choose it has bought nothing.
+    pub client_nonce: String,
+}
+
+pub async fn post_receipt_heartbeat(
+    State(state): State<AppState>,
+    Extension(RawToken(raw_token)): Extension<RawToken>,
+    Json(req): Json<ReceiptHeartbeatRequest>,
+) -> Response {
+    let started = Instant::now();
+    info!(event = "receipt_heartbeat_received");
+
+    // Same bound and charset the enclave enforces. Duplicated on purpose: the
+    // enclave check is the one that counts (it signs the value), this one just
+    // spends no vsock round-trip on obvious junk.
+    //
+    // 🔴 NOT trimmed. Trimming would forward `"abc"` for a client that sent
+    // `" abc "`, so the signed document would echo a value the client never
+    // chose — and the echo is the entire freshness proof. Whitespace is
+    // rejected, never silently repaired (CodeRabbit, #668).
+    //
+    // Bound before scanning: the cheap check should not run after the one that
+    // walks the bytes (Gemini, #668).
+    let nonce = req.client_nonce.as_str();
+    if nonce.is_empty() || nonce.len() > 128 {
+        return finish_log(
+            error_response(err_code::BAD_REQUEST),
+            started,
+            false,
+            Some(err_code::BAD_REQUEST),
+        );
+    }
+    let charset_ok = nonce
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !charset_ok {
+        return finish_log(
+            error_response(err_code::BAD_REQUEST),
+            started,
+            false,
+            Some(err_code::BAD_REQUEST),
+        );
+    }
+
+    let vsock_req = VsockRequest {
+        action: "receipt_heartbeat".to_owned(),
+        proto_version: 1,
+        opaque_token: Some(raw_token),
+        method: None,
+        path: None,
+        body: None,
+        timestamp_ms: None,
+        aws_credentials: None,
+        ciphertext_blob_base64: None,
+        key_blob_s3_key: None,
+        query: None,
+        op: None,
+        payload: None,
+        hl_action: None,
+        nonce: None,
+        vault_address: None,
+        x402: None,
+        order: None,
+        cancel: None,
+        attestation_nonce: None,
+        attestation_user_data: None,
+        data: None,
+        intent_signature: None,
+        intent_nonce: None,
+        client_nonce: Some(nonce.to_owned()),
+    };
+
+    let mut resp = match vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(event = "receipt_heartbeat_vsock", error_code = "enclave_unreachable", detail = %e);
+            return finish_log(
+                error_response(err_code::ENCLAVE_UNREACHABLE),
+                started,
+                false,
+                Some(err_code::ENCLAVE_UNREACHABLE),
+            );
+        }
+    };
+    if let Some(code) = resp.error.as_deref() {
+        let mapped = crate::proto::safe_wire_code(code);
+        warn!(event = "receipt_heartbeat_enclave_error", code = %mapped);
+        // `enclave_error_response`, not `error_response`: this refusal came from
+        // the enclave and must say so. `error_response` stamps
+        // `decided_by: "gateway"`, which would make an enclave
+        // `receipts_unavailable` indistinguishable from a gateway refusal — on
+        // the one route whose job is to tell those two apart (CodeRabbit, #668).
+        return finish_log(
+            enclave_error_response(mapped, None),
+            started,
+            false,
+            Some(mapped),
+        );
+    }
+    // `.take()` rather than a field move — VsockResponse has a manual Drop.
+    let Some(hb) = resp.heartbeat.take() else {
+        // A success with no document would mean the enclave answered "ok" to a
+        // question it did not answer. Fail rather than serve an empty body the
+        // caller might read as "zero decisions".
+        warn!(event = "receipt_heartbeat_no_document");
+        return finish_log(
+            error_response(err_code::INTERNAL_ERROR),
+            started,
+            false,
+            Some(err_code::INTERNAL_ERROR),
+        );
+    };
+    finish_log(
+        (StatusCode::OK, Json(serde_json::json!({ "heartbeat": hb }))).into_response(),
+        started,
+        true,
+        None,
+    )
+}
+
 /// `GET /attestation` — signer-mcp `get_attestation` proof tool.
 ///
 /// H5: fetches a live NSM-signed COSE attestation document from the enclave,
@@ -2355,6 +2499,7 @@ pub async fn get_attestation(
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
     };
     let mut resp = match vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await
     {
@@ -2672,6 +2817,7 @@ async fn sign_account_read(
         data: None,
         intent_signature: None,
         intent_nonce: None,
+        client_nonce: None,
         attestation_nonce: None,
         attestation_user_data: None,
     };

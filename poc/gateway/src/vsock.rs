@@ -167,6 +167,14 @@ pub struct VsockRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[zeroize(skip)]
     pub intent_nonce: Option<String>,
+
+    /// `receipt_heartbeat`: the CLIENT's freshness nonce, forwarded verbatim so
+    /// the enclave can echo it inside the signed document. Public by nature —
+    /// its whole job is to be a value the gateway did not choose, which is what
+    /// makes a replayed heartbeat detectable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub client_nonce: Option<String>,
 }
 
 /// Vsock-side response shape.
@@ -238,6 +246,14 @@ pub struct VsockResponse {
     #[serde(default)]
     #[zeroize(skip)]
     pub receipt: Option<serde_json::Value>,
+
+    /// Signed counter heartbeat (`receipt_heartbeat`). Opaque to the gateway
+    /// exactly like `receipt` above: forwarded to the client verbatim, never
+    /// parsed for meaning. The gateway must not be able to author or amend the
+    /// document that reports on the gateway.
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub heartbeat: Option<serde_json::Value>,
 }
 
 impl fmt::Debug for VsockResponse {
@@ -403,6 +419,7 @@ mod tests {
             data: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
         };
@@ -504,6 +521,7 @@ mod tests {
             data: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
         };

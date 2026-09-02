@@ -787,6 +787,13 @@ pub fn denial_meta(code: &str) -> (bool, &'static str, &'static str) {
         err_code::BAD_REQUEST => (false, err_code::BAD_REQUEST, "request"),
         err_code::PAYLOAD_TOO_LARGE => (false, err_code::PAYLOAD_TOO_LARGE, "request"),
         err_code::VERIFY_FAILED => (false, err_code::VERIFY_FAILED, "infra"),
+        // NOT a denial: the enclave has no resident receipt key, so it issues
+        // no heartbeats. Without this arm the default-deny fallback would
+        // report `denied: true` / `policy_denied` / `rule_class: "policy"` — a
+        // provisioning gap dressed as an attested policy refusal, which is the
+        // exact confusion the explainable layer exists to remove
+        // (CodeRabbit, #668).
+        err_code::RECEIPTS_UNAVAILABLE => (false, err_code::RECEIPTS_UNAVAILABLE, "infra"),
         err_code::ENCLAVE_UNREACHABLE => (false, err_code::ENCLAVE_UNREACHABLE, "infra"),
         err_code::INTERNAL_ERROR => (false, err_code::INTERNAL_ERROR, "infra"),
         // Tier-2 fail-closed: an allow-listed code with no explicit arm → generic
@@ -842,6 +849,9 @@ pub mod err_code {
     /// ZN-200 — SIGNER_REQUIRE_CONTEXT=1 + missing context.
     pub const CONTEXT_REQUIRED: &str = "context_required";
     /// C27 — policy carries an unimplemented field; fail-loud.
+    /// Mirror of the enclave code: this enclave has no resident receipt key,
+    /// so it issues neither receipts nor counter heartbeats.
+    pub const RECEIPTS_UNAVAILABLE: &str = "receipts_unavailable";
     pub const UNIMPLEMENTED_POLICY_FIELD: &str = "unimplemented_policy_field";
     /// CR035 (red-team, 2026-05-29): collapsed code on the verify_blob
     /// path that hides "wrong key" vs "wrong inner ciphertext" vs
@@ -881,6 +891,7 @@ pub const WIRE_OK_ERROR_CODES: &[&str] = &[
     err_code::POLICY_REQUIRED,
     err_code::CONTEXT_REQUIRED,
     err_code::UNIMPLEMENTED_POLICY_FIELD,
+    err_code::RECEIPTS_UNAVAILABLE,
     err_code::VERIFY_FAILED,
     // explainable-denials: typed denial subclasses (wire-safe, class-only).
     err_code::ACTION_NOT_ALLOWED,
@@ -946,6 +957,10 @@ pub fn http_status_for(code: &str) -> u16 {
         err_code::POLICY_REQUIRED => 403,
         err_code::CONTEXT_REQUIRED => 400,
         err_code::UNIMPLEMENTED_POLICY_FIELD => 501,
+        // "this enclave issues no receipts" — a capability absence the
+        // operator fixes by provisioning a data key, not something the
+        // caller can retry into existence.
+        err_code::RECEIPTS_UNAVAILABLE => 501,
         // explainable-denials: typed policy-denial subclasses → 403 (class only).
         err_code::ACTION_NOT_ALLOWED => 403,
         err_code::SIZE_OVER_CAP => 403,
@@ -1209,6 +1224,23 @@ mod tests {
         assert!(!is_withdrawal_kind(None));
         // Case-sensitive: only the exact venue-native names are denied here.
         assert!(!is_withdrawal_kind(Some("Withdraw")));
+    }
+
+    /// A missing receipt capability must not read as an attested policy refusal.
+    /// Without an explicit arm the default-deny fallback reports
+    /// `denied: true` / `policy_denied` / `rule_class: "policy"` — a
+    /// provisioning gap presented as a ruling from inside the enclave.
+    #[test]
+    fn receipts_unavailable_is_infra_not_a_denial() {
+        let (denied, reason, class) = denial_meta(err_code::RECEIPTS_UNAVAILABLE);
+        assert!(!denied, "no receipt key is an absence, not a refusal");
+        assert_eq!(reason, err_code::RECEIPTS_UNAVAILABLE);
+        assert_eq!(class, "infra");
+        assert_eq!(http_status_for(err_code::RECEIPTS_UNAVAILABLE), 501);
+        assert!(
+            WIRE_OK_ERROR_CODES.contains(&err_code::RECEIPTS_UNAVAILABLE),
+            "must survive safe_wire_code, else it collapses to internal_error"
+        );
     }
 
     #[test]

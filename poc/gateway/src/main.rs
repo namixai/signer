@@ -298,6 +298,15 @@ async fn main() -> Result<()> {
     // cross. This is layer-1 of the data-key isolation; the enclave KMS
     // EncryptionContext (§5) is layer-2. (CTO re-reviews this ACL on the PR.)
     let operator_router = Router::new()
+        // Signed counter heartbeat: ask the ENCLAVE how many decisions it has
+        // made for this tenant. The one call whose purpose is to catch this
+        // very gateway hiding a decision, so it sits on the tenant router (the
+        // tenant's own bearer resolves the identity inside the enclave) and
+        // carries nothing the gateway chooses.
+        .route(
+            "/receipts/heartbeat",
+            post(handlers::post_receipt_heartbeat),
+        )
         .route("/verify-blob", post(handlers::post_verify_blob))
         .route("/sign-data", post(handlers::post_sign_data))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -537,6 +546,7 @@ async fn run_data_signing_probe(state: &AppState, max_attempts: u32) -> ProbeOut
             data: Some(SIGN_PROBE_PAYLOAD.to_owned()),
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
         };
