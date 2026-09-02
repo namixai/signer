@@ -22,6 +22,7 @@ mod handlers;
 mod hedge;
 mod limits;
 mod proto;
+mod receipts;
 mod state;
 mod vsock;
 
@@ -255,6 +256,15 @@ async fn main() -> Result<()> {
         // Option-A exception — see hedge.rs doctrine note). Same auth +
         // dos-hardening stack as /sign.
         .route("/hedge", post(hedge::post_hedge))
+        // Signed counter heartbeat: ask the ENCLAVE how many decisions it has
+        // made for this tenant. The one call whose purpose is to catch this
+        // very gateway hiding a decision, so it sits on the tenant router (the
+        // tenant's own bearer resolves the identity inside the enclave) and
+        // carries nothing the gateway chooses.
+        .route(
+            "/receipts/heartbeat",
+            post(handlers::post_receipt_heartbeat),
+        )
         // B3 (в): per-token rate limit across the WHOLE tenant sign tier.
         // Registered BEFORE require_bearer in the builder chain → INNER layer
         // (axum: later layers wrap earlier ones), so it runs AFTER auth and
@@ -536,6 +546,7 @@ async fn run_data_signing_probe(state: &AppState, max_attempts: u32) -> ProbeOut
             data: Some(SIGN_PROBE_PAYLOAD.to_owned()),
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
         };
@@ -1418,6 +1429,53 @@ mod tests {
     // accept loop, not the in-process tower stack. They prove that the
     // header_read_timeout is wired correctly and fires even when no
     // tower layer has had a chance to see the request.
+
+    /// The heartbeat exists to let a TENANT catch this gateway hiding a
+    /// decision. On the operator router it is answerable only by us — the one
+    /// party it is meant to check — and a tenant's own bearer gets 401, so the
+    /// mechanism ships dead while every other test stays green.
+    ///
+    /// This is a source guard rather than a request test because the routers
+    /// are assembled inline in `main()` and cannot be built from a test. It is
+    /// falsifiable: move the route back under `operator_router` and it fails.
+    #[test]
+    fn heartbeat_answers_the_tenant_not_only_the_operator() {
+        let src = include_str!("main.rs");
+        // Every needle is assembled at compile time rather than written as one
+        // literal: `include_str!` pulls in THIS test too, so a whole-string
+        // needle would also match itself and the counts below would be off by
+        // one. `concat!` leaves no single matching literal in the source.
+        let sign = src
+            .find(concat!("let sign_router = ", "Router::new()"))
+            .expect("sign_router is built in main()");
+        let operator = src
+            .find(concat!("let operator_router = ", "Router::new()"))
+            .expect("operator_router is built in main()");
+        // The HANDLER reference, not the path string: a path string also
+        // occurs in prose, so a guard anchored on it would keep passing after
+        // the `.route(...)` itself moved or went away (CodeRabbit, #78).
+        let needle = concat!("post(handlers::", "post_receipt_heartbeat)");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "the heartbeat handler must be wired exactly once, or `find` below \
+             would report an arbitrary one of several registrations"
+        );
+        let route = src.find(needle).expect("the heartbeat route is registered");
+        let decl = src[..route]
+            .rfind(".route(")
+            .expect("the handler is reached through a .route(...) registration");
+        assert!(
+            src[decl..route].contains(concat!("\"/receipts", "/heartbeat\"")),
+            "the handler must be registered under its own path"
+        );
+        assert!(
+            sign < decl && decl < operator,
+            "the heartbeat must sit on the tenant router: a tenant bearer is \
+             the only credential that makes it evidence rather than \
+             self-testimony (sign={sign}, decl={decl}, operator={operator})"
+        );
+    }
 
     /// Build a minimal Router that returns 200 on /healthz, suitable
     /// for spinning up behind serve_with_hyper_util in tests.

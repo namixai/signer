@@ -172,6 +172,10 @@ pub struct SignHttpResponse {
     pub headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<HlSignatureWire>,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignHttpResponse {
@@ -428,6 +432,11 @@ pub struct SignX402Response {
     /// The payer address the enclave signed as (derived from the key).
     #[zeroize(skip)]
     pub from: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignX402Response {
@@ -519,6 +528,10 @@ pub struct SignBinanceOrderResponse {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignBinanceOrderResponse {
@@ -565,6 +578,10 @@ pub struct SignBinanceRequestHttp {
 pub struct SignBinanceRequestResponse {
     pub signature: String,
     pub api_key: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignBinanceRequestResponse {
@@ -594,6 +611,10 @@ pub struct SignBinanceCancelResponse {
     pub method: &'static str,
     pub url: String,
     pub headers: BTreeMap<String, String>,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignBinanceCancelResponse {
@@ -665,6 +686,10 @@ pub struct SignOkxResponse {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignOkxResponse {
@@ -710,9 +735,29 @@ pub struct ErrorResponse {
     pub rule_class: String,
     /// Raw wire code (existing SDK field — unchanged for back-compat).
     pub error: String,
+    /// WHICH LAYER decided: `enclave` when this response was built from an
+    /// enclave reply (`from_enclave`), `gateway` when the gateway refused on its
+    /// own (`new`).
+    ///
+    /// Without this field the layer was not determinable from a response at all:
+    /// `rule_class: "policy"` is set by the gateway's classifier and says nothing
+    /// about who ruled. An attested-looking denial could have been decided
+    /// outside the attested boundary, and a reader had no way to tell.
+    pub decided_by: &'static str,
+    /// The enclave's signed decision receipt, when one was issued
+    /// (`enclave/src/receipt.rs`). Verify it against the `public_key` carried by
+    /// the attestation document — that is what makes an enclave-decided refusal
+    /// checkable without trusting us.
+    ///
+    /// Absent by construction on gateway-decided denials, and absent before the
+    /// receipt epoch starts on an enclave (no resident key → no receipts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl ErrorResponse {
+    /// A denial the GATEWAY decided on its own (auth, tenant state, limits,
+    /// request shape, its withdrawal pre-check). No receipt by construction.
     pub fn new(code: &str) -> Self {
         let (denied, reason_code, rule_class) = denial_meta(code);
         Self {
@@ -720,7 +765,17 @@ impl ErrorResponse {
             reason_code: reason_code.to_owned(),
             rule_class: rule_class.to_owned(),
             error: code.to_owned(),
+            decided_by: "gateway",
+            receipt: None,
         }
+    }
+
+    /// A denial mapped from an ENCLAVE reply, carrying the receipt it came with.
+    pub fn from_enclave(code: &str, receipt: Option<serde_json::Value>) -> Self {
+        let mut r = Self::new(code);
+        r.decided_by = "enclave";
+        r.receipt = receipt;
+        r
     }
 }
 
@@ -757,6 +812,13 @@ pub fn denial_meta(code: &str) -> (bool, &'static str, &'static str) {
         err_code::BAD_REQUEST => (false, err_code::BAD_REQUEST, "request"),
         err_code::PAYLOAD_TOO_LARGE => (false, err_code::PAYLOAD_TOO_LARGE, "request"),
         err_code::VERIFY_FAILED => (false, err_code::VERIFY_FAILED, "infra"),
+        // NOT a denial: the enclave has no resident receipt key, so it issues
+        // no heartbeats. Without this arm the default-deny fallback would
+        // report `denied: true` / `policy_denied` / `rule_class: "policy"` — a
+        // provisioning gap dressed as an attested policy refusal, which is the
+        // exact confusion the explainable layer exists to remove
+        // (CodeRabbit, #668).
+        err_code::RECEIPTS_UNAVAILABLE => (false, err_code::RECEIPTS_UNAVAILABLE, "infra"),
         err_code::ENCLAVE_UNREACHABLE => (false, err_code::ENCLAVE_UNREACHABLE, "infra"),
         err_code::INTERNAL_ERROR => (false, err_code::INTERNAL_ERROR, "infra"),
         // Tier-2 fail-closed: an allow-listed code with no explicit arm → generic
@@ -813,6 +875,9 @@ pub mod err_code {
     pub const CONTEXT_REQUIRED: &str = "context_required";
     /// C27 — policy carries an unimplemented field; fail-loud.
     pub const UNIMPLEMENTED_POLICY_FIELD: &str = "unimplemented_policy_field";
+    /// Mirror of the enclave code: this enclave has no resident receipt key,
+    /// so it issues neither receipts nor counter heartbeats.
+    pub const RECEIPTS_UNAVAILABLE: &str = "receipts_unavailable";
     /// CR035 (red-team, 2026-05-29): collapsed code on the verify_blob
     /// path that hides "wrong key" vs "wrong inner ciphertext" vs
     /// "decrypted-but-wrong-shape" from the external caller.
@@ -851,6 +916,7 @@ pub const WIRE_OK_ERROR_CODES: &[&str] = &[
     err_code::POLICY_REQUIRED,
     err_code::CONTEXT_REQUIRED,
     err_code::UNIMPLEMENTED_POLICY_FIELD,
+    err_code::RECEIPTS_UNAVAILABLE,
     err_code::VERIFY_FAILED,
     // explainable-denials: typed denial subclasses (wire-safe, class-only).
     err_code::ACTION_NOT_ALLOWED,
@@ -916,6 +982,10 @@ pub fn http_status_for(code: &str) -> u16 {
         err_code::POLICY_REQUIRED => 403,
         err_code::CONTEXT_REQUIRED => 400,
         err_code::UNIMPLEMENTED_POLICY_FIELD => 501,
+        // "this enclave issues no receipts" — a capability absence the
+        // operator fixes by provisioning a data key, not something the
+        // caller can retry into existence.
+        err_code::RECEIPTS_UNAVAILABLE => 501,
         // explainable-denials: typed policy-denial subclasses → 403 (class only).
         err_code::ACTION_NOT_ALLOWED => 403,
         err_code::SIZE_OVER_CAP => 403,
@@ -1141,6 +1211,8 @@ mod tests {
                 reason_code,
                 rule_class,
                 error,
+                decided_by: _,
+                receipt: _,
             } = ErrorResponse::new(code);
             for field in [&reason_code, &rule_class, &error] {
                 assert!(
@@ -1177,6 +1249,23 @@ mod tests {
         assert!(!is_withdrawal_kind(None));
         // Case-sensitive: only the exact venue-native names are denied here.
         assert!(!is_withdrawal_kind(Some("Withdraw")));
+    }
+
+    /// A missing receipt capability must not read as an attested policy refusal.
+    /// Without an explicit arm the default-deny fallback reports
+    /// `denied: true` / `policy_denied` / `rule_class: "policy"` — a
+    /// provisioning gap presented as a ruling from inside the enclave.
+    #[test]
+    fn receipts_unavailable_is_infra_not_a_denial() {
+        let (denied, reason, class) = denial_meta(err_code::RECEIPTS_UNAVAILABLE);
+        assert!(!denied, "no receipt key is an absence, not a refusal");
+        assert_eq!(reason, err_code::RECEIPTS_UNAVAILABLE);
+        assert_eq!(class, "infra");
+        assert_eq!(http_status_for(err_code::RECEIPTS_UNAVAILABLE), 501);
+        assert!(
+            WIRE_OK_ERROR_CODES.contains(&err_code::RECEIPTS_UNAVAILABLE),
+            "must survive safe_wire_code, else it collapses to internal_error"
+        );
     }
 
     #[test]
