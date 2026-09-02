@@ -20,8 +20,9 @@ use tracing::{info, warn};
 use crate::auth::{RawToken, ResolvedCustomer};
 use crate::proto::{
     enclave_action_for, err_code, http_status_for, is_withdrawal_kind, timestamp_in_window,
-    ErrorResponse, HealthResponse, HealthUnavailableResponse, SignDataHttpResponse, SignDataRequest, SignHttpRequest,
-    SignHttpResponse, VerifyBlobRequest, VerifyBlobResponse, ALLOWED_EXCHANGES,
+    ErrorResponse, HealthResponse, HealthUnavailableResponse, SignDataHttpResponse,
+    SignDataRequest, SignHttpRequest, SignHttpResponse, VerifyBlobRequest, VerifyBlobResponse,
+    ALLOWED_EXCHANGES,
 };
 use crate::state::{blob_key, AppState, DATA_SIGNING_CUSTOMER, DATA_SIGNING_STEM};
 use crate::vsock::{self, AwsCredentials, VsockRequest};
@@ -557,8 +558,31 @@ pub async fn post_sign(
 /// than guessing — a wrong build id is worse than an absent one, because it
 /// would be believed.
 fn build_sha() -> &'static str {
-    match option_env!("SIGNER_BUILD_SHA") {
-        Some(s) if !s.is_empty() => s,
+    valid_build_sha(option_env!("SIGNER_BUILD_SHA"))
+}
+
+/// The SHAPE gate for `build_sha()`, split out so it can be tested — the value
+/// itself arrives at compile time and cannot be varied from a test.
+///
+/// The vocabulary here is as closed as `build_source()`'s, and for the same
+/// reason: `/healthz` promises a short commit SHA or `"unknown"`, so a branch
+/// name, a stray newline from a CI expansion, or `main` must NOT come out
+/// looking like an answer. A reader would take `main` for a build id and go
+/// looking for a commit that does not exist. Earlier this function accepted any
+/// non-empty string — the discipline was applied to `build_source()` right
+/// below and not to its neighbour (CodeRabbit, #73, raised twice).
+///
+/// Accepted: 7..=40 lowercase hex characters — `git rev-parse --short` at any
+/// abbreviation length, up to a full SHA-1. Anything else is `"unknown"`.
+fn valid_build_sha(raw: Option<&'static str>) -> &'static str {
+    match raw {
+        Some(s)
+            if (7..=40).contains(&s.len())
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            s
+        }
         _ => "unknown",
     }
 }
@@ -3801,6 +3825,41 @@ mod tests {
         );
         assert!(!heartbeat_nonce_ok("abc "), "trailing whitespace likewise");
         assert!(!heartbeat_nonce_ok("ab.c"), "'.' is outside the charset");
+    }
+
+    /// `/healthz` promises a short commit SHA or `"unknown"`. Anything else
+    /// would be BELIEVED — a reader seeing `main` goes looking for a commit
+    /// that does not exist, which is worse than being told nothing.
+    #[test]
+    fn build_sha_is_a_sha_or_it_is_unknown() {
+        assert_eq!(
+            valid_build_sha(Some("a81e99e")),
+            "a81e99e",
+            "short SHA passes"
+        );
+        assert_eq!(
+            valid_build_sha(Some("3bf4f62c99be3cef529e4dc9e78d96d8ac1d3c89")),
+            "3bf4f62c99be3cef529e4dc9e78d96d8ac1d3c89",
+            "a full SHA-1 passes"
+        );
+
+        for bad in [
+            "main",      // a branch name is the case that motivated this
+            "",          // empty
+            " a81e99e",  // whitespace from a CI expansion
+            "a81e99e\n", // trailing newline, same source
+            "A81E99E",   // uppercase is not what rev-parse emits
+            "a81e99",    // 6 chars — below any abbreviation git produces
+            "zzzzzzz",   // right length, not hex
+            "a81e99e-dirty",
+        ] {
+            assert_eq!(
+                valid_build_sha(Some(bad)),
+                "unknown",
+                "must not publish {bad:?} as a build id"
+            );
+        }
+        assert_eq!(valid_build_sha(None), "unknown", "undeclared build");
     }
     use super::*;
 
