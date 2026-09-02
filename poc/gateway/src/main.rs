@@ -1178,9 +1178,13 @@ mod tests {
              nothing and would pass on anything",
             real.len()
         );
+        // The exact path, not a prefix: `contains("/receipts/")` would be
+        // satisfied by any other route under that namespace, and the point is
+        // that THIS one — written multi-line — is being read (CodeRabbit, #79).
         assert!(
-            real.iter().any(|p| p.contains("/receipts/")),
-            "the multi-line registrations are not being read"
+            real.contains(&"/receipts/heartbeat"),
+            "the multi-line registrations are not being read: /receipts/heartbeat \
+             is written that way and is missing from what the extractor returned"
         );
     }
     use super::*;
