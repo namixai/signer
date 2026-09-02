@@ -209,15 +209,15 @@ async fn main() -> Result<()> {
         // bearer-gated router, which made the signer-mcp proof tool return 401.
         // signer-mcp signed-read tool: per-venue signed account-read
         // (Option A — gateway never calls the venue; MCP submits + parses).
-        .route("/account/:venue", get(handlers::get_account))
+        .route("/account/{venue}", get(handlers::get_account))
         // Signed enumerate (reconcile orders an agent lost the id for) + signed
         // mass-cancel. Reuse the GENERIC sign_binance/sign_okx action via
         // sign_account_read — no enclave change / no PCR0 cutover. Tenant-authed.
-        .route("/open-orders/:venue", get(handlers::get_open_orders))
+        .route("/open-orders/{venue}", get(handlers::get_open_orders))
         // gate-2: signed read of own filled-trade history (audit without a raw
         // key). Binance only in v0; OKX fills-history fast-follows.
-        .route("/user-trades/:venue", get(handlers::get_user_trades))
-        .route("/cancel-all/:venue", post(handlers::post_cancel_all))
+        .route("/user-trades/{venue}", get(handlers::get_user_trades))
+        .route("/cancel-all/{venue}", post(handlers::post_cancel_all))
         // Binance USD-M Futures trade signing — structured order/cancel in,
         // venue-canonical signed bytes out (enclave builds canonical inside).
         .route(
@@ -1072,6 +1072,79 @@ fn load_all_blobs(cli: &Cli) -> Result<HashMap<String, BlobBundle>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every route path in this file must be constructible by the axum version
+    /// we actually link against.
+    ///
+    /// 🔴 This exists because the four `/:venue` routes below survived CI, a
+    /// green clippy, a tag and a production deploy, and then panicked on the
+    /// first real startup: axum 0.8 changed capture syntax from `/:param` to
+    /// `/{param}` and rejects the old form when the Router is BUILT. Nothing in
+    /// this crate built a Router — the routers are assembled inline in `main()`
+    /// — so no test could go red. The bump arrived on its own; the breakage
+    /// waited for a human to restart the gateway on the box.
+    ///
+    /// Paths are read from this file's own source rather than listed here, so a
+    /// route added tomorrow is covered without anyone remembering to add it.
+    #[test]
+    fn every_route_path_is_valid_for_the_linked_axum() {
+        let src = include_str!("main.rs");
+        // The registration marker, assembled so this line does not itself
+        // match — the first run of this test failed on a path it read out of
+        // its own comment, and the second on the `.rfind` inside the heartbeat
+        // guard below. A captured path must therefore start with `/`, which is
+        // both the real rule and the cheapest way to ignore prose.
+        let marker = concat!(".", "route(");
+        let mut paths: Vec<&str> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(marker) {
+            let mut k = from + rel + marker.len();
+            from = k;
+            // Multi-line registrations put the path on the NEXT line; the
+            // heartbeat route is written that way, so a same-line-only
+            // extractor would silently skip the very route this rotation adds.
+            while src[k..].starts_with(|c: char| c.is_whitespace()) {
+                k += 1;
+            }
+            if !src[k..].starts_with('"') {
+                continue;
+            }
+            let start = k + 1;
+            let Some(end_rel) = src[start..].find('"') else {
+                continue;
+            };
+            let path = &src[start..start + end_rel];
+            if path.starts_with('/') {
+                paths.push(path);
+            }
+        }
+        assert!(
+            paths.len() >= 15,
+            "expected the route table, found {} paths — the extractor is \
+             reading nothing and would pass on anything",
+            paths.len()
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/receipts/")),
+            "the multi-line registrations are not being read: this rotation's \
+             own route is written that way"
+        );
+
+        for path in paths {
+            let p = path.to_owned();
+            let built = std::panic::catch_unwind(move || {
+                // Bound rather than dropped: `Router` is `#[must_use]`, and the
+                // point here is that CONSTRUCTION is what panics.
+                let _r = Router::<()>::new().route(&p, get(|| async {}));
+            });
+            assert!(
+                built.is_ok(),
+                "axum refuses this path: {path:?}. Since 0.8 a capture is \
+                 written {{name}}, not :name — and the Router only rejects it \
+                 when it is BUILT, which no other test here does."
+            );
+        }
+    }
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
