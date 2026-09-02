@@ -478,6 +478,35 @@ fn enforce_policy(
     }
 }
 
+/// Build a refusal that NAMES the policy in force when the decision was made.
+///
+/// Receipts (design §2) promise that a denial binds to the rule that produced
+/// it. `enforce_policy` keeps that promise for its OWN denials (see the comment
+/// above), but it is not the last gate a request crosses: the cap gates
+/// (`enforce_order_cap`, `enforce_hl_caps`, `enforce_x402_cap`,
+/// `enforce_asterdex_size_cap`), the AF-2 intent gates, and every shape /
+/// secret-material refusal that follows all decide with the policy already in
+/// force — and all of them used to answer with an EMPTY `policy_hash`.
+///
+/// On Hyperliquid that was the money gate itself: a per-asset cap or vault-list
+/// refusal produced a receipt that could not name the policy it was refused
+/// under, which is the one thing the receipt exists to prove. Found 2026-08-31
+/// while explaining an empty `policy_hash` on a live mainnet denial.
+///
+/// The invariant this restores is stronger than "denials name their rule", and
+/// deliberately so: **`policy_hash` is non-empty exactly when a policy was
+/// established at the moment of the decision.** That makes an EMPTY hash mean
+/// one precise thing — the request was refused BEFORE the policy was read
+/// (venue ACL, action shape, blob load) — instead of meaning either that or
+/// "some gate forgot". A diagnostic that is ambiguous is not a diagnostic.
+///
+/// `every_post_policy_refusal_names_the_policy` (in `mod tests`) fails the
+/// build if a new refusal is added after the policy gate without going through
+/// here — the sweep is a property, not a one-time cleanup.
+fn deny_under(policy_hash: &Option<String>, code: &'static str) -> SignResponse {
+    SignResponse::err(code).with_policy_hash(policy_hash.clone())
+}
+
 #[allow(clippy::result_large_err)]
 fn enforce_policy_inner(
     policy: Option<&Policy>,
@@ -1525,6 +1554,11 @@ pub fn handle(req: SignRequest) -> SignResponse {
         "sign_binance_cancel" => handle_sign_binance_cancel(req, identity),
         "sign_okx_order" => handle_sign_okx_order(req, identity),
         "sign_okx_cancel" => handle_sign_okx_cancel(req, identity),
+        // Signed counter heartbeat (receipt.rs). Reads this tenant's decision
+        // counter and signs the answer with the receipt key. No blob, no KMS,
+        // no venue signature — and NOT a `sign_*` action, so
+        // `is_receipted_action` keeps it out of the very chain it reports on.
+        "receipt_heartbeat" => handle_receipt_heartbeat(&req, identity),
         // Path B-lite (Stage 4 pre-flight): decrypt the blob, emit SHA-256
         // of the plaintext, zeroize. Operator-side proof that the attested
         // enclave can recover every production secret BEFORE Stage 4 cutover.
@@ -1568,7 +1602,13 @@ fn tenant_mode_gate(
     match identity.mode {
         TenantMode::Active => Ok(()),
         TenantMode::Halted => {
-            if action == "verify_blob" {
+            // `receipt_heartbeat` joins `verify_blob` in the exemption, and for
+            // the same reason turned up a notch: a HALTED tenant is exactly the
+            // one who needs to audit what was decided before the stop. It emits
+            // no signature over anything a venue would accept and cannot create
+            // exposure. Refusing it would mean the kill switch also destroys the
+            // evidence, which is the wrong trade in both directions.
+            if action == "verify_blob" || action == "receipt_heartbeat" {
                 return Ok(());
             }
             tracing::warn!(
@@ -1586,6 +1626,7 @@ fn tenant_mode_gate(
                 .map(|m| m.trim().to_ascii_uppercase())
                 .unwrap_or_default();
             let allowed = action == "verify_blob"
+                || action == "receipt_heartbeat"
                 || action.ends_with("_cancel")
                 || (action == "sign_binance_request"
                     && req.op.as_deref().map(str::trim) != Some("order"))
@@ -1605,6 +1646,71 @@ fn tenant_mode_gate(
                 );
                 Err(SignResponse::err(err_code::MODE_CANCEL_ONLY))
             }
+        }
+    }
+}
+
+/// `receipt_heartbeat` — how many decisions has this enclave made for the
+/// calling tenant since boot, signed, with the caller's nonce inside.
+///
+/// Closes the one hole the receipt chain cannot close on its own: a gap between
+/// `seq` numbers is only visible once the NEXT receipt arrives, so a swallowed
+/// LAST decision is invisible forever if the tenant never calls again. Asking
+/// the counter directly makes it visible immediately, and makes "no receipt"
+/// decidable: the counter moved without a receipt reaching me = it was hidden;
+/// the counter did not move = there was no enclave decision, so the refusal
+/// came from the gateway or the request never arrived. Both answers are honest.
+///
+/// Reads; never advances. Touches no blob and no KMS — the resident receipt key
+/// is the only secret involved.
+fn handle_receipt_heartbeat(
+    req: &SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
+    let Some(nonce) = req.client_nonce.as_deref() else {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+    // The nonce is echoed INSIDE a document we sign, so it is an input to a
+    // signed payload and gets input treatment: bounded, non-empty, and drawn
+    // from an unambiguous alphabet. Not a security boundary by itself — the
+    // canonical form would survive any UTF-8 — but a signed field that a caller
+    // can fill with arbitrary bytes is a smuggling surface, and there is no
+    // reason to offer one for a value whose only job is to be unguessable.
+    // Bound first, THEN look at the bytes. Not a DoS fix — the 64 KiB vsock
+    // frame already bounds the input — but the check that costs nothing should
+    // not run after the one that scans (Gemini, #668).
+    if nonce.is_empty() || nonce.len() > crate::receipt::MAX_CLIENT_NONCE_LEN {
+        tracing::warn!(
+            event = "heartbeat_bad_nonce",
+            reason = "length",
+            len = nonce.len()
+        );
+        return SignResponse::err(err_code::BAD_REQUEST);
+    }
+    let charset_ok = nonce
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !charset_ok {
+        tracing::warn!(
+            event = "heartbeat_bad_nonce",
+            reason = "charset",
+            len = nonce.len()
+        );
+        return SignResponse::err(err_code::BAD_REQUEST);
+    }
+    match crate::receipt::issue_heartbeat(identity, nonce) {
+        Some(hb) => {
+            let mut resp = SignResponse::ok(String::new());
+            resp.heartbeat = Some(hb);
+            resp
+        }
+        // No resident key: the receipt epoch has not started on this enclave.
+        // Said plainly rather than dressed as a failure — the same absence is
+        // independently visible in the attestation document's missing
+        // `public_key`, so the two agree.
+        None => {
+            tracing::info!(event = "heartbeat_no_receipt_key");
+            SignResponse::err(err_code::RECEIPTS_UNAVAILABLE)
         }
     }
 }
@@ -1814,7 +1920,7 @@ fn handle_sign_kucoin(
         .is_some()
     {
         tracing::warn!(event = "generic_capped_denied", venue = "kucoin");
-        return SignResponse::err(err_code::POLICY_DENIED);
+        return deny_under(&policy_hash, err_code::POLICY_DENIED);
     }
 
     // Parse the secret JSON as a KuCoin secret triple. KucoinSecret zeroizes
@@ -1826,11 +1932,11 @@ fn handle_sign_kucoin(
             // Malformed JSON inside the ciphertext blob is operationally
             // identical to "wrong blob loaded" — surface as bad_request, which
             // already carries no internal detail.
-            return SignResponse::err(err_code::BAD_REQUEST);
+            return deny_under(&policy_hash, err_code::BAD_REQUEST);
         }
     };
     if !secret_triple.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     // Wrap the borrowed secret bytes in Zeroizing for the duration of the
@@ -1851,7 +1957,7 @@ fn handle_sign_kucoin(
         body,
     ) {
         Ok(headers) => SignResponse::ok_headers(headers).with_policy_hash(policy_hash),
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
     // secret_triple, secret_bytes wiped via their respective Drop impls
     // when this function returns.
@@ -2042,22 +2148,22 @@ fn handle_sign_binance(
         )
     {
         tracing::warn!(event = "generic_capped_denied", venue = "binance");
-        return SignResponse::err(err_code::POLICY_DENIED);
+        return deny_under(&policy_hash, err_code::POLICY_DENIED);
     }
 
     let secret_pair: BinanceSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_pair.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     let secret_bytes = Zeroizing::new(secret_pair.secret.as_bytes().to_vec());
 
     match signer::compute_binance_headers(&secret_bytes, &secret_pair.key, ts, user_query, body) {
         Ok(headers) => SignResponse::ok_headers(headers).with_policy_hash(policy_hash),
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
 }
 
@@ -2168,15 +2274,15 @@ fn handle_sign_binance_request(
             venue = "binance",
             path = "sign_binance_request"
         );
-        return SignResponse::err(err_code::POLICY_DENIED);
+        return deny_under(&policy_hash, err_code::POLICY_DENIED);
     }
 
     let mut secret_pair: BinanceSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_pair.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     // Move the secret's buffer into the zeroizing Vec (no lingering plaintext
     // copy in `secret_pair.secret`); only `secret_pair.key` is used afterwards.
@@ -2186,7 +2292,7 @@ fn handle_sign_binance_request(
     // so this is hmac_sha256(secret, payload) — byte-identical to a local connector.
     let sig = match signer::sign_binance(&secret_bytes, &payload, "") {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     };
     let mut headers = std::collections::BTreeMap::new();
     headers.insert("signature".to_owned(), sig);
@@ -2952,7 +3058,7 @@ fn handle_sign_binance_order(
         Some(&order.qty),
         order.price.as_deref(),
     ) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     // AF-2: verify the agent's signature over the FULL order intent (side/price/
@@ -2967,20 +3073,20 @@ fn handle_sign_binance_order(
         order,
         &req,
     ) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     let canonical = match crate::signer::build_binance_order_query(order) {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
 
     let mut secret_pair: BinanceSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_pair.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     // Move the secret's buffer straight into the zeroizing Vec instead of
     // copying it (`as_bytes().to_vec()` left a second plaintext copy in the
@@ -2991,7 +3097,7 @@ fn handle_sign_binance_order(
         Ok(headers) => SignResponse::ok_headers(headers)
             .with_policy_hash(policy_hash)
             .with_canonical_body(canonical),
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
 }
 
@@ -3027,7 +3133,7 @@ fn handle_sign_binance_cancel(
 
     // Cancel must target a symbol that the key is allowed to trade. qty=None.
     if let Err(resp) = enforce_order_cap(policy.as_ref(), &cancel.symbol, None, None) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     // AF-2: agent-signed-intent (opt-in) — bind symbol/order_id so a gateway
@@ -3041,20 +3147,20 @@ fn handle_sign_binance_cancel(
         cancel,
         &req,
     ) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     let canonical = match crate::signer::build_binance_cancel_query(cancel) {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
 
     let mut secret_pair: BinanceSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_pair.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     // Move the secret's buffer straight into the zeroizing Vec instead of
     // copying it (`as_bytes().to_vec()` left a second plaintext copy in the
@@ -3065,7 +3171,7 @@ fn handle_sign_binance_cancel(
         Ok(headers) => SignResponse::ok_headers(headers)
             .with_policy_hash(policy_hash)
             .with_canonical_body(canonical),
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
 }
 
@@ -3107,7 +3213,7 @@ fn handle_sign_okx_order(
         Some(&order.qty),
         order.price.as_deref(),
     ) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     // AF-2: agent-signed-intent (opt-in) — verify full order intent pre-venue-sign.
@@ -3120,20 +3226,20 @@ fn handle_sign_okx_order(
         order,
         &req,
     ) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     let canonical = match crate::signer::build_okx_order_body(order) {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
 
     let mut secret_triple: OkxSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_triple.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     // Move the secret's buffer into the zeroizing Vec instead of copying it
     // (`as_bytes().to_vec()` left a second plaintext copy in `secret_triple.secret`
@@ -3155,7 +3261,7 @@ fn handle_sign_okx_order(
             .with_policy_hash(policy_hash)
             .with_canonical_body(canonical),
         // Malformed passphrase byte (CRLF / NUL / non-ASCII) — operator blob bug.
-        Err(_) => SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => deny_under(&policy_hash, err_code::BAD_REQUEST),
     }
 }
 
@@ -3191,7 +3297,7 @@ fn handle_sign_okx_cancel(
     };
 
     if let Err(resp) = enforce_order_cap(policy.as_ref(), &cancel.symbol, None, None) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     // AF-2: agent-signed-intent (opt-in) — nonce = intent_nonce (UUID).
@@ -3204,20 +3310,20 @@ fn handle_sign_okx_cancel(
         cancel,
         &req,
     ) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     let canonical = match crate::signer::build_okx_cancel_body(cancel) {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
 
     let mut secret_triple: OkxSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_triple.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     // Move the secret's buffer into the zeroizing Vec instead of copying it
     // (`as_bytes().to_vec()` left a second plaintext copy in `secret_triple.secret`
@@ -3238,7 +3344,7 @@ fn handle_sign_okx_cancel(
         Ok(headers) => SignResponse::ok_headers(headers)
             .with_policy_hash(policy_hash)
             .with_canonical_body(canonical),
-        Err(_) => SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => deny_under(&policy_hash, err_code::BAD_REQUEST),
     }
 }
 
@@ -3297,15 +3403,15 @@ fn handle_sign_bybit(
         .is_some()
     {
         tracing::warn!(event = "generic_capped_denied", venue = "bybit");
-        return SignResponse::err(err_code::POLICY_DENIED);
+        return deny_under(&policy_hash, err_code::POLICY_DENIED);
     }
 
     let secret_pair: BybitSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret_pair.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     let secret_bytes = Zeroizing::new(secret_pair.secret.as_bytes().to_vec());
@@ -3319,7 +3425,7 @@ fn handle_sign_bybit(
         body,
     ) {
         Ok(headers) => SignResponse::ok_headers(headers).with_policy_hash(policy_hash),
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
 }
 
@@ -3404,7 +3510,7 @@ fn handle_sign_okx(req: SignRequest, identity: &crate::registry::ResolvedIdentit
         && !generic_capped_op_allowed("okx", method, &request_path, "", body)
     {
         tracing::warn!(event = "generic_capped_denied", venue = "okx");
-        return SignResponse::err(err_code::POLICY_DENIED);
+        return deny_under(&policy_hash, err_code::POLICY_DENIED);
     }
 
     let secret_triple: OkxSecret = match secret_json.deserialize_into() {
@@ -3412,11 +3518,11 @@ fn handle_sign_okx(req: SignRequest, identity: &crate::registry::ResolvedIdentit
         Err(_) => {
             // Malformed JSON inside ciphertext blob is operationally
             // identical to "wrong blob loaded" — surface as bad_request.
-            return SignResponse::err(err_code::BAD_REQUEST);
+            return deny_under(&policy_hash, err_code::BAD_REQUEST);
         }
     };
     if !secret_triple.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     let secret_bytes = Zeroizing::new(secret_triple.secret.as_bytes().to_vec());
@@ -3434,7 +3540,7 @@ fn handle_sign_okx(req: SignRequest, identity: &crate::registry::ResolvedIdentit
         Ok(headers) => SignResponse::ok_headers(headers).with_policy_hash(policy_hash),
         // Most likely cause: passphrase has illegal byte (CRLF / NUL /
         // non-ASCII). Map to bad_request — the customer's blob is malformed.
-        Err(_) => SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => deny_under(&policy_hash, err_code::BAD_REQUEST),
     }
     // secret_triple, secret_bytes wiped on Drop.
 }
@@ -3529,14 +3635,19 @@ fn load_hyperliquid_request(
     // the symbol-keyed order_caps cannot express for HL's index-based action.
     // Enforced here so BOTH order and cancel paths get the vault check (the
     // size caps apply only to order-shaped actions, gated inside the helper).
-    enforce_hl_caps(policy.as_ref(), action, vault.as_ref())?;
+    // Receipts: this gate refuses with the policy already in force, so its
+    // denial must name it (see `deny_under`). On HL this is THE money gate —
+    // per-asset caps and the vault allow-list — and it used to answer with an
+    // empty `policy_hash`.
+    enforce_hl_caps(policy.as_ref(), action, vault.as_ref())
+        .map_err(|resp| resp.with_policy_hash(policy_hash.clone()))?;
 
     let secret: HyperliquidSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return Err(SignResponse::err(err_code::BAD_REQUEST)),
+        Err(_) => return Err(deny_under(&policy_hash, err_code::BAD_REQUEST)),
     };
     if !secret.is_complete() {
-        return Err(SignResponse::err(err_code::BAD_REQUEST));
+        return Err(deny_under(&policy_hash, err_code::BAD_REQUEST));
     }
 
     // 4. Sanity check: re-derive address from private key and compare with
@@ -3544,18 +3655,18 @@ fn load_hyperliquid_request(
     //    key/address pair into the blob; refuse to sign.
     let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
         Ok(k) => k,
-        Err(_) => return Err(SignResponse::err(err_code::BAD_REQUEST)),
+        Err(_) => return Err(deny_under(&policy_hash, err_code::BAD_REQUEST)),
     };
     let derived = match crate::signer::derive_address_from_private_key(&pk) {
         Ok(a) => a,
-        Err(_) => return Err(SignResponse::err(err_code::INTERNAL_ERROR)),
+        Err(_) => return Err(deny_under(&policy_hash, err_code::INTERNAL_ERROR)),
     };
     let claimed = match crate::signer::parse_evm_address(&secret.wallet_address) {
         Ok(a) => a,
-        Err(_) => return Err(SignResponse::err(err_code::BAD_REQUEST)),
+        Err(_) => return Err(deny_under(&policy_hash, err_code::BAD_REQUEST)),
     };
     if derived.ct_eq(&claimed).unwrap_u8() == 0 {
-        return Err(SignResponse::err(err_code::BAD_REQUEST));
+        return Err(deny_under(&policy_hash, err_code::BAD_REQUEST));
     }
 
     Ok((secret, action.clone(), nonce, vault, policy_hash))
@@ -3803,11 +3914,11 @@ fn sign_hyperliquid_mainnet(
     };
     let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
         Ok(k) => k,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let sig = match crate::signer::sign_hyperliquid(&pk, &action, nonce, vault, "a") {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     };
     SignResponse::ok_hl_signature(sig).with_policy_hash(policy_hash)
 }
@@ -3823,14 +3934,14 @@ fn sign_hyperliquid_testnet(
     };
     let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
         Ok(k) => k,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     // source="b" = Hyperliquid TESTNET. The mainnet twin above passes "a"; the
     // byte is the whole difference at this layer, which is why the floors that
     // decide WHO may reach either one live in `load_hyperliquid_request`.
     let sig = match crate::signer::sign_hyperliquid(&pk, &action, nonce, vault, "b") {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     };
     SignResponse::ok_hl_signature(sig).with_policy_hash(policy_hash)
 }
@@ -4734,7 +4845,7 @@ fn handle_sign_asterdex(
     // path for a real Asterdex key. Dev/legacy (REQUIRE_POLICY off) is unchanged.
     if asterdex_floor_denies(policy_required(), policy.as_ref()) {
         tracing::warn!(event = "asterdex_money_venue_missing_order_caps");
-        return SignResponse::err(err_code::POLICY_REQUIRED);
+        return deny_under(&policy_hash, err_code::POLICY_REQUIRED);
     }
 
     if let Some(ref p) = policy {
@@ -4789,7 +4900,7 @@ fn handle_sign_asterdex(
                     path_only = %path_only,
                     allowed = ?allowed,
                 );
-                return SignResponse::err(err_code::POLICY_DENIED);
+                return deny_under(&policy_hash, err_code::POLICY_DENIED);
             }
         }
     }
@@ -4799,20 +4910,20 @@ fn handle_sign_asterdex(
     // No-op unless the policy declares order_caps. Runs before the KMS-derived
     // secret is touched (fail-fast, no secret needed).
     if let Err(resp) = enforce_asterdex_size_cap(policy.as_ref(), body) {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     let secret: AsterdexSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
         Ok(k) => k,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
 
     // Sanity-check: PK and signer_address inside the blob agree. This
@@ -4821,14 +4932,14 @@ fn handle_sign_asterdex(
     // derive) and fails fast.
     let derived = match crate::signer::derive_address_from_private_key(&pk) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     };
     let claimed = match crate::signer::parse_evm_address(&secret.signer_address) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if derived.ct_eq(&claimed).unwrap_u8() == 0 {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     // CRITICAL — enforce that `body` binds to OUR signer + a fresh nonce.
@@ -4836,7 +4947,7 @@ fn handle_sign_asterdex(
     // payloads (T1 finding from 2026-05-13 dogfood audit). See
     // `validate_asterdex_body` for the exact rules.
     if validate_asterdex_body(body, &derived).is_err() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     // Sign the canonical msg. Asterdex's primaryType is `Message` with a
@@ -4849,7 +4960,7 @@ fn handle_sign_asterdex(
             headers.insert("signer".to_owned(), format!("0x{}", hex::encode(derived)));
             SignResponse::ok_headers(headers).with_policy_hash(policy_hash)
         }
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
     // secret, pk, plaintext all zeroize on Drop.
 }
@@ -4898,23 +5009,23 @@ fn handle_sign_x402_eip3009(
     // Parse the public authorization fields.
     let token_address = match crate::signer::parse_evm_address(&x402.token_address) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let from = match crate::signer::parse_evm_address(&x402.from) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let to = match crate::signer::parse_evm_address(&x402.to) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let value = match crate::signer::parse_u256_be_decimal(&x402.value) {
         Ok(v) => v,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let nonce = match crate::signer::parse_bytes32_hex(&x402.nonce) {
         Ok(n) => n,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
 
     // CR050: x402 is a WITHDRAWAL primitive (moves USDC out of the payer key),
@@ -4922,39 +5033,39 @@ fn handle_sign_x402_eip3009(
     // "no clause" must never mean "no limit". Enforced in `enforce_x402_cap`.
     if let Err(resp) = enforce_x402_cap(policy.as_ref(), x402.chain_id, &token_address, &to, &value)
     {
-        return resp;
+        return resp.with_policy_hash(policy_hash.clone());
     }
 
     // Load the payer EVM key (reuses the EVM secret shape).
     let secret: AsterdexSecret = match secret_json.deserialize_into() {
         Ok(s) => s,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if !secret.is_complete() {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
         Ok(k) => k,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let derived = match crate::signer::derive_address_from_private_key(&pk) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     };
     // Blob self-consistency: the stapled address matches the PK.
     let claimed = match crate::signer::parse_evm_address(&secret.signer_address) {
         Ok(a) => a,
-        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     if derived.ct_eq(&claimed).unwrap_u8() == 0 {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
     // CRITICAL: the enclave may only authorize transfers FROM its own key.
     // A facilitator's `ecrecover` would reject a mismatched `from` anyway,
     // but enforce it here so the enclave never emits a signature whose
     // `from` ≠ the signing key.
     if derived.ct_eq(&from).unwrap_u8() == 0 {
-        return SignResponse::err(err_code::BAD_REQUEST);
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
     }
 
     match crate::signer::sign_x402_eip3009(
@@ -4976,7 +5087,7 @@ fn handle_sign_x402_eip3009(
             headers.insert("from".to_owned(), format!("0x{}", hex::encode(derived)));
             SignResponse::ok_headers(headers).with_policy_hash(policy_hash)
         }
-        Err(_) => SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     }
     // secret, pk all zeroize on Drop.
 }
@@ -4984,6 +5095,164 @@ fn handle_sign_x402_eip3009(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 Guard for the receipt claim, added 2026-08-31 with the `deny_under`
+    /// sweep. Once a request has crossed `enforce_policy`, a policy is in force
+    /// for every decision that follows — so every refusal after that point must
+    /// name it. A bare `SignResponse::err` there produces a receipt with an
+    /// empty `policy_hash`, i.e. a decision that cannot be bound to the rule
+    /// that made it. That is exactly what `enforce_hl_caps` did to Hyperliquid
+    /// cap and vault denials until this sweep.
+    ///
+    /// Source-level on purpose. A behavioural test only covers the paths its
+    /// author remembered, and the defect being fixed IS "a path nobody
+    /// remembered": the gate was written years after the receipt design and
+    /// never learned about it. This fails the build for the NEXT such gate.
+    ///
+    /// The rule it enforces: in any function that reaches the policy (calls
+    /// `enforce_policy` or `load_hyperliquid_request`), no `SignResponse::err`
+    /// may appear after that call — use `deny_under(&policy_hash, code)`.
+    #[test]
+    fn every_post_policy_refusal_names_the_policy() {
+        // `sign_data` is NOT a receipted action (`is_receipted_action`), so no
+        // receipt binds its refusals and it does not thread a policy hash.
+        const EXEMPT: &[&str] = &["handle_sign_data"];
+
+        let src = include_str!("handler.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        // Stop at the test module — this very file's tests mention both tokens.
+        let end = lines
+            .iter()
+            .position(|l| l.starts_with("mod tests"))
+            .unwrap_or(lines.len());
+
+        let mut current = "<file>";
+        let mut policy_seen_at: Option<usize> = None;
+        let mut offenders: Vec<String> = Vec::new();
+
+        for (i, raw) in lines[..end].iter().enumerate() {
+            let line = raw.trim_start();
+            // A new top-level fn resets the state.
+            if raw.starts_with("fn ")
+                || raw.starts_with("pub fn ")
+                || raw.starts_with("pub(crate) fn ")
+            {
+                current = raw
+                    .split("fn ")
+                    .nth(1)
+                    .and_then(|r| r.split('(').next())
+                    .unwrap_or("<?>");
+                policy_seen_at = None;
+                continue; // the signature line is not a call site
+            }
+            if line.starts_with("//") {
+                continue; // comments quote both tokens freely
+            }
+            if policy_seen_at.is_none()
+                && (line.contains("enforce_policy(") || line.contains("load_hyperliquid_request("))
+            {
+                policy_seen_at = Some(i + 1);
+                continue;
+            }
+            // Two shapes of the same defect: a refusal built here, and a
+            // refusal built by a pure gate (`enforce_order_cap`,
+            // `enforce_hl_caps`, the AF-2 gates) and returned untouched.
+            // The second is how the Hyperliquid hole actually looked.
+            let bare_refusal = line.contains("SignResponse::err(");
+            // Every spelling a pure gate's refusal can be forwarded with. The
+            // `Result<(), SignResponse>` gates return `resp` directly; a function
+            // that itself returns `Result<_, SignResponse>` — such as
+            // `load_hyperliquid_request`, where the Hyperliquid hole actually
+            // lived — spells it `Err(resp)`; and either can appear as a block
+            // tail or a match arm, with or without punctuation. Matching only
+            // some of them left the exact defect this guard exists for reachable
+            // (CodeRabbit, #668, twice).
+            //
+            // Matched as a line TAIL, not a substring: `Err(resp) => Err(resp)`
+            // is a violation, while `Err(resp) => Err(resp.with_policy_hash(h))`
+            // is the fix and must not be flagged. The tail is what says whether
+            // the value leaves untouched.
+            let untagged_gate = [
+                "return resp;",
+                "return resp",
+                "Err(resp);",
+                "Err(resp)",
+                "Err(resp),",
+            ]
+            .iter()
+            .any(|form| line.ends_with(form));
+            if let Some(since) = policy_seen_at {
+                if (bare_refusal || untagged_gate) && !EXEMPT.contains(&current) {
+                    offenders.push(format!(
+                        "handler.rs:{} in `{}` (policy in force since line {since})",
+                        i + 1,
+                        current,
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "refusal(s) built after the policy gate without naming the policy — \
+             use `deny_under(&policy_hash, code)` so the receipt can bind the \
+             decision to the rule:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// 🔴 Cross-language fixture for `scripts/policy_cap_recover.py`.
+    ///
+    /// The live caps of a production tenant are readable nowhere: the policy
+    /// lives inside a sealed blob, and the venue ceremony writes `policy.json`
+    /// into a temp dir it does not persist. What IS readable, for free, is
+    /// `policy_hash` — the enclave stamps it into every decision receipt, and a
+    /// cancel carries a receipt without spending a daily order slot. So the caps
+    /// can be recovered offline by rebuilding candidate policies and matching
+    /// the hash.
+    ///
+    /// That recovery is only sound if the offline canonical bytes are the same
+    /// bytes this enclave hashes, and they are easy to get wrong: the canonical
+    /// order is the `Policy` STRUCT declaration order, where `label` precedes
+    /// `order_caps` — while the ceremony's own dict emits them the other way
+    /// round. This test pins the two implementations to one number.
+    ///
+    /// Note what the input proves as a side effect: the JSON below is written in
+    /// the CEREMONY's order, and the hash still matches, because the hash is
+    /// taken over the re-serialized struct. Input order cannot change it.
+    #[test]
+    fn policy_hash_matches_the_offline_recovery_fixture() {
+        let json = r#"{
+            "allowed_actions": ["sign_binance_order", "sign_binance_cancel"],
+            "allowed_methods": ["GET", "POST", "DELETE"],
+            "allowed_path_prefixes": ["/fapi/"],
+            "denied_path_prefixes": ["/sapi/"],
+            "order_caps": [{"symbol":"BTCUSDT","max_qty":"0.01","max_notional":"1000"}],
+            "label": "binance-mainnet-abcd1234"
+        }"#;
+        let policy: crate::proto::Policy = serde_json::from_str(json).expect("policy parses");
+        assert_eq!(
+            compute_policy_hash(&policy).expect("hashes"),
+            "f6776a24a880e3f46f789ccd9ddadee36c02393bafdf68e7c07f39a78144c593",
+            "offline recovery (scripts/policy_cap_recover.py --selftest) must agree \
+             byte-for-byte; if this fails, the recovery tool silently finds nothing"
+        );
+    }
+
+    /// The other half of the same property: what `deny_under` stamps is what a
+    /// receipt reads. `receipt::issue_pre` copies `resp.policy_hash` verbatim,
+    /// so a stamped refusal is a receipt that names its policy and an unstamped
+    /// one is not — there is no third outcome.
+    #[test]
+    fn deny_under_stamps_the_hash_and_none_stays_none() {
+        let h = Some("0123456789abcdef".to_owned());
+        let stamped = deny_under(&h, err_code::POLICY_DENIED);
+        assert_eq!(stamped.error.as_deref(), Some(err_code::POLICY_DENIED));
+        assert_eq!(stamped.policy_hash, h, "the refusal must name the policy");
+        // A legacy blob carries no policy: nothing to name, and inventing a
+        // value would be worse than an empty one.
+        assert_eq!(deny_under(&None, err_code::BAD_REQUEST).policy_hash, None);
+    }
 
     // ── H5: attestation input validation ────────────────────────────────────
     // These assert the gate that runs BEFORE the NSM ioctl, so they never touch
@@ -5073,6 +5342,7 @@ mod tests {
             registry_refresh: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
             provision_venue: None,
@@ -5170,6 +5440,7 @@ mod tests {
             data: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
             provision_venue: None,
@@ -8762,6 +9033,7 @@ mod tests {
             data: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
             provision_venue: None,
@@ -9141,6 +9413,7 @@ mod tests {
             data: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
             provision_venue: None,
@@ -9354,6 +9627,7 @@ mod tests {
             data: None,
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
             provision_venue: None,
