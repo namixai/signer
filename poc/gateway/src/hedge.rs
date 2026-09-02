@@ -197,7 +197,7 @@ async fn sign_leg(
     let payload = serde_json::json!({ "order": leg.order });
     match venue.as_str() {
         "binance" => {
-            let (canonical, mut headers) = sign_structured_request(
+            let (canonical, mut headers, _receipt) = sign_structured_request(
                 state,
                 customer_id,
                 raw_token,
@@ -231,7 +231,7 @@ async fn sign_leg(
             })
         }
         "okx" => {
-            let (canonical, mut headers) = sign_structured_request(
+            let (canonical, mut headers, _receipt) = sign_structured_request(
                 state,
                 customer_id,
                 raw_token,

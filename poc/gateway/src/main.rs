@@ -256,6 +256,15 @@ async fn main() -> Result<()> {
         // Option-A exception — see hedge.rs doctrine note). Same auth +
         // dos-hardening stack as /sign.
         .route("/hedge", post(hedge::post_hedge))
+        // Signed counter heartbeat: ask the ENCLAVE how many decisions it has
+        // made for this tenant. The one call whose purpose is to catch this
+        // very gateway hiding a decision, so it sits on the tenant router (the
+        // tenant's own bearer resolves the identity inside the enclave) and
+        // carries nothing the gateway chooses.
+        .route(
+            "/receipts/heartbeat",
+            post(handlers::post_receipt_heartbeat),
+        )
         // B3 (в): per-token rate limit across the WHOLE tenant sign tier.
         // Registered BEFORE require_bearer in the builder chain → INNER layer
         // (axum: later layers wrap earlier ones), so it runs AFTER auth and
@@ -298,15 +307,6 @@ async fn main() -> Result<()> {
     // cross. This is layer-1 of the data-key isolation; the enclave KMS
     // EncryptionContext (§5) is layer-2. (CTO re-reviews this ACL on the PR.)
     let operator_router = Router::new()
-        // Signed counter heartbeat: ask the ENCLAVE how many decisions it has
-        // made for this tenant. The one call whose purpose is to catch this
-        // very gateway hiding a decision, so it sits on the tenant router (the
-        // tenant's own bearer resolves the identity inside the enclave) and
-        // carries nothing the gateway chooses.
-        .route(
-            "/receipts/heartbeat",
-            post(handlers::post_receipt_heartbeat),
-        )
         .route("/verify-blob", post(handlers::post_verify_blob))
         .route("/sign-data", post(handlers::post_sign_data))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -1429,6 +1429,34 @@ mod tests {
     // accept loop, not the in-process tower stack. They prove that the
     // header_read_timeout is wired correctly and fires even when no
     // tower layer has had a chance to see the request.
+
+    /// The heartbeat exists to let a TENANT catch this gateway hiding a
+    /// decision. On the operator router it is answerable only by us — the one
+    /// party it is meant to check — and a tenant's own bearer gets 401, so the
+    /// mechanism ships dead while every other test stays green.
+    ///
+    /// This is a source guard rather than a request test because the routers
+    /// are assembled inline in `main()` and cannot be built from a test. It is
+    /// falsifiable: move the route back under `operator_router` and it fails.
+    #[test]
+    fn heartbeat_answers_the_tenant_not_only_the_operator() {
+        let src = include_str!("main.rs");
+        let sign = src
+            .find("let sign_router = Router::new()")
+            .expect("sign_router is built in main()");
+        let operator = src
+            .find("let operator_router = Router::new()")
+            .expect("operator_router is built in main()");
+        let route = src
+            .find("\"/receipts/heartbeat\"")
+            .expect("the heartbeat route is registered");
+        assert!(
+            sign < route && route < operator,
+            "the heartbeat must sit on the tenant router: a tenant bearer is \
+             the only credential that makes it evidence rather than \
+             self-testimony (sign={sign}, route={route}, operator={operator})"
+        );
+    }
 
     /// Build a minimal Router that returns 200 on /healthz, suitable
     /// for spinning up behind serve_with_hyper_util in tests.

@@ -494,6 +494,7 @@ pub async fn post_sign(
                 Json(SignHttpResponse {
                     headers: std::collections::BTreeMap::new(),
                     signature: Some(http_sig),
+                    receipt,
                 }),
             )
                 .into_response(),
@@ -534,6 +535,7 @@ pub async fn post_sign(
             Json(SignHttpResponse {
                 headers,
                 signature: None,
+                receipt,
             }),
         )
             .into_response(),
@@ -1141,6 +1143,7 @@ pub async fn post_sign_x402(
     };
 
     // 5. Errors → allow-listed wire surface (CR037/CR049 parity with /sign).
+    let receipt = take_receipt(&mut resp, &customer);
     if let Some(code) = resp.error.as_deref() {
         let mapped = crate::proto::safe_wire_code(code);
         if mapped == err_code::RATE_LIMITED {
@@ -1153,7 +1156,12 @@ pub async fn post_sign_x402(
             wire_code = mapped,
             vsock_latency_ms,
         );
-        return finish_log(error_response(mapped), started, false, Some(mapped));
+        return finish_log(
+            enclave_error_response(mapped, receipt),
+            started,
+            false,
+            Some(mapped),
+        );
     }
 
     // 6. Success: the enclave returns signature + payer address via headers.
@@ -1185,6 +1193,7 @@ pub async fn post_sign_x402(
                 ok: true,
                 signature,
                 from,
+                receipt,
             }),
         )
             .into_response(),
@@ -1255,7 +1264,14 @@ pub(crate) async fn sign_structured_request(
     // enclave's intent reconstruction would diverge) + the agent signature and
     // (cancel-only) replay nonce. All `None` for non-AF-2 (opt-in-absent) calls.
     intent: AgentIntentForward,
-) -> Result<(String, std::collections::BTreeMap<String, String>), Response> {
+) -> Result<
+    (
+        String,
+        std::collections::BTreeMap<String, String>,
+        Option<serde_json::Value>,
+    ),
+    Response,
+> {
     // F1: constrain key_id (venue stem) before it becomes a blob-key half and
     // an enclave-side namespace label.
     if !is_safe_key_id(key_id) {
@@ -1369,6 +1385,7 @@ pub(crate) async fn sign_structured_request(
         }
     };
 
+    let receipt = take_receipt(&mut resp, customer_id);
     if let Some(code) = resp.error.as_deref() {
         let mapped = crate::proto::safe_wire_code(code);
         if mapped == err_code::RATE_LIMITED {
@@ -1381,7 +1398,7 @@ pub(crate) async fn sign_structured_request(
             wire_code = mapped,
             vsock_latency_ms,
         );
-        return Err(error_response(mapped));
+        return Err(enclave_error_response(mapped, receipt));
     }
 
     let canonical = match resp.canonical_body.take() {
@@ -1393,7 +1410,7 @@ pub(crate) async fn sign_structured_request(
     };
     let headers = resp.headers.take().unwrap_or_default();
     state.backoff.report_success(&scope);
-    Ok((canonical, headers))
+    Ok((canonical, headers, receipt))
 }
 
 /// Assemble the final Binance signed querystring — `canonical` followed by
@@ -1475,7 +1492,7 @@ pub async fn post_sign_binance_order(
     // forwarded Value, golden HMAC vectors unaffected.
     let payload = serde_json::json!({ "order": req.order });
 
-    let (canonical, mut headers) = match sign_structured_request(
+    let (canonical, mut headers, receipt) = match sign_structured_request(
         &state,
         &customer,
         &raw_token,
@@ -1524,6 +1541,7 @@ pub async fn post_sign_binance_order(
                 url: format!("{}/fapi/v1/order", binance_base_url()),
                 headers,
                 body,
+                receipt,
             }),
         )
             .into_response(),
@@ -1551,9 +1569,12 @@ pub async fn post_sign_binance_order(
 /// the intercept, making the coercion unreachable for this route. Routing all
 /// errors through this one function keeps the coercion the sole reachable path
 /// (regression-guarded by `binance_request_wire_error_never_leaks_op_param`).
-fn binance_request_wire_error(code: &str) -> (Response, &'static str) {
+fn binance_request_wire_error(
+    code: &str,
+    receipt: Option<serde_json::Value>,
+) -> (Response, &'static str) {
     let mapped = crate::proto::safe_wire_code(code);
-    (error_response(mapped), mapped)
+    (enclave_error_response(mapped, receipt), mapped)
 }
 
 /// `POST /sign/binance-request` — the keyless-Hummingbot generic primitive.
@@ -1685,9 +1706,10 @@ pub async fn post_sign_binance_request(
         }
     };
 
+    let receipt = take_receipt(&mut resp, &customer);
     if let Some(code) = resp.error.as_deref() {
         // Single no-leak chokepoint — see `binance_request_wire_error`.
-        let (response, mapped) = binance_request_wire_error(code);
+        let (response, mapped) = binance_request_wire_error(code, receipt);
         if mapped == err_code::RATE_LIMITED {
             state.backoff.report_rate_limited(&scope);
         }
@@ -1738,7 +1760,11 @@ pub async fn post_sign_binance_request(
     finish_log(
         (
             StatusCode::OK,
-            Json(crate::proto::SignBinanceRequestResponse { signature, api_key }),
+            Json(crate::proto::SignBinanceRequestResponse {
+                signature,
+                api_key,
+                receipt,
+            }),
         )
             .into_response(),
         started,
@@ -1769,7 +1795,7 @@ pub async fn post_sign_binance_cancel(
     // forwarded Value, golden HMAC vectors unaffected.
     let payload = serde_json::json!({ "cancel": req.cancel });
 
-    let (canonical, mut headers) = match sign_structured_request(
+    let (canonical, mut headers, receipt) = match sign_structured_request(
         &state,
         &customer,
         &raw_token,
@@ -1813,6 +1839,7 @@ pub async fn post_sign_binance_cancel(
                 method: "DELETE",
                 url: format!("{}/fapi/v1/order?{}", binance_base_url(), qs),
                 headers,
+                receipt,
             }),
         )
             .into_response(),
@@ -1902,7 +1929,7 @@ pub async fn post_sign_binance_spot_order(
 
     let payload = serde_json::json!({ "order": req.order });
 
-    let (canonical, mut headers) = match sign_structured_request(
+    let (canonical, mut headers, receipt) = match sign_structured_request(
         &state,
         &customer,
         &raw_token,
@@ -1951,6 +1978,7 @@ pub async fn post_sign_binance_spot_order(
                 url: format!("{}{}", binance_spot_base_url(), BINANCE_SPOT_ORDER_PATH),
                 headers,
                 body,
+                receipt,
             }),
         )
             .into_response(),
@@ -1976,7 +2004,7 @@ pub async fn post_sign_binance_spot_cancel(
 
     let payload = serde_json::json!({ "cancel": req.cancel });
 
-    let (canonical, mut headers) = match sign_structured_request(
+    let (canonical, mut headers, receipt) = match sign_structured_request(
         &state,
         &customer,
         &raw_token,
@@ -2025,6 +2053,7 @@ pub async fn post_sign_binance_spot_cancel(
                     qs
                 ),
                 headers,
+                receipt,
             }),
         )
             .into_response(),
@@ -2073,7 +2102,7 @@ pub async fn post_sign_okx_order(
     // golden HMAC vectors unaffected.
     let payload = serde_json::json!({ "order": req.order });
 
-    let (canonical, mut headers) = match sign_structured_request(
+    let (canonical, mut headers, receipt) = match sign_structured_request(
         &state,
         &customer,
         &raw_token,
@@ -2110,6 +2139,7 @@ pub async fn post_sign_okx_order(
                 url: format!("{}/api/v5/trade/order", okx_base_url()),
                 headers,
                 body: canonical,
+                receipt,
             }),
         )
             .into_response(),
@@ -2141,7 +2171,7 @@ pub async fn post_sign_okx_cancel(
     // golden HMAC vectors unaffected.
     let payload = serde_json::json!({ "cancel": req.cancel });
 
-    let (canonical, mut headers) = match sign_structured_request(
+    let (canonical, mut headers, receipt) = match sign_structured_request(
         &state,
         &customer,
         &raw_token,
@@ -2177,6 +2207,7 @@ pub async fn post_sign_okx_cancel(
                 url: format!("{}/api/v5/trade/cancel-order", okx_base_url()),
                 headers,
                 body: canonical,
+                receipt,
             }),
         )
             .into_response(),
@@ -3873,7 +3904,7 @@ mod tests {
             "param_not_allowed:account:coin",
             "action_not_allowed", // the current static emit — passes through unchanged
         ] {
-            let (resp, mapped) = binance_request_wire_error(enclave_code);
+            let (resp, mapped) = binance_request_wire_error(enclave_code, None);
             assert_eq!(
                 resp.status(),
                 StatusCode::FORBIDDEN,
@@ -3891,7 +3922,7 @@ mod tests {
         }
         // A non-denial code still routes through safe_wire_code (unknown → 500),
         // proving there is no denial-only special-case left in the handler.
-        let (resp, mapped) = binance_request_wire_error("some_unmapped_diag");
+        let (resp, mapped) = binance_request_wire_error("some_unmapped_diag", None);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(mapped, err_code::INTERNAL_ERROR);
     }

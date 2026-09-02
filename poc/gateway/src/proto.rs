@@ -172,6 +172,10 @@ pub struct SignHttpResponse {
     pub headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<HlSignatureWire>,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignHttpResponse {
@@ -428,6 +432,11 @@ pub struct SignX402Response {
     /// The payer address the enclave signed as (derived from the key).
     #[zeroize(skip)]
     pub from: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignX402Response {
@@ -519,6 +528,10 @@ pub struct SignBinanceOrderResponse {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignBinanceOrderResponse {
@@ -565,6 +578,10 @@ pub struct SignBinanceRequestHttp {
 pub struct SignBinanceRequestResponse {
     pub signature: String,
     pub api_key: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignBinanceRequestResponse {
@@ -594,6 +611,10 @@ pub struct SignBinanceCancelResponse {
     pub method: &'static str,
     pub url: String,
     pub headers: BTreeMap<String, String>,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignBinanceCancelResponse {
@@ -665,6 +686,10 @@ pub struct SignOkxResponse {
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for SignOkxResponse {
