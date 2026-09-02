@@ -1088,49 +1088,7 @@ mod tests {
     /// route added tomorrow is covered without anyone remembering to add it.
     #[test]
     fn every_route_path_is_valid_for_the_linked_axum() {
-        let src = include_str!("main.rs");
-        // The registration marker, assembled so this line does not itself
-        // match — the first run of this test failed on a path it read out of
-        // its own comment, and the second on the `.rfind` inside the heartbeat
-        // guard below. A captured path must therefore start with `/`, which is
-        // both the real rule and the cheapest way to ignore prose.
-        let marker = concat!(".", "route(");
-        let mut paths: Vec<&str> = Vec::new();
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find(marker) {
-            let mut k = from + rel + marker.len();
-            from = k;
-            // Multi-line registrations put the path on the NEXT line; the
-            // heartbeat route is written that way, so a same-line-only
-            // extractor would silently skip the very route this rotation adds.
-            while src[k..].starts_with(|c: char| c.is_whitespace()) {
-                k += 1;
-            }
-            if !src[k..].starts_with('"') {
-                continue;
-            }
-            let start = k + 1;
-            let Some(end_rel) = src[start..].find('"') else {
-                continue;
-            };
-            let path = &src[start..start + end_rel];
-            if path.starts_with('/') {
-                paths.push(path);
-            }
-        }
-        assert!(
-            paths.len() >= 15,
-            "expected the route table, found {} paths — the extractor is \
-             reading nothing and would pass on anything",
-            paths.len()
-        );
-        assert!(
-            paths.iter().any(|p| p.contains("/receipts/")),
-            "the multi-line registrations are not being read: this rotation's \
-             own route is written that way"
-        );
-
-        for path in paths {
+        for path in route_paths(include_str!("main.rs")) {
             let p = path.to_owned();
             let built = std::panic::catch_unwind(move || {
                 // Bound rather than dropped: `Router` is `#[must_use]`, and the
@@ -1144,6 +1102,86 @@ mod tests {
                  when it is BUILT, which no other test here does."
             );
         }
+    }
+
+    /// Every route path registered in a Rust source, read from the source.
+    ///
+    /// Split out of the test so the extraction itself can be exercised — it has
+    /// its own failure modes, and two of them already bit:
+    ///
+    ///   - a same-line-only reader silently skipped the MULTI-LINE
+    ///     registrations, including `/receipts/heartbeat`, and reported success
+    ///     on half the table;
+    ///   - the marker matched prose: first a path inside this test's own doc
+    ///     comment, then the `.rfind` in the neighbouring heartbeat guard. A
+    ///     captured path must start with `/` — the real rule, and the cheapest
+    ///     way to ignore commentary.
+    ///
+    /// 🔴 Advancing by `c.len_utf8()` and not by 1: a multi-byte whitespace
+    /// (NBSP, U+2028) would leave `k` inside a UTF-8 sequence and the next slice
+    /// would PANIC — a source-reading guard brought down by the source it reads
+    /// (Gemini, #79). Our sources are ASCII today; that is a property of today.
+    fn route_paths(src: &str) -> Vec<&str> {
+        let marker = concat!(".", "route(");
+        let mut paths = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(marker) {
+            let mut k = from + rel + marker.len();
+            from = k;
+            while let Some(c) = src[k..].chars().next() {
+                if !c.is_whitespace() {
+                    break;
+                }
+                k += c.len_utf8();
+            }
+            if !src[k..].starts_with('"') {
+                continue;
+            }
+            let start = k + 1;
+            let Some(end_rel) = src[start..].find('"') else {
+                continue;
+            };
+            let path = &src[start..start + end_rel];
+            if path.starts_with('/') {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// The extractor must survive the source it is pointed at, and must read the
+    /// whole table rather than the half it can see on one line.
+    #[test]
+    fn route_paths_reads_the_whole_table_and_survives_non_ascii() {
+        // U+00A0 NBSP between `.route(` and the literal: byte-wise `k += 1`
+        // lands mid-sequence and the next slice panics.
+        let synthetic = concat!(
+            "        .route(\"/same-line\", get(h))\n",
+            "        .route(\u{00a0}\n            \"/multi-line\",\n            post(h),\n        )\n",
+            "        // prose mentioning .route( in a comment\n",
+            "        .rfind(\".route(\")\n",
+        );
+        let got = route_paths(synthetic);
+        assert_eq!(
+            got,
+            vec!["/same-line", "/multi-line"],
+            "expected both registrations and neither piece of prose"
+        );
+
+        // And on the real file: the count is a floor, and the route this
+        // rotation adds is written multi-line, so it proves the reader is not
+        // quietly seeing half.
+        let real = route_paths(include_str!("main.rs"));
+        assert!(
+            real.len() >= 15,
+            "expected the route table, found {} — the extractor is reading \
+             nothing and would pass on anything",
+            real.len()
+        );
+        assert!(
+            real.iter().any(|p| p.contains("/receipts/")),
+            "the multi-line registrations are not being read"
+        );
     }
     use super::*;
     use axum::body::Body;
