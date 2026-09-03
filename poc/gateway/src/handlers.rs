@@ -2278,7 +2278,6 @@ pub async fn post_sign_okx_cancel(
 /// per-request global env-lock contention; Gemini #76 HIGH).
 struct AttestationConfig {
     pcr0: String,
-    registered_onchain: bool,
     /// Attested-data pubkey (P2), both wire forms; `None` until provisioned.
     data_pubkey_compressed: Option<String>,
     data_pubkey_address: Option<String>,
@@ -2293,19 +2292,6 @@ fn validate_pcr0(raw: &str) -> Result<String, &'static str> {
     } else {
         Err("SIGNER_PCR0 must be 96 hex chars (SHA-384)")
     }
-}
-
-/// Parse `SIGNER_PCR0_ONCHAIN`. Only an explicit truthy value (`1|true|yes`)
-/// → `true`; absent OR any unrecognized value → **false**. CodeRabbit #76
-/// Major + CTO preference: a trust signal must fail safe — a typo like
-/// `"flase"` must NOT silently read as registered.
-fn parse_registered_onchain(raw: Option<String>) -> bool {
-    matches!(
-        raw.as_deref()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes")
-    )
 }
 
 /// Validate an optional `0x`-hex env value of exactly `nbytes` bytes. `None`
@@ -2337,8 +2323,6 @@ fn attestation_config() -> &'static Result<AttestationConfig, &'static str> {
         std::sync::OnceLock::new();
     CFG.get_or_init(|| {
         let pcr0 = validate_pcr0(&std::env::var("SIGNER_PCR0").unwrap_or_default())?;
-        let registered_onchain =
-            parse_registered_onchain(std::env::var("SIGNER_PCR0_ONCHAIN").ok());
         let data_pubkey_compressed = validate_opt_hex(
             std::env::var("SIGNER_DATA_PUBKEY").ok(),
             33,
@@ -2351,7 +2335,6 @@ fn attestation_config() -> &'static Result<AttestationConfig, &'static str> {
         )?;
         Ok(AttestationConfig {
             pcr0,
-            registered_onchain,
             data_pubkey_compressed,
             data_pubkey_address,
         })
@@ -2684,7 +2667,6 @@ pub async fn get_attestation(
     info!(
         event = "attestation_served",
         pcr0_short = %&pcr0_from_doc[..16],
-        registered_onchain = cfg.registered_onchain,
         nonce_present = nonce_hex.is_some(),
     );
     let mut response = (
@@ -2693,7 +2675,6 @@ pub async fn get_attestation(
             pcr0_sha384: pcr0_from_doc,
             attestation_doc_b64: Some(doc_b64),
             nonce: nonce_hex,
-            registered_onchain: cfg.registered_onchain,
             data_pubkey_compressed: cfg.data_pubkey_compressed.clone(),
             data_pubkey_address: cfg.data_pubkey_address.clone(),
             timestamp_ms: now_ms(),
@@ -4130,18 +4111,6 @@ mod tests {
         assert!(validate_pcr0("").is_err());
         assert!(validate_pcr0(&"z".repeat(96)).is_err());
         assert!(validate_pcr0(&format!("{}0", good)).is_err());
-    }
-
-    #[test]
-    fn parse_registered_onchain_fails_safe() {
-        assert!(parse_registered_onchain(Some("true".into())));
-        assert!(parse_registered_onchain(Some("1".into())));
-        assert!(parse_registered_onchain(Some("YES".into())));
-        assert!(!parse_registered_onchain(Some("false".into())));
-        assert!(!parse_registered_onchain(Some("0".into())));
-        assert!(!parse_registered_onchain(Some("flase".into())));
-        assert!(!parse_registered_onchain(Some("".into())));
-        assert!(!parse_registered_onchain(None));
     }
 
     /// F1: `is_safe_key_id` admits venue/key stems and rejects anything that

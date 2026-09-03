@@ -286,9 +286,13 @@ The demo measurement has two independent sources, in increasing order of trust:
   timestamped record whose **event log** cannot be rewritten after the fact.
   (The *current* active-owner lookup is mutable state, and registration is
   permissionless — so check the owner address, not just the boolean; Part 1.3
-  spells this out.) Since the 2026-08-10 rotation the measurement above **is**
-  registered and the demo's `/attestation` returns `registered_onchain: true`;
-  read it yourself rather than taking that field's word for it. (Earlier revisions of this page said the demo was not
+  spells this out.) 🔴 Do not expect a `registered_onchain` field — it was removed on 2026-09-03,
+  because a boolean this gateway computes about a public oracle is our word,
+  not evidence. Ask the registry yourself and compare the **owner**.
+  And know what you are asking: the registry keeps ONE active measurement per
+  owner, so registering the production measurement deprecates the demo's in the
+  very same transaction. While the two boxes run different images, only one of
+  them can answer `true` — a `false` on the other is the design, not a warning. (Earlier revisions of this page said the demo was not
   on-chain and told you a chain lookup did not apply to it. That was true when
   written and is false now — corrected rather than quietly amended.)
 
