@@ -197,7 +197,14 @@ async fn sign_leg(
     let payload = serde_json::json!({ "order": leg.order });
     match venue.as_str() {
         "binance" => {
-            let (canonical, mut headers) = sign_structured_request(
+            // `_receipt`: `sign_structured_request` has already archived this
+            // leg's receipt, so the auditor path is whole — only the
+            // client-held copy is skipped. The compound hedge response has no
+            // per-leg receipt field, and inventing one here would ship a shape
+            // the private tree does not have. A caller who needs the proof for
+            // a hedge leg reads the counter heartbeat instead: both legs are
+            // decisions, so `seq` moves by two.
+            let (canonical, mut headers, _receipt) = sign_structured_request(
                 state,
                 customer_id,
                 raw_token,
@@ -231,7 +238,14 @@ async fn sign_leg(
             })
         }
         "okx" => {
-            let (canonical, mut headers) = sign_structured_request(
+            // `_receipt`: `sign_structured_request` has already archived this
+            // leg's receipt, so the auditor path is whole — only the
+            // client-held copy is skipped. The compound hedge response has no
+            // per-leg receipt field, and inventing one here would ship a shape
+            // the private tree does not have. A caller who needs the proof for
+            // a hedge leg reads the counter heartbeat instead: both legs are
+            // decisions, so `seq` moves by two.
+            let (canonical, mut headers, _receipt) = sign_structured_request(
                 state,
                 customer_id,
                 raw_token,

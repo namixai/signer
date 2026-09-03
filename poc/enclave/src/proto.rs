@@ -228,6 +228,17 @@ pub struct SignRequest {
     #[serde(default)]
     pub attestation_user_data: Option<String>,
 
+    /// (`action == "receipt_heartbeat"`): the caller's own freshness nonce,
+    /// echoed INSIDE the signed heartbeat document.
+    ///
+    /// Deliberately NOT folded into `request_digest_v1`: that digest is the
+    /// receipt's binding to a request, its field list is what an outside
+    /// verifier recomputes, and a heartbeat is not a receipted decision. Adding
+    /// a field there would silently invalidate every recipe already published
+    /// for checking a receipt.
+    #[serde(default)]
+    pub client_nonce: Option<String>,
+
     /// ROT-1 (`action == "provision_agent_key"`): the venue the minted agent key
     /// will sign for, e.g. `hyperliquid_main`. Decides the KMS encryption
     /// context and the sealed AAD, so it MUST equal the venue the sign path
@@ -459,6 +470,14 @@ pub struct SignResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_body: Option<String>,
 
+    /// (`action == "receipt_heartbeat"`): the enclave's signed answer to "how
+    /// many decisions have you made for me?" — `{boot_id, customer_id,
+    /// seq_next, client_nonce}` under its own domain. PUBLIC, like the receipt
+    /// it accompanies. `None` for every other action and before the receipt key
+    /// is resident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<crate::receipt::ReceiptHeartbeat>,
+
     /// H5 (`action == "attestation"`): base64 of the NSM-signed COSE
     /// attestation document (AWS Nitro Attestation PKI). PUBLIC — carries
     /// PCRs + certificate chain, no secret material — so it is NOT wiped in
@@ -524,6 +543,7 @@ impl SignResponse {
             hl_signature: None,
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -544,6 +564,7 @@ impl SignResponse {
             hl_signature: None,
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: Some(plaintext_sha256_hex),
             plaintext_len: Some(plaintext_len),
@@ -565,6 +586,7 @@ impl SignResponse {
             hl_signature: None,
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -582,6 +604,7 @@ impl SignResponse {
             hl_signature: None,
             error: Some(code.to_owned()),
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -602,6 +625,7 @@ impl SignResponse {
             hl_signature: None,
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -623,6 +647,7 @@ impl SignResponse {
             hl_signature: Some(sig),
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -642,6 +667,7 @@ impl SignResponse {
             hl_signature: None,
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -660,6 +686,7 @@ impl SignResponse {
             hl_signature: None,
             error: None,
             receipt: None,
+            heartbeat: None,
             policy_hash: None,
             plaintext_sha256: None,
             plaintext_len: None,
@@ -1612,6 +1639,13 @@ pub mod err_code {
     /// wire-level deception where the customer believes a constraint
     /// is active but the enclave silently ignores it.
     pub const UNIMPLEMENTED_POLICY_FIELD: &str = "unimplemented_policy_field";
+    /// `receipt_heartbeat` on an enclave whose receipt key is not resident —
+    /// the receipt epoch has not started here. NOT an error in the ordinary
+    /// sense and deliberately not collapsed into one: the absence is itself
+    /// verifiable (the attestation document carries no `public_key` either),
+    /// and a caller must be able to tell "this enclave issues no receipts" from
+    /// "your request was refused".
+    pub const RECEIPTS_UNAVAILABLE: &str = "receipts_unavailable";
     /// CR035 (Security otdel red-team, 2026-05-29): collapsed wire code
     /// for the `verify_blob` path. Returned in place of `kms_decrypt_denied`,
     /// `internal_error` (envelope AEAD), and post-KMS `bad_request`
