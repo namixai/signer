@@ -22,6 +22,7 @@ mod handlers;
 mod hedge;
 mod limits;
 mod proto;
+mod receipts;
 mod state;
 mod vsock;
 
@@ -208,15 +209,15 @@ async fn main() -> Result<()> {
         // bearer-gated router, which made the signer-mcp proof tool return 401.
         // signer-mcp signed-read tool: per-venue signed account-read
         // (Option A — gateway never calls the venue; MCP submits + parses).
-        .route("/account/:venue", get(handlers::get_account))
+        .route("/account/{venue}", get(handlers::get_account))
         // Signed enumerate (reconcile orders an agent lost the id for) + signed
         // mass-cancel. Reuse the GENERIC sign_binance/sign_okx action via
         // sign_account_read — no enclave change / no PCR0 cutover. Tenant-authed.
-        .route("/open-orders/:venue", get(handlers::get_open_orders))
+        .route("/open-orders/{venue}", get(handlers::get_open_orders))
         // gate-2: signed read of own filled-trade history (audit without a raw
         // key). Binance only in v0; OKX fills-history fast-follows.
-        .route("/user-trades/:venue", get(handlers::get_user_trades))
-        .route("/cancel-all/:venue", post(handlers::post_cancel_all))
+        .route("/user-trades/{venue}", get(handlers::get_user_trades))
+        .route("/cancel-all/{venue}", post(handlers::post_cancel_all))
         // Binance USD-M Futures trade signing — structured order/cancel in,
         // venue-canonical signed bytes out (enclave builds canonical inside).
         .route(
@@ -255,6 +256,15 @@ async fn main() -> Result<()> {
         // Option-A exception — see hedge.rs doctrine note). Same auth +
         // dos-hardening stack as /sign.
         .route("/hedge", post(hedge::post_hedge))
+        // Signed counter heartbeat: ask the ENCLAVE how many decisions it has
+        // made for this tenant. The one call whose purpose is to catch this
+        // very gateway hiding a decision, so it sits on the tenant router (the
+        // tenant's own bearer resolves the identity inside the enclave) and
+        // carries nothing the gateway chooses.
+        .route(
+            "/receipts/heartbeat",
+            post(handlers::post_receipt_heartbeat),
+        )
         // B3 (в): per-token rate limit across the WHOLE tenant sign tier.
         // Registered BEFORE require_bearer in the builder chain → INNER layer
         // (axum: later layers wrap earlier ones), so it runs AFTER auth and
@@ -536,6 +546,7 @@ async fn run_data_signing_probe(state: &AppState, max_attempts: u32) -> ProbeOut
             data: Some(SIGN_PROBE_PAYLOAD.to_owned()),
             intent_signature: None,
             intent_nonce: None,
+            client_nonce: None,
             attestation_nonce: None,
             attestation_user_data: None,
         };
@@ -1061,6 +1072,121 @@ fn load_all_blobs(cli: &Cli) -> Result<HashMap<String, BlobBundle>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every route path in this file must be constructible by the axum version
+    /// we actually link against.
+    ///
+    /// 🔴 This exists because the four `/:venue` routes below survived CI, a
+    /// green clippy, a tag and a production deploy, and then panicked on the
+    /// first real startup: axum 0.8 changed capture syntax from `/:param` to
+    /// `/{param}` and rejects the old form when the Router is BUILT. Nothing in
+    /// this crate built a Router — the routers are assembled inline in `main()`
+    /// — so no test could go red. The bump arrived on its own; the breakage
+    /// waited for a human to restart the gateway on the box.
+    ///
+    /// Paths are read from this file's own source rather than listed here, so a
+    /// route added tomorrow is covered without anyone remembering to add it.
+    #[test]
+    fn every_route_path_is_valid_for_the_linked_axum() {
+        for path in route_paths(include_str!("main.rs")) {
+            let p = path.to_owned();
+            let built = std::panic::catch_unwind(move || {
+                // Bound rather than dropped: `Router` is `#[must_use]`, and the
+                // point here is that CONSTRUCTION is what panics.
+                let _r = Router::<()>::new().route(&p, get(|| async {}));
+            });
+            assert!(
+                built.is_ok(),
+                "axum refuses this path: {path:?}. Since 0.8 a capture is \
+                 written {{name}}, not :name — and the Router only rejects it \
+                 when it is BUILT, which no other test here does."
+            );
+        }
+    }
+
+    /// Every route path registered in a Rust source, read from the source.
+    ///
+    /// Split out of the test so the extraction itself can be exercised — it has
+    /// its own failure modes, and two of them already bit:
+    ///
+    ///   - a same-line-only reader silently skipped the MULTI-LINE
+    ///     registrations, including `/receipts/heartbeat`, and reported success
+    ///     on half the table;
+    ///   - the marker matched prose: first a path inside this test's own doc
+    ///     comment, then the `.rfind` in the neighbouring heartbeat guard. A
+    ///     captured path must start with `/` — the real rule, and the cheapest
+    ///     way to ignore commentary.
+    ///
+    /// 🔴 Advancing by `c.len_utf8()` and not by 1: a multi-byte whitespace
+    /// (NBSP, U+2028) would leave `k` inside a UTF-8 sequence and the next slice
+    /// would PANIC — a source-reading guard brought down by the source it reads
+    /// (Gemini, #79). Our sources are ASCII today; that is a property of today.
+    fn route_paths(src: &str) -> Vec<&str> {
+        let marker = concat!(".", "route(");
+        let mut paths = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(marker) {
+            let mut k = from + rel + marker.len();
+            from = k;
+            while let Some(c) = src[k..].chars().next() {
+                if !c.is_whitespace() {
+                    break;
+                }
+                k += c.len_utf8();
+            }
+            if !src[k..].starts_with('"') {
+                continue;
+            }
+            let start = k + 1;
+            let Some(end_rel) = src[start..].find('"') else {
+                continue;
+            };
+            let path = &src[start..start + end_rel];
+            if path.starts_with('/') {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// The extractor must survive the source it is pointed at, and must read the
+    /// whole table rather than the half it can see on one line.
+    #[test]
+    fn route_paths_reads_the_whole_table_and_survives_non_ascii() {
+        // U+00A0 NBSP between `.route(` and the literal: byte-wise `k += 1`
+        // lands mid-sequence and the next slice panics.
+        let synthetic = concat!(
+            "        .route(\"/same-line\", get(h))\n",
+            "        .route(\u{00a0}\n            \"/multi-line\",\n            post(h),\n        )\n",
+            "        // prose mentioning .route( in a comment\n",
+            "        .rfind(\".route(\")\n",
+        );
+        let got = route_paths(synthetic);
+        assert_eq!(
+            got,
+            vec!["/same-line", "/multi-line"],
+            "expected both registrations and neither piece of prose"
+        );
+
+        // And on the real file: the count is a floor, and the route this
+        // rotation adds is written multi-line, so it proves the reader is not
+        // quietly seeing half.
+        let real = route_paths(include_str!("main.rs"));
+        assert!(
+            real.len() >= 15,
+            "expected the route table, found {} — the extractor is reading \
+             nothing and would pass on anything",
+            real.len()
+        );
+        // The exact path, not a prefix: `contains("/receipts/")` would be
+        // satisfied by any other route under that namespace, and the point is
+        // that THIS one — written multi-line — is being read (CodeRabbit, #79).
+        assert!(
+            real.contains(&"/receipts/heartbeat"),
+            "the multi-line registrations are not being read: /receipts/heartbeat \
+             is written that way and is missing from what the extractor returned"
+        );
+    }
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -1418,6 +1544,53 @@ mod tests {
     // accept loop, not the in-process tower stack. They prove that the
     // header_read_timeout is wired correctly and fires even when no
     // tower layer has had a chance to see the request.
+
+    /// The heartbeat exists to let a TENANT catch this gateway hiding a
+    /// decision. On the operator router it is answerable only by us — the one
+    /// party it is meant to check — and a tenant's own bearer gets 401, so the
+    /// mechanism ships dead while every other test stays green.
+    ///
+    /// This is a source guard rather than a request test because the routers
+    /// are assembled inline in `main()` and cannot be built from a test. It is
+    /// falsifiable: move the route back under `operator_router` and it fails.
+    #[test]
+    fn heartbeat_answers_the_tenant_not_only_the_operator() {
+        let src = include_str!("main.rs");
+        // Every needle is assembled at compile time rather than written as one
+        // literal: `include_str!` pulls in THIS test too, so a whole-string
+        // needle would also match itself and the counts below would be off by
+        // one. `concat!` leaves no single matching literal in the source.
+        let sign = src
+            .find(concat!("let sign_router = ", "Router::new()"))
+            .expect("sign_router is built in main()");
+        let operator = src
+            .find(concat!("let operator_router = ", "Router::new()"))
+            .expect("operator_router is built in main()");
+        // The HANDLER reference, not the path string: a path string also
+        // occurs in prose, so a guard anchored on it would keep passing after
+        // the `.route(...)` itself moved or went away (CodeRabbit, #78).
+        let needle = concat!("post(handlers::", "post_receipt_heartbeat)");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "the heartbeat handler must be wired exactly once, or `find` below \
+             would report an arbitrary one of several registrations"
+        );
+        let route = src.find(needle).expect("the heartbeat route is registered");
+        let decl = src[..route]
+            .rfind(".route(")
+            .expect("the handler is reached through a .route(...) registration");
+        assert!(
+            src[decl..route].contains(concat!("\"/receipts", "/heartbeat\"")),
+            "the handler must be registered under its own path"
+        );
+        assert!(
+            sign < decl && decl < operator,
+            "the heartbeat must sit on the tenant router: a tenant bearer is \
+             the only credential that makes it evidence rather than \
+             self-testimony (sign={sign}, decl={decl}, operator={operator})"
+        );
+    }
 
     /// Build a minimal Router that returns 200 on /healthz, suitable
     /// for spinning up behind serve_with_hyper_util in tests.

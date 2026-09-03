@@ -93,6 +93,42 @@ impl TenantMode {
 }
 
 impl ResolvedIdentity {
+    /// SHA-256 over the canonical form of THIS tenant's resident registry entry:
+    /// `{"allowed_venues":[…sorted…],"customer_id":"…","mode":"active|cancel_only|halted"}`
+    /// under canonical-v1 (RFC 8785 JCS), hex.
+    ///
+    /// Why a HASH and not the entry. The live registry is RAM-only and there is
+    /// no way to read it back — composition drift is therefore invisible until
+    /// a request happens to fail on it, which is exactly how 2026-08-31 went.
+    /// A read-back of the entry itself would fix that and simultaneously hand a
+    /// STOLEN token its own scope in one call, which is the venue-scope oracle
+    /// `authorize_venue` deliberately refuses to be (see the `err_code` note on
+    /// the absent `venue_not_allowed` class). A hash gives the operator — who
+    /// holds the composition they signed — a one-line drift check, and gives a
+    /// thief nothing: a digest of something they would have to already know.
+    ///
+    /// `token_hmac` is deliberately NOT covered: its key is enclave-internal, so
+    /// including it would make the hash unreproducible off-box, which defeats
+    /// the entire purpose. The token→entry mapping is still covered in effect —
+    /// the caller's own token is what resolved to this entry, so a re-pointed
+    /// token shows up as a different `customer_id`.
+    ///
+    /// Venues are SORTED so the digest does not depend on the order the
+    /// composition happened to list them in.
+    pub fn entry_hash(&self) -> Option<String> {
+        let mut venues = self.allowed_venues.clone();
+        venues.sort();
+        let value = serde_json::json!({
+            "customer_id": self.customer_id,
+            "allowed_venues": venues,
+            "mode": self.mode.as_str(),
+        });
+        let canonical = crate::signer::canonical_v1(&value).ok()?;
+        Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            &canonical,
+        )))
+    }
+
     /// True iff this tenant is permitted to act on `venue`. The venue ACL is
     /// checked BEFORE blob access (design §5.4), so an authenticated tenant
     /// can never even reach a venue blob outside their grant.
@@ -699,6 +735,65 @@ pub fn test_install_with_mode(entries: &[(&str, &str, &[&str], TenantMode)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 The drift check that costs no read-back route (naryad item 4).
+    ///
+    /// The resident registry cannot be read out — composition drift is
+    /// invisible until a request happens to fail on it, which is exactly how
+    /// 2026-08-31 went. `entry_hash` gives the operator a one-line comparison
+    /// against the composition they signed, while giving a stolen token
+    /// nothing: a digest of a value its holder would have to already know.
+    ///
+    /// The fixture is computed OUTSIDE this codebase (`json.dumps(..., sort_keys,
+    /// separators=(',',':'))` + sha256). If canonical-v1 ever drifts from JCS
+    /// this test says so — an operator check that only agrees with itself is
+    /// not a check.
+    #[test]
+    fn entry_hash_is_reproducible_off_box_and_moves_when_the_grant_moves() {
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        test_install(&[(
+            "tok-drift",
+            "cust-drift",
+            &["binance", "hyperliquid_main", "okx"],
+        )]);
+        let id = resolve("tok-drift").expect("seeded token resolves");
+        let h = id.entry_hash().expect("entry canonicalises");
+        assert_eq!(
+            h, "a0a88958fc7cbde51adda37ec49028a65bd4a27e8580582f412a868585212d8e",
+            "canonical form must stay \
+             {{\"allowed_venues\":[…],\"customer_id\":…,\"mode\":…}} under JCS"
+        );
+
+        // Order of the composition must not matter — an operator who lists the
+        // same venues differently has not drifted.
+        test_install(&[(
+            "tok-drift",
+            "cust-drift",
+            &["okx", "binance", "hyperliquid_main"],
+        )]);
+        assert_eq!(resolve("tok-drift").unwrap().entry_hash().unwrap(), h);
+
+        // 🔴 The case this exists for: a venue silently missing from the live
+        // entry. This is the shape the Hyperliquid refusal is suspected to be,
+        // and today nothing surfaces it until a signature fails.
+        test_install(&[("tok-drift", "cust-drift", &["binance", "okx"])]);
+        assert_ne!(
+            resolve("tok-drift").unwrap().entry_hash().unwrap(),
+            h,
+            "a dropped venue must change the digest"
+        );
+
+        // A silently changed MODE is drift too — a tenant halted by a bad
+        // composition looks identical to one halted on purpose.
+        test_install_with_mode(&[(
+            "tok-drift",
+            "cust-drift",
+            &["binance", "hyperliquid_main", "okx"],
+            TenantMode::CancelOnly,
+        )]);
+        assert_ne!(resolve("tok-drift").unwrap().entry_hash().unwrap(), h);
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     /// Install the control-plane pubkey AND take the shared GLOBAL_TEST_LOCK for
