@@ -209,15 +209,15 @@ async fn main() -> Result<()> {
         // bearer-gated router, which made the signer-mcp proof tool return 401.
         // signer-mcp signed-read tool: per-venue signed account-read
         // (Option A — gateway never calls the venue; MCP submits + parses).
-        .route("/account/:venue", get(handlers::get_account))
+        .route("/account/{venue}", get(handlers::get_account))
         // Signed enumerate (reconcile orders an agent lost the id for) + signed
         // mass-cancel. Reuse the GENERIC sign_binance/sign_okx action via
         // sign_account_read — no enclave change / no PCR0 cutover. Tenant-authed.
-        .route("/open-orders/:venue", get(handlers::get_open_orders))
+        .route("/open-orders/{venue}", get(handlers::get_open_orders))
         // gate-2: signed read of own filled-trade history (audit without a raw
         // key). Binance only in v0; OKX fills-history fast-follows.
-        .route("/user-trades/:venue", get(handlers::get_user_trades))
-        .route("/cancel-all/:venue", post(handlers::post_cancel_all))
+        .route("/user-trades/{venue}", get(handlers::get_user_trades))
+        .route("/cancel-all/{venue}", post(handlers::post_cancel_all))
         // Binance USD-M Futures trade signing — structured order/cancel in,
         // venue-canonical signed bytes out (enclave builds canonical inside).
         .route(
@@ -1072,6 +1072,121 @@ fn load_all_blobs(cli: &Cli) -> Result<HashMap<String, BlobBundle>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every route path in this file must be constructible by the axum version
+    /// we actually link against.
+    ///
+    /// 🔴 This exists because the four `/:venue` routes below survived CI, a
+    /// green clippy, a tag and a production deploy, and then panicked on the
+    /// first real startup: axum 0.8 changed capture syntax from `/:param` to
+    /// `/{param}` and rejects the old form when the Router is BUILT. Nothing in
+    /// this crate built a Router — the routers are assembled inline in `main()`
+    /// — so no test could go red. The bump arrived on its own; the breakage
+    /// waited for a human to restart the gateway on the box.
+    ///
+    /// Paths are read from this file's own source rather than listed here, so a
+    /// route added tomorrow is covered without anyone remembering to add it.
+    #[test]
+    fn every_route_path_is_valid_for_the_linked_axum() {
+        for path in route_paths(include_str!("main.rs")) {
+            let p = path.to_owned();
+            let built = std::panic::catch_unwind(move || {
+                // Bound rather than dropped: `Router` is `#[must_use]`, and the
+                // point here is that CONSTRUCTION is what panics.
+                let _r = Router::<()>::new().route(&p, get(|| async {}));
+            });
+            assert!(
+                built.is_ok(),
+                "axum refuses this path: {path:?}. Since 0.8 a capture is \
+                 written {{name}}, not :name — and the Router only rejects it \
+                 when it is BUILT, which no other test here does."
+            );
+        }
+    }
+
+    /// Every route path registered in a Rust source, read from the source.
+    ///
+    /// Split out of the test so the extraction itself can be exercised — it has
+    /// its own failure modes, and two of them already bit:
+    ///
+    ///   - a same-line-only reader silently skipped the MULTI-LINE
+    ///     registrations, including `/receipts/heartbeat`, and reported success
+    ///     on half the table;
+    ///   - the marker matched prose: first a path inside this test's own doc
+    ///     comment, then the `.rfind` in the neighbouring heartbeat guard. A
+    ///     captured path must start with `/` — the real rule, and the cheapest
+    ///     way to ignore commentary.
+    ///
+    /// 🔴 Advancing by `c.len_utf8()` and not by 1: a multi-byte whitespace
+    /// (NBSP, U+2028) would leave `k` inside a UTF-8 sequence and the next slice
+    /// would PANIC — a source-reading guard brought down by the source it reads
+    /// (Gemini, #79). Our sources are ASCII today; that is a property of today.
+    fn route_paths(src: &str) -> Vec<&str> {
+        let marker = concat!(".", "route(");
+        let mut paths = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(marker) {
+            let mut k = from + rel + marker.len();
+            from = k;
+            while let Some(c) = src[k..].chars().next() {
+                if !c.is_whitespace() {
+                    break;
+                }
+                k += c.len_utf8();
+            }
+            if !src[k..].starts_with('"') {
+                continue;
+            }
+            let start = k + 1;
+            let Some(end_rel) = src[start..].find('"') else {
+                continue;
+            };
+            let path = &src[start..start + end_rel];
+            if path.starts_with('/') {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    /// The extractor must survive the source it is pointed at, and must read the
+    /// whole table rather than the half it can see on one line.
+    #[test]
+    fn route_paths_reads_the_whole_table_and_survives_non_ascii() {
+        // U+00A0 NBSP between `.route(` and the literal: byte-wise `k += 1`
+        // lands mid-sequence and the next slice panics.
+        let synthetic = concat!(
+            "        .route(\"/same-line\", get(h))\n",
+            "        .route(\u{00a0}\n            \"/multi-line\",\n            post(h),\n        )\n",
+            "        // prose mentioning .route( in a comment\n",
+            "        .rfind(\".route(\")\n",
+        );
+        let got = route_paths(synthetic);
+        assert_eq!(
+            got,
+            vec!["/same-line", "/multi-line"],
+            "expected both registrations and neither piece of prose"
+        );
+
+        // And on the real file: the count is a floor, and the route this
+        // rotation adds is written multi-line, so it proves the reader is not
+        // quietly seeing half.
+        let real = route_paths(include_str!("main.rs"));
+        assert!(
+            real.len() >= 15,
+            "expected the route table, found {} — the extractor is reading \
+             nothing and would pass on anything",
+            real.len()
+        );
+        // The exact path, not a prefix: `contains("/receipts/")` would be
+        // satisfied by any other route under that namespace, and the point is
+        // that THIS one — written multi-line — is being read (CodeRabbit, #79).
+        assert!(
+            real.contains(&"/receipts/heartbeat"),
+            "the multi-line registrations are not being read: /receipts/heartbeat \
+             is written that way and is missing from what the extractor returned"
+        );
+    }
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
