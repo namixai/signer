@@ -847,6 +847,44 @@ pub struct HealthResponse {
     pub sign_ok: bool,
     /// Seconds since the last SUCCESSFUL self-sign; `null` if it never succeeded yet.
     pub sign_age_s: Option<u64>,
+    /// Short commit SHA the running gateway was built from, or `"unknown"`.
+    ///
+    /// WHY THIS IS PUBLIC. Nothing here used to identify the running build, and
+    /// the consequence was not theoretical: we could not tell which gateway code
+    /// production was running, and there was no way to find out short of an
+    /// authenticated request. A system whose own operators cannot name what is
+    /// running cannot honestly ask anyone else to verify it.
+    ///
+    /// WHY DISCLOSING IT IS ACCEPTABLE. This threat model already treats the
+    /// gateway as untrusted — the signing key never leaves the enclave, so a
+    /// fully backdoored gateway is assumed not to yield keys. Hiding its version
+    /// would be obscurity protecting a component we publicly say is not trusted.
+    /// `/healthz` already discloses more operationally sensitive things:
+    /// `sign_age_s` reveals how recently this deployment last signed.
+    pub build: &'static str,
+    /// Which tree that commit belongs to: `"public"`, `"internal"`, `"unknown"`.
+    ///
+    /// 🔴 The SHA alone is ambiguous: two 40-hex strings from two different
+    /// repositories look identical, and without this field a reader cannot tell
+    /// which history to look the commit up in.
+    pub source: &'static str,
+}
+
+/// `/healthz` when the enclave is unreachable.
+///
+/// Carries the build identity even though the probe failed — and that is the
+/// point. The failure state is exactly when an operator asks "which binary is
+/// this?", and answering only in the healthy case would withhold it precisely
+/// when it is needed.
+///
+/// Deliberately NOT folded into the shared `ErrorResponse`: that type answers
+/// every denial on every route, and build identity has no business travelling
+/// with a policy refusal.
+#[derive(Debug, Serialize)]
+pub struct HealthUnavailableResponse {
+    pub error: &'static str,
+    pub build: &'static str,
+    pub source: &'static str,
 }
 
 /// Generic error codes returned to HTTP clients.
@@ -1029,6 +1067,8 @@ mod tests {
         // Provisioned + healthy.
         let ok = HealthResponse {
             status: "ok",
+            build: "testsha",
+            source: "internal",
             enclave_cid: 16,
             enclave_port: 5005,
             sign_checked: true,
@@ -1043,6 +1083,8 @@ mod tests {
         // Never-succeeded → sign_age_s is JSON null (monitor treats as stale).
         let never = HealthResponse {
             status: "ok",
+            build: "testsha",
+            source: "internal",
             enclave_cid: 16,
             enclave_port: 5005,
             sign_checked: true,
@@ -1055,6 +1097,8 @@ mod tests {
         // Venue-only box (data key not provisioned) → sign_checked false.
         let venue_only = HealthResponse {
             status: "ok",
+            build: "testsha",
+            source: "internal",
             enclave_cid: 16,
             enclave_port: 5005,
             sign_checked: false,
