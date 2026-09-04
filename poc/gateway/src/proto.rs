@@ -278,7 +278,7 @@ pub struct AttestationResponse {
     /// anti-replay. `None` when the caller supplied no `?nonce=`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
-    /// True once the operator has registered this PCR0 on the Base registry    /// Attested-signed-data (P2): the data-signing pubkey in BOTH wire forms
+    /// Attested-signed-data (P2): the data-signing pubkey in BOTH wire forms
     /// (compressed secp256k1 + ETH address). Buyers pin these and ecrecover the
     /// signer. `None` until the data key is provisioned + `SIGNER_DATA_PUBKEY` set.
     #[serde(skip_serializing_if = "Option::is_none")]
