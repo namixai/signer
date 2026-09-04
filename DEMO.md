@@ -241,13 +241,15 @@ and agreement is a coincidence with a date on it, not a property. Two facts, two
   (source verified on Basescan)
 - Canonical owner address:
   `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- Active on-chain right now — the **production** enclave:
-  `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3`
-  (registered 2026-08-24 by the owner above)
+- Active on-chain right now — the **production** enclave: **not printed here.** This page named
+  the value three times (July, 2026-08-24, 2026-08-27) and went stale three times. Read it from
+  `https://signer.usenami.io:8443/attestation` (`pcr0_sha384`), then ask the registry about *that*
+  value with the command below, and compare the returned owner to the address above.
 - What the **demo** box is running: ask the box, with the command below. From 2026-08-24 to
   2026-08-27 it attested `32d25d8c2f0b…`, which that rotation auto-deprecated, so the registry
-  answered `false` for it; it was rotated onto the production measurement on 2026-08-27. Both
-  of those are dated readings, and the box is the only thing that can tell you what is true now.
+  answered `false` for it; it was rotated onto the then-production measurement on 2026-08-27, and
+  production itself rotated again on 2026-09-03. All of those are dated readings; the box is the
+  only thing that can tell you what is true now.
 
 > ⚠️ **This page has now gone stale twice, and both corrections are published rather
 > than quietly swapped.** An earlier revision printed `7c9e8b26…` and told you to expect
@@ -266,10 +268,18 @@ and agreement is a coincidence with a date on it, not a property. Two facts, two
 
 ```bash
 # The production measurement — the one that answers "would this enclave be safe
-# with my keys":
+# with my keys" — read live, never from this page:
+PCR0=$(curl -sf https://signer.usenami.io:8443/attestation | jq -r '.pcr0_sha384 // empty')
+# Refuse to ask the chain about nothing: a dead endpoint or an error body would
+# otherwise send `0x` or `0xnull` into the call and get you a confident wrong answer.
+case "$PCR0" in
+  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "not a 96-hex PCR0: '$PCR0'" >&2; exit 1; } ;;
+  *) echo "no pcr0_sha384 from the endpoint (down, or an error body)" >&2; exit 1 ;;
+esac
+# `isPCR0Active` takes 48 RAW BYTES, so the 96-hex string goes in `0x`-prefixed.
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
-  0x103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3 \
+  "0x$PCR0" \
   --rpc-url https://mainnet.base.org
 
 # Or ask about whatever a box is actually running:
@@ -338,7 +348,7 @@ true
 0x21538eBF6598e5866BA496A954dE8E39097bFB59
 ```
 
-Translation: *the registry reports PCR0 103ccd79de6c… as active right now, with owner
+Translation: *the registry reports the PCR0 you just read from `/attestation` as active right now, with owner
 0x21538eBF…, the canonical address Usenami publishes.* Run the same command against
 whatever a box attests and you learn whether that box's measurement is registered. A
 `false` with a zero owner means the measurement has been deprecated, which inside a
