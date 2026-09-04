@@ -461,7 +461,7 @@ impl GatewayOps {
     ) -> Result<BTreeMap<String, String>, String> {
         let mut last = String::new();
         for attempt in 1..=CANCEL_ATTEMPTS {
-            match crate::handlers::sign_generic_venue_request(
+            match crate::handlers::sign_account_read(
                 &self.state,
                 &self.customer,
                 &self.token,
@@ -900,6 +900,24 @@ fn release_claim(customer: &str) {
     }
 }
 
+/// Holds the in-process claim and releases it on the way out — including on a
+/// PANIC inside the spawned job.
+///
+/// Gemini on #82: with a bare `release_claim` at the end of the task, a panic in
+/// `GatewayOps::new` or `run` skipped it and left the customer in `RUNNING`
+/// forever. `kick` is a no-op while the claim is held, so the next stop press
+/// would record a job that never starts — the tenant is halted and nothing
+/// unwinds, which is the worst of the two states this module exists to avoid.
+/// A restart clears it (the set is per-process), but "restart the money-path
+/// gateway" is not an answer to a panic.
+struct ClaimGuard(String);
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        release_claim(&self.0);
+    }
+}
+
 /// Start the reconcile job for `customer` if its record says one is due and
 /// none is running. Idempotent; safe to call on every transition.
 pub fn kick(state: AppState, customer: &str) {
@@ -916,6 +934,8 @@ pub fn kick(state: AppState, customer: &str) {
     }
     let customer = customer.to_owned();
     tokio::spawn(async move {
+        // Released on every exit path, panic included (see `ClaimGuard`).
+        let _claim = ClaimGuard(customer.clone());
         let Some(ops) = GatewayOps::new(state.clone(), &customer) else {
             error!(event = "tenant_reconcile_no_token", customer = %customer, "no SIGNER_API_TOKENS entry for this customer — cannot sign cancels; unwind by hand");
             state.tenants.update_reconcile(&customer, |s| {
@@ -927,11 +947,9 @@ pub fn kick(state: AppState, customer: &str) {
                         .to_owned(),
                 );
             });
-            release_claim(&customer);
             return;
         };
         let _ = run(&state, &customer, &ops, &RealClock, &incidents_dir()).await;
-        release_claim(&customer);
     });
 }
 

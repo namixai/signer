@@ -2853,7 +2853,7 @@ pub(crate) fn okx_is_demo() -> bool {
 #[allow(clippy::result_large_err)]
 // Response is the canonical wire type — boxing adds indirection (same allow as enclave's enforce_policy).
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
-async fn sign_account_read(
+pub(crate) async fn sign_account_read(
     state: &AppState,
     customer_id: &str,
     raw_token: &str,
@@ -2946,7 +2946,11 @@ async fn sign_account_read(
         }
     };
 
-    // 7. Errors → allow-listed wire surface (CR037/CR049 parity).
+    // 7. Errors → allow-listed wire surface (CR037/CR049 parity). The receipt is
+    //    ARCHIVED here for reads too — every enclave decision leaves one, and a
+    //    read that was refused is a decision. Returning it to the caller on these
+    //    routes (SignedVenueRequest) is a follow-up; the archive is complete.
+    let receipt = take_receipt(&mut resp, customer_id);
     if let Some(code) = resp.error.as_deref() {
         let mapped = crate::proto::safe_wire_code(code);
         if mapped == err_code::RATE_LIMITED {
@@ -2959,7 +2963,7 @@ async fn sign_account_read(
             wire_code = mapped,
             vsock_latency_ms,
         );
-        return Err(enclave_error_response(mapped, None));
+        return Err(enclave_error_response(mapped, receipt));
     }
 
     state.backoff.report_success(&scope);
@@ -3809,133 +3813,6 @@ fn finish_log(
 }
 
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
-/// Sign ONE venue-native HTTP request (method + path + query + body) through
-/// the venue's generic HMAC action — the same primitive the signed READS
-/// (`/account`, `/open-orders`, `/user-trades`) and the signed mass-cancel
-/// (`DELETE /fapi/v1/allOpenOrders`) are built on. The name used to be
-/// `sign_account_read`, which read as "reads only" and alarmed reviewers when
-/// the DELETE went through it. It is NOT a read-only channel and does not need
-/// to be: the ENCLAVE enforces the policy on the forwarded method + path
-/// (`allowed_methods`, `allowed_path_prefixes`, withdrawal deny-list — CR051),
-/// so a capped key gets exactly what its policy permits regardless of which
-/// gateway helper assembled the request. A gateway that lied about the method
-/// would be refused by the enclave, not trusted.
-pub(crate) async fn sign_generic_venue_request(
-    state: &AppState,
-    customer_id: &str,
-    raw_token: &str,
-    venue: &str,
-    method: &str,
-    path: &str,
-    body: &str,
-    query: &str,
-) -> Result<std::collections::BTreeMap<String, String>, Response> {
-    // 1. Resolve the enclave action for this venue (Some unknown venue → 400).
-    //    /account is signed-read only; `kind` is None.
-    let action = match enclave_action_for(venue, None) {
-        Some(a) => a,
-        None => return Err(error_response(err_code::BAD_REQUEST)),
-    };
-
-    // 2. Blob lookup — tenant-scoped (customer × venue), no cross-customer
-    //    fall-through. Backoff keyed identically below.
-    let scope = blob_key(customer_id, venue);
-    let blob = match state.blobs.get(&scope) {
-        Some(b) => b,
-        None => {
-            warn!(event = "account_blob_missing", venue = %venue);
-            return Err(error_response(err_code::BAD_REQUEST));
-        }
-    };
-
-    // 3. Adaptive backoff (parity with /sign and /sign-x402).
-    if !state.backoff.allow(&scope) {
-        warn!(event = "account_backoff_rejected", venue = %venue);
-        return Err(error_response(err_code::RATE_LIMITED));
-    }
-
-    // 4. Fresh AWS creds.
-    let creds = match state.creds.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(event = "account_creds_failed", venue = %venue, detail = %e);
-            return Err(error_response(err_code::INTERNAL_ERROR));
-        }
-    };
-
-    // 5. Build the vsock request. Body and query are caller-supplied so the
-    //    helper stays generic across read endpoints.
-    let vsock_req = VsockRequest {
-        action: action.to_owned(),
-        method: Some(method.to_owned()),
-        path: Some(path.to_owned()),
-        body: Some(body.to_owned()),
-        timestamp_ms: Some(now_ms()),
-        aws_credentials: Some(AwsCredentials {
-            access_key_id: creds.access_key_id.clone(),
-            secret_access_key: creds.secret_access_key.clone(),
-            session_token: creds.session_token.clone(),
-        }),
-        ciphertext_blob_base64: Some(B64.encode(blob.ciphertext.as_slice())),
-        proto_version: 1,
-        op: None,
-        payload: None,
-        opaque_token: Some(raw_token.to_owned()),
-        key_blob_s3_key: Some(format!("secrets/{}.enc", venue)),
-        query: if query.is_empty() {
-            None
-        } else {
-            Some(query.to_owned())
-        },
-        hl_action: None,
-        nonce: None,
-        vault_address: None,
-        x402: None,
-        order: None,
-        cancel: None,
-        data: None,
-        intent_signature: None,
-        intent_nonce: None,
-        client_nonce: None,
-        attestation_nonce: None,
-        attestation_user_data: None,
-    };
-
-    // 6. Round-trip.
-    let vsock_started = Instant::now();
-    let resp = vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await;
-    let vsock_latency_ms = vsock_started.elapsed().as_millis() as u64;
-    let mut resp = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(event = "account_vsock_failed", venue = %venue, latency_ms = vsock_latency_ms, detail = %e);
-            return Err(error_response(err_code::ENCLAVE_UNREACHABLE));
-        }
-    };
-
-    // 7. Errors → allow-listed wire surface (CR037/CR049 parity). The receipt
-    //    is ARCHIVED here for reads; returning it to the caller on the read
-    //    routes (SignedVenueRequest) is a follow-up — the archive is complete.
-    let receipt = take_receipt(&mut resp, customer_id);
-    if let Some(code) = resp.error.as_deref() {
-        let mapped = crate::proto::safe_wire_code(code);
-        if mapped == err_code::RATE_LIMITED {
-            state.backoff.report_rate_limited(&scope);
-        }
-        warn!(
-            event = "account_enclave_error",
-            venue = %venue,
-            internal_code = code,
-            wire_code = mapped,
-            vsock_latency_ms,
-        );
-        return Err(enclave_error_response(mapped, receipt));
-    }
-
-    state.backoff.report_success(&scope);
-    Ok(resp.headers.take().unwrap_or_default())
-}
-
 #[cfg(test)]
 mod tests {
 

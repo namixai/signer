@@ -286,11 +286,6 @@ async fn main() -> Result<()> {
             "/receipts/heartbeat",
             post(handlers::post_receipt_heartbeat),
         )
-        // Per-tenant kill switch, customer-pressed: escalate-only with the
-        // tenant's own bearer (ACTIVE → CANCEL_ONLY → HALTED); release is an
-        // operator action over the admin socket. Exempt from the tenant-state
-        // middleware by construction (it can only tighten).
-        .route("/tenant/halt", post(tenant_state::post_tenant_halt))
         // B3 (в): per-token rate limit across the WHOLE tenant sign tier.
         // Registered BEFORE require_bearer in the builder chain → INNER layer
         // (axum: later layers wrap earlier ones), so it runs AFTER auth and
@@ -405,7 +400,31 @@ async fn main() -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
+    // 🔴 The kill switch gets its OWN router, WITHOUT the per-token rate limiter.
+    //
+    // Why: the press that matters happens under load. A bot that has run away is,
+    // by definition, the one that saturated its own minute bucket — and on the
+    // shared sign_router its next request, the halt, would be refused 429 by the
+    // limiter its own traffic filled. The stop would be unreachable exactly when
+    // it is needed, which is worse than not advertising one (CodeRabbit on #82;
+    // the private tree has the same layering and inherits the fix).
+    //
+    // Safe to exempt because the route can only TIGHTEN: `post_tenant_halt`
+    // escalates ACTIVE → CANCEL_ONLY → HALTED and cannot release — release is an
+    // operator action over the admin socket. So an attacker holding the token
+    // gains nothing by calling it repeatedly except stopping themselves. It keeps
+    // auth (a bearer is still required) and the tenant span, and it is exempt from
+    // the tenant-state middleware by construction.
+    let halt_router = Router::new()
+        .route("/tenant/halt", post(tenant_state::post_tenant_halt))
+        .route_layer(axum::middleware::from_fn(tenant_state::request_span_mw))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::require_bearer,
+        ));
+
     let api_router = sign_router
+        .merge(halt_router)
         .merge(operator_router)
         .layer(TraceLayer::new_for_http())
         .layer(dos_hardening)
@@ -1185,8 +1204,11 @@ mod tests {
         let mut found: Vec<&str> = route_paths(include_str!("main.rs"));
         found.sort_unstable();
         found.dedup();
-        // Routes registered by modules other than this one are not in this file's
-        // source; the guard covers what `main.rs` itself registers.
+        // Every tenant- and operator-facing route this file registers, listed in
+        // full rather than sampled: the five binance signing routes were missing
+        // from the first version of this guard (both review bots caught it), and a
+        // guard that covers part of the table teaches people it covers all of it.
+        // Test-only routes (/probe, /slow, /fast, /block) are deliberately absent.
         for expected in [
             "/account/{venue}",
             "/attestation",
@@ -1198,6 +1220,11 @@ mod tests {
             "/sign",
             "/sign-data",
             "/sign-x402",
+            "/sign/binance-cancel",
+            "/sign/binance-order",
+            "/sign/binance-request",
+            "/sign/binance-spot-cancel",
+            "/sign/binance-spot-order",
             "/sign/okx-cancel",
             "/sign/okx-order",
             "/tenant/halt",
