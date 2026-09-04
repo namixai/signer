@@ -269,7 +269,14 @@ and agreement is a coincidence with a date on it, not a property. Two facts, two
 ```bash
 # The production measurement — the one that answers "would this enclave be safe
 # with my keys" — read live, never from this page:
-PCR0=$(curl -s https://signer.usenami.io:8443/attestation | jq -r .pcr0_sha384)
+PCR0=$(curl -sf https://signer.usenami.io:8443/attestation | jq -r '.pcr0_sha384 // empty')
+# Refuse to ask the chain about nothing: a dead endpoint or an error body would
+# otherwise send `0x` or `0xnull` into the call and get you a confident wrong answer.
+case "$PCR0" in
+  [0-9a-f]*) [ ${#PCR0} -eq 96 ] || { echo "not a 96-hex PCR0: '$PCR0'" >&2; exit 1; } ;;
+  *) echo "no pcr0_sha384 from the endpoint (down, or an error body)" >&2; exit 1 ;;
+esac
+# `isPCR0Active` takes 48 RAW BYTES, so the 96-hex string goes in `0x`-prefixed.
 cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
   "isPCR0Active(bytes)(bool,address)" \
   "0x$PCR0" \
