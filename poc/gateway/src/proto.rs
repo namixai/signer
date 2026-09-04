@@ -251,8 +251,18 @@ pub struct VerifyBlobResponse {
 /// tool). H5: `pcr0_sha384` is now parsed OUT of the NSM-signed COSE document
 /// (`attestation_doc_b64`) and cross-checked against the `SIGNER_PCR0` deploy
 /// env — a mismatch fails the request rather than serving a stale/forged value.
-/// The document is the source of truth; the legacy `pcr0_sha384`/
-/// `registered_onchain` fields stay for backward-compatible callers.
+/// The document is the source of truth; `pcr0_sha384` stays for
+/// backward-compatible callers.
+///
+/// 🔴 `registered_onchain` was REMOVED (2026-09-03) and must not come back.
+/// It was a boolean this gateway computed about the on-chain registry — that
+/// is, OUR WORD about a fact with a public oracle. A verifier who believed it
+/// gained nothing over one who believed the env var behind it: the trust
+/// boundary did not move, in a document whose entire purpose is to move it.
+/// Making it a live `isPCR0Active` call would not have fixed that and would
+/// have put an external RPC on the attestation path — with no honest answer
+/// when the RPC is down. The registry address and the expected owner belong in
+/// the verification recipe, where the reader runs the query themselves.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct AttestationResponse {
     /// PCR0 (SHA-384 of the enclave image) as 96-char lowercase hex. H5: parsed
@@ -268,9 +278,6 @@ pub struct AttestationResponse {
     /// anti-replay. `None` when the caller supplied no `?nonce=`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
-    /// True once the operator has registered this PCR0 on the Base registry
-    /// (the cutover flow does this). Sourced from `SIGNER_PCR0_ONCHAIN`.
-    pub registered_onchain: bool,
     /// Attested-signed-data (P2): the data-signing pubkey in BOTH wire forms
     /// (compressed secp256k1 + ETH address). Buyers pin these and ecrecover the
     /// signer. `None` until the data key is provisioned + `SIGNER_DATA_PUBKEY` set.
