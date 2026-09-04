@@ -305,17 +305,17 @@ branch: dependency bumps on `main` change the enclave binary and therefore PCR0.
 
 ```bash
 git clone https://github.com/namixai/signer.git && cd signer
-git checkout 96cd4e46                   # the commit the production PCR0 was measured on
+git checkout pcr0-60036cd3              # a measurement TAG (pcr0-<prefix>); pick the one you intend to trust
 cd poc
 SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
-# → PCR0 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
-# Compare that against the production /attestation, not against this line. The table
-# below records which commit produced which measurement, and when each was deployed.
+# → prints that tag's PCR0. Compare it against the /attestation of the endpoint you are
+# asking about — this file never names the live measurement, because every time it did,
+# it went stale. The table below is a dated record of which tree measured to what.
 ```
 
 > **Measured, not asserted — and here is the measurement record.**
-> Last re-run: **2026-08-23** (103ccd79 measurement; prior re-run 2026-08-20), clean anonymous clone into an empty
-> directory, `env -i`, x86_64 EC2 build host `i-0d332f8f`, **`nitro-cli 1.4.4`**.
+> Last re-runs: **2026-09-02** (tag `pcr0-60036cd3`, clean anonymous clone by `poc/scripts/reproducibility-from-public-clone.sh`,
+> which refuses to build anything but a tag) and **2026-08-23** (tag `pcr0-103ccd79`); both `env -i`, x86_64 EC2 build host, **`nitro-cli 1.4.4`**.
 > PCR0 also depends on the `nitro-cli` release (it bundles the enclave kernel and
 > init), so use the same version or expect a different number for that reason alone.
 > A build needs ~30 GB of free disk for the Docker layers; `build-eif.sh` prunes
@@ -325,7 +325,8 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > |---|---|---|
 > | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — previous production (2026-08-10 → 2026-08-24) |
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
-> | commit `96cd4e46` (2026-08-23, merge of #55: tenant mode + decision receipts + ROT-8) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — **production since 2026-08-24** (registry v108, decision receipts + enclave-level tenant stop live); the live value is always `/attestation` |
+> | tag `pcr0-103ccd79` = commit `96cd4e46` (2026-08-23, merge of #55) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured 2026-08-23/26; deployed to production 2026-08-24 → 2026-09-03 |
+> | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
 > | commit `1207d37` (2026-08-19, current `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9` — **not deployed**; differs because `anyhow` and `thiserror` were bumped after the measurement |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
