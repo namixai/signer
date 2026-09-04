@@ -23,7 +23,9 @@ mod hedge;
 mod limits;
 mod proto;
 mod receipts;
+mod reconcile;
 mod state;
+mod tenant_state;
 mod vsock;
 
 use anyhow::{Context, Result};
@@ -188,7 +190,26 @@ async fn main() -> Result<()> {
     // Attested-signed-data (P2): the enclave opaque_token forwarded for sign_data
     // (resolves to the data-signing service identity). None until provisioned.
     .with_data_signing_token(std::env::var("SIGNER_DATA_SIGNING_TOKEN").ok())
-    .with_limits(b3_limits);
+    .with_limits(b3_limits)
+    .with_tenants({
+        let path = std::env::var(tenant_state::STATE_PATH_ENV)
+            .ok()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| tenant_state::DEFAULT_STATE_PATH.to_owned());
+        let store = tenant_state::TenantStateStore::load(std::path::PathBuf::from(&path))
+            .with_context(|| format!("load tenant-state file {path}"))?;
+        // Prove the path is WRITABLE at boot (same discipline as the daily
+        // counter): an unwritable /var/lib/signer must fail here, not at the
+        // first halt.
+        store.boot_probe().with_context(|| {
+            format!(
+                "tenant-state file {path} is not writable ({})",
+                tenant_state::STATE_PATH_ENV
+            )
+        })?;
+        store
+    });
 
     // C22 (ZLODEY 2026-05-18): load bearer-token config and apply to /sign.
     // Healthz stays unauthenticated for Cloudflare/AWS liveness probes.
@@ -265,6 +286,11 @@ async fn main() -> Result<()> {
             "/receipts/heartbeat",
             post(handlers::post_receipt_heartbeat),
         )
+        // Per-tenant kill switch, customer-pressed: escalate-only with the
+        // tenant's own bearer (ACTIVE → CANCEL_ONLY → HALTED); release is an
+        // operator action over the admin socket. Exempt from the tenant-state
+        // middleware by construction (it can only tighten).
+        .route("/tenant/halt", post(tenant_state::post_tenant_halt))
         // B3 (в): per-token rate limit across the WHOLE tenant sign tier.
         // Registered BEFORE require_bearer in the builder chain → INNER layer
         // (axum: later layers wrap earlier ones), so it runs AFTER auth and
@@ -276,6 +302,19 @@ async fn main() -> Result<()> {
             state.clone(),
             limits::rate_limit_mw,
         ))
+        // Per-tenant kill switch: OUTSIDE the rate limiter (a halted bot's
+        // retries must not drain the bucket a legitimate cancel needs) and
+        // INSIDE auth (needs ResolvedCustomer). Path-classified routes are
+        // settled here; `/sign` and `/sign/binance-request` finish in-handler.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenant_state::tenant_state_mw,
+        ))
+        // Tenant dimension on every lifecycle event (customer/method/path span):
+        // without it "what did tenant X do in the last hour" cannot be answered
+        // from the gateway log. Directly inside auth so the span wraps
+        // everything below, denials included.
+        .route_layer(axum::middleware::from_fn(tenant_state::request_span_mw))
         .route_layer(axum::middleware::from_fn_with_state(
             // Cloned so the original survives the operator/tenant overlap check
             // below (LOW#2) before it is dropped.
@@ -391,7 +430,50 @@ async fn main() -> Result<()> {
         .merge(api_router)
         .merge(public_router)
         .route("/healthz", get(handlers::get_healthz))
-        .with_state(state);
+        // Cloned: `reconcile::resume_all` and the admin-socket task below both
+        // need the state after the router takes ownership. AppState is Arc-backed.
+        .with_state(state.clone());
+
+    // PR-2: restart any reconcile job a previous process left non-final — a
+    // restart mid-unwind must not leave orders resting unnoticed.
+    reconcile::resume_all(state.clone());
+
+    // Cloned for the admin-socket task, which outlives this scope.
+    let admin_state = state.clone();
+
+    // Operator control socket for the per-tenant kill switch. Unix socket, no
+    // bearer: the file mode (0660) is the permission to press, and no TLS
+    // front can ever proxy to it. `SIGNER_ADMIN_SOCKET=off` disables it (dev).
+    {
+        let sock = std::env::var(tenant_state::ADMIN_SOCKET_ENV)
+            .ok()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| tenant_state::DEFAULT_ADMIN_SOCKET.to_owned());
+        if sock == "off" {
+            warn!(
+                event = "tenant_admin_socket_disabled",
+                "SIGNER_ADMIN_SOCKET=off — operator per-tenant stop is NOT reachable on this box"
+            );
+        } else {
+            // Bind is a BOOT-time concern: if the operator control path cannot
+            // exist, the gateway must not serve signing traffic without it
+            // (CodeRabbit). Only the accept loop is spawned.
+            let sock_path = std::path::PathBuf::from(&sock);
+            let listener = tenant_state::bind_admin_socket(&sock_path).with_context(|| {
+                format!(
+                    "bind operator admin socket {sock} ({})",
+                    tenant_state::ADMIN_SOCKET_ENV
+                )
+            })?;
+            let admin_app = tenant_state::admin_router(admin_state.clone());
+            tokio::spawn(async move {
+                if let Err(e) = tenant_state::serve_admin_socket(listener, admin_app).await {
+                    error!(event = "tenant_admin_socket_failed", error = %e, "operator per-tenant stop NOT reachable");
+                }
+            });
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(cli.bind)
         .await
@@ -1086,6 +1168,52 @@ mod tests {
     ///
     /// Paths are read from this file's own source rather than listed here, so a
     /// route added tomorrow is covered without anyone remembering to add it.
+    /// 🔴 The route table is a CONTRACT, and losing a route is as much a defect
+    /// as adding a broken one.
+    ///
+    /// Measured 2026-09-04: the production gateway had been rebuilt on 09-03 from
+    /// this repository, which at the time carried no `tenant_state.rs` — so
+    /// `POST /tenant/halt` went from `401` (2026-08-31) to `404`, and the
+    /// per-tenant kill switch was gone from production for a day before anyone
+    /// noticed. Nothing went red, because every check asked "did the new thing
+    /// appear?" and none asked "did the old thing survive?".
+    ///
+    /// This list is that second question. Removing or renaming a route must be a
+    /// deliberate edit here, in the same commit, with the reason in the message.
+    #[test]
+    fn the_route_table_has_not_silently_lost_anything() {
+        let mut found: Vec<&str> = route_paths(include_str!("main.rs"));
+        found.sort_unstable();
+        found.dedup();
+        // Routes registered by modules other than this one are not in this file's
+        // source; the guard covers what `main.rs` itself registers.
+        for expected in [
+            "/account/{venue}",
+            "/attestation",
+            "/cancel-all/{venue}",
+            "/healthz",
+            "/hedge",
+            "/open-orders/{venue}",
+            "/receipts/heartbeat",
+            "/sign",
+            "/sign-data",
+            "/sign-x402",
+            "/sign/okx-cancel",
+            "/sign/okx-order",
+            "/tenant/halt",
+            "/user-trades/{venue}",
+            "/verify-blob",
+        ] {
+            assert!(
+                found.contains(&expected),
+                "route {expected} is gone from main.rs. If that is intentional, delete it \
+                 from this list in the SAME commit and say why in the message — otherwise \
+                 you are repeating 2026-09-03, when /tenant/halt vanished from production \
+                 for a day and no test noticed. Routes currently registered: {found:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_route_path_is_valid_for_the_linked_axum() {
         for path in route_paths(include_str!("main.rs")) {

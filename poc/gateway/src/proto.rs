@@ -813,6 +813,8 @@ pub fn denial_meta(code: &str) -> (bool, &'static str, &'static str) {
         }
         err_code::RATE_LIMITED => (true, err_code::RATE_LIMITED, "rate"),
         err_code::DAILY_CAP => (true, err_code::DAILY_CAP, "rate"),
+        err_code::TENANT_CANCEL_ONLY => (true, err_code::TENANT_CANCEL_ONLY, "tenant_state"),
+        err_code::TENANT_HALTED => (true, err_code::TENANT_HALTED, "tenant_state"),
         err_code::UNAUTHORIZED => (true, err_code::UNAUTHORIZED, "auth"),
         err_code::KMS_DECRYPT_DENIED => (true, err_code::KMS_DECRYPT_DENIED, "attestation"),
         // Non-denial: request-shape / infra. `denied:false`.
@@ -941,6 +943,15 @@ pub mod err_code {
     /// Gateway-emitted: per-token per-UTC-day order counter exhausted (B3).
     /// `rule_class: "rate"`, HTTP 429 (a budget signal, like rate_limited).
     pub const DAILY_CAP: &str = "daily_cap";
+    /// Gateway-emitted per-tenant kill switch (docs/TENANT-KILL-SWITCH-DESIGN.md):
+    /// the tenant is in CANCEL_ONLY — exposure-creating paths (orders, x402,
+    /// opaque bodies) refused; cancels and reads still go through.
+    /// `rule_class: "tenant_state"`, HTTP 403.
+    pub const TENANT_CANCEL_ONLY: &str = "tenant_cancel_only";
+    /// Gateway-emitted: the tenant is HALTED — every tenant-facing path refused
+    /// except the escalate-only `/tenant/halt`. `rule_class: "tenant_state"`, 403.
+    /// A bot MUST be able to tell this from `bad_request`, or it retries forever.
+    pub const TENANT_HALTED: &str = "tenant_halted";
 }
 
 /// CR037 (red-team, 2026-05-29): allow-list of error codes that the

@@ -61,7 +61,7 @@ fn take_receipt(
     receipt
 }
 
-fn error_response(code: &str) -> Response {
+pub(crate) fn error_response(code: &str) -> Response {
     let status =
         StatusCode::from_u16(http_status_for(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(ErrorResponse::new(code))).into_response()
@@ -264,6 +264,26 @@ pub async fn post_sign(
             );
         }
     };
+
+    // Per-tenant kill switch, body half. The path-classified middleware let
+    // `/sign` through in CANCEL_ONLY because the class lives in `kind`; now that
+    // the action is known, settle it. HL `*_order` is an order; HL `*_cancel`
+    // reduces exposure; an OPAQUE HMAC body (kind=None) is unclassifiable here
+    // and could place an order → denied in CANCEL_ONLY (fail-closed). HALTED
+    // never reaches this point (middleware denies).
+    {
+        use crate::tenant_state::RouteClass;
+        let class = if action.ends_with("_order") {
+            RouteClass::Order
+        } else if action.ends_with("_cancel") {
+            RouteClass::Cancel
+        } else {
+            RouteClass::Unknown
+        };
+        if let Some((resp, code)) = crate::tenant_state::body_route_gate(&state, &customer, class) {
+            return finish_log(resp, started, false, Some(code));
+        }
+    }
 
     // B3 (б): Hyperliquid ORDER actions place orders through this generic
     // route — count them against the per-token daily cap. Explicit action
@@ -1670,6 +1690,23 @@ pub async fn post_sign_binance_request(
     // Gating on the DECLARED op is sound because the enclave's positive
     // per-op param allow-list refuses an order-shaped payload under any
     // other declared op before signing. Reads/cancel are not counted.
+    // Per-tenant kill switch, body half: gate on the DECLARED op. In
+    // CANCEL_ONLY an `order` op is refused, `cancel` and read-only ops go
+    // through. The enclave's per-op param allow-list is what makes gating on
+    // the declared op sound (a mislabelled order-shaped payload is refused
+    // there before signing).
+    {
+        use crate::tenant_state::RouteClass;
+        let class = match req.op.as_str() {
+            "order" => RouteClass::Order,
+            "cancel" => RouteClass::Cancel,
+            _ => RouteClass::Read,
+        };
+        if let Some((resp, code)) = crate::tenant_state::body_route_gate(&state, &customer, class) {
+            return finish_log(resp, started, false, Some(code));
+        }
+    }
+
     if req.op == "order" {
         if let Some((resp, code)) = order_gate(&state, &raw_token).await {
             return finish_log(resp, started, false, Some(code));
@@ -3174,7 +3211,7 @@ pub async fn get_account(
 /// Leaves only `X-MBX-APIKEY` in `headers`. Wrong order = invalid signature.
 /// Returns the `err_code` (`&'static str`) on failure — the caller maps it to the
 /// wire response (avoids returning a heavy `Response` from a small helper).
-fn binance_signed_url(
+pub(crate) fn binance_signed_url(
     path: &str,
     user_query: &str,
     headers: &mut std::collections::BTreeMap<String, String>,
@@ -3769,6 +3806,134 @@ fn finish_log(
         error_code = error_code.unwrap_or("")
     );
     resp
+}
+
+#[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
+/// Sign ONE venue-native HTTP request (method + path + query + body) through
+/// the venue's generic HMAC action — the same primitive the signed READS
+/// (`/account`, `/open-orders`, `/user-trades`) and the signed mass-cancel
+/// (`DELETE /fapi/v1/allOpenOrders`) are built on. The name used to be
+/// `sign_account_read`, which read as "reads only" and alarmed reviewers when
+/// the DELETE went through it. It is NOT a read-only channel and does not need
+/// to be: the ENCLAVE enforces the policy on the forwarded method + path
+/// (`allowed_methods`, `allowed_path_prefixes`, withdrawal deny-list — CR051),
+/// so a capped key gets exactly what its policy permits regardless of which
+/// gateway helper assembled the request. A gateway that lied about the method
+/// would be refused by the enclave, not trusted.
+pub(crate) async fn sign_generic_venue_request(
+    state: &AppState,
+    customer_id: &str,
+    raw_token: &str,
+    venue: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    query: &str,
+) -> Result<std::collections::BTreeMap<String, String>, Response> {
+    // 1. Resolve the enclave action for this venue (Some unknown venue → 400).
+    //    /account is signed-read only; `kind` is None.
+    let action = match enclave_action_for(venue, None) {
+        Some(a) => a,
+        None => return Err(error_response(err_code::BAD_REQUEST)),
+    };
+
+    // 2. Blob lookup — tenant-scoped (customer × venue), no cross-customer
+    //    fall-through. Backoff keyed identically below.
+    let scope = blob_key(customer_id, venue);
+    let blob = match state.blobs.get(&scope) {
+        Some(b) => b,
+        None => {
+            warn!(event = "account_blob_missing", venue = %venue);
+            return Err(error_response(err_code::BAD_REQUEST));
+        }
+    };
+
+    // 3. Adaptive backoff (parity with /sign and /sign-x402).
+    if !state.backoff.allow(&scope) {
+        warn!(event = "account_backoff_rejected", venue = %venue);
+        return Err(error_response(err_code::RATE_LIMITED));
+    }
+
+    // 4. Fresh AWS creds.
+    let creds = match state.creds.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(event = "account_creds_failed", venue = %venue, detail = %e);
+            return Err(error_response(err_code::INTERNAL_ERROR));
+        }
+    };
+
+    // 5. Build the vsock request. Body and query are caller-supplied so the
+    //    helper stays generic across read endpoints.
+    let vsock_req = VsockRequest {
+        action: action.to_owned(),
+        method: Some(method.to_owned()),
+        path: Some(path.to_owned()),
+        body: Some(body.to_owned()),
+        timestamp_ms: Some(now_ms()),
+        aws_credentials: Some(AwsCredentials {
+            access_key_id: creds.access_key_id.clone(),
+            secret_access_key: creds.secret_access_key.clone(),
+            session_token: creds.session_token.clone(),
+        }),
+        ciphertext_blob_base64: Some(B64.encode(blob.ciphertext.as_slice())),
+        proto_version: 1,
+        op: None,
+        payload: None,
+        opaque_token: Some(raw_token.to_owned()),
+        key_blob_s3_key: Some(format!("secrets/{}.enc", venue)),
+        query: if query.is_empty() {
+            None
+        } else {
+            Some(query.to_owned())
+        },
+        hl_action: None,
+        nonce: None,
+        vault_address: None,
+        x402: None,
+        order: None,
+        cancel: None,
+        data: None,
+        intent_signature: None,
+        intent_nonce: None,
+        client_nonce: None,
+        attestation_nonce: None,
+        attestation_user_data: None,
+    };
+
+    // 6. Round-trip.
+    let vsock_started = Instant::now();
+    let resp = vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await;
+    let vsock_latency_ms = vsock_started.elapsed().as_millis() as u64;
+    let mut resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(event = "account_vsock_failed", venue = %venue, latency_ms = vsock_latency_ms, detail = %e);
+            return Err(error_response(err_code::ENCLAVE_UNREACHABLE));
+        }
+    };
+
+    // 7. Errors → allow-listed wire surface (CR037/CR049 parity). The receipt
+    //    is ARCHIVED here for reads; returning it to the caller on the read
+    //    routes (SignedVenueRequest) is a follow-up — the archive is complete.
+    let receipt = take_receipt(&mut resp, customer_id);
+    if let Some(code) = resp.error.as_deref() {
+        let mapped = crate::proto::safe_wire_code(code);
+        if mapped == err_code::RATE_LIMITED {
+            state.backoff.report_rate_limited(&scope);
+        }
+        warn!(
+            event = "account_enclave_error",
+            venue = %venue,
+            internal_code = code,
+            wire_code = mapped,
+            vsock_latency_ms,
+        );
+        return Err(enclave_error_response(mapped, receipt));
+    }
+
+    state.backoff.report_success(&scope);
+    Ok(resp.headers.take().unwrap_or_default())
 }
 
 #[cfg(test)]
