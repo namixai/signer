@@ -112,6 +112,28 @@ const HEADER_READ_TIMEOUT_SECS: u64 = 2;
 /// /sign in flight at peak in dogfood).
 const MAX_CONCURRENT_REQUESTS: usize = 256;
 
+/// In-flight cap for the OPERATOR tier (`/sign-data`, `/verify-blob`) — its own
+/// pool, deliberately much smaller than the money tier's.
+///
+/// Why a separate pool at all (Alex, 2026-09-05, as a condition of enabling the
+/// attested-snapshot path): the marketplace signs ~1757 snapshots per cycle
+/// through `/sign-data`. Sharing one bounded pool with `/sign` means a slow
+/// enclave, a retry storm, or simply a long cycle can hold slots that money
+/// traffic then cannot get — and load-shed answers `/sign` with 503 for a reason
+/// that has nothing to do with trading. Operator work must not be able to shed
+/// the money path; the reverse is acceptable.
+///
+/// Why 32: the caller is synchronous, one snapshot at a time, so this is already
+/// an order of magnitude above its real concurrency — it bounds a runaway, it
+/// does not shape normal traffic. Raise it if a legitimate operator client ever
+/// needs more; the number that must NOT move is the money tier's.
+const MAX_CONCURRENT_OPERATOR_REQUESTS: usize = 32;
+
+/// Compile-time, not a test: equal or larger would make the split real but
+/// pointless — operator work could again shed the money path. A build that gets
+/// this wrong must not exist, rather than fail a test someone can skip.
+const _: () = assert!(MAX_CONCURRENT_OPERATOR_REQUESTS < MAX_CONCURRENT_REQUESTS);
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -366,11 +388,27 @@ async fn main() -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
+    // Same stack, own pool: the operator tier cannot starve the money tier, and a
+    // money-path flood cannot lock the operator out of `/verify-blob` either.
+    let operator_hardening = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_middleware_error))
+        .load_shed()
+        .concurrency_limit(MAX_CONCURRENT_OPERATOR_REQUESTS)
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ));
+
+    let operator_router = operator_router
+        .layer(TraceLayer::new_for_http())
+        .layer(operator_hardening)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+
     let api_router = sign_router
-        .merge(operator_router)
         .layer(TraceLayer::new_for_http())
         .layer(dos_hardening)
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+        .merge(operator_router);
 
     // Q2a (attested-data): fail-loud at boot if the provisioned data-signing key
     // drifts from the published pubkey. Runs BEFORE `state` is moved into the
@@ -1086,6 +1124,54 @@ mod tests {
     ///
     /// Paths are read from this file's own source rather than listed here, so a
     /// route added tomorrow is covered without anyone remembering to add it.
+    /// The operator tier must keep its OWN in-flight pool, and the money tier's
+    /// must stay the larger of the two.
+    ///
+    /// Condition of enabling the attested-snapshot path (Alex, 2026-09-05): the
+    /// marketplace signs ~1757 snapshots per cycle on `/sign-data`. On one shared
+    /// pool that work can hold slots `/sign` then cannot get, and load-shed answers
+    /// money traffic with 503 for a reason that has nothing to do with trading.
+    ///
+    /// Guarded here because it is easy to undo by accident: merging
+    /// `operator_router` into `api_router` BEFORE the layers silently puts it back
+    /// on the money pool, and nothing else would notice.
+    #[test]
+    fn the_operator_tier_has_its_own_smaller_pool() {
+        // The size relation is a compile-time assert next to the constants; this
+        // test guards the WIRING, which the compiler cannot see.
+        let src = include_str!("main.rs");
+        // `concat!` so these needles do not match themselves in this test's own text.
+        let hardening = concat!("let operator_hardening = ", "ServiceBuilder::new()");
+        assert_eq!(
+            src.matches(hardening).count(),
+            1,
+            "the operator tier must build its own hardening stack exactly once"
+        );
+        // The merge has to come AFTER the money tier's layers: `.merge()` before
+        // them would wrap the operator routes in `dos_hardening` again.
+        let layers = src
+            .find(concat!(".layer(", "dos_hardening)"))
+            .expect("the money tier applies dos_hardening");
+        // No trailing `;` in the needle: another layer chained after the merge is a
+        // legitimate edit, and a guard that goes red for it would train people to
+        // delete the guard (Gemini, #83).
+        let merge_needle = concat!(".merge(", "operator_router)");
+        assert_eq!(
+            src.matches(merge_needle).count(),
+            1,
+            "the operator router must be merged exactly once, or the position \
+             comparison below would test an arbitrary one of several merges"
+        );
+        let merge = src
+            .find(merge_needle)
+            .expect("api_router merges the operator router");
+        assert!(
+            merge > layers,
+            "operator_router is merged BEFORE the money tier's layers, which puts it \
+             back on the shared pool — merge it after, so it keeps operator_hardening"
+        );
+    }
+
     #[test]
     fn every_route_path_is_valid_for_the_linked_axum() {
         for path in route_paths(include_str!("main.rs")) {
