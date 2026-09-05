@@ -478,6 +478,19 @@ pub struct OrderParams {
     pub price: Option<String>,
     #[serde(default)]
     pub reduce_only: bool,
+    /// Client-supplied idempotency key, forwarded verbatim to the enclave, which
+    /// binds it INTO the signed body (`newClientOrderId` on Binance, `clOrdId` on
+    /// OKX) — so a retried order with the same id is deduplicated by the venue
+    /// instead of opening a second position.
+    ///
+    /// 🔴 The enclave has accepted this since PR-B; the gateway was dropping it on
+    /// the floor, because `OrderParams` had no such field and `deny_unknown_fields`
+    /// rejected callers who tried. Found 2026-09-05 while routing the keyless
+    /// Hummingbot shim onto this endpoint: a bot that cannot set its own order id
+    /// cannot reconcile its own orders, which turns "place an order" into "place an
+    /// order and lose track of it". Optional, so nothing that worked before changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
 }
 
 /// Same dropped-typo'd-field rationale as `OrderParams`.
@@ -1068,6 +1081,51 @@ pub fn timestamp_in_window(now_ms: u64, ts_ms: u64) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `client_order_id` must SURVIVE serialization, and must stay absent when
+    /// the caller does not set it.
+    ///
+    /// The enclave has accepted this field since PR-B and binds it into the signed
+    /// body (`newClientOrderId`). The gateway was dropping it: `OrderParams` had no
+    /// such field, and `deny_unknown_fields` rejected callers who tried to pass one.
+    /// A bot that cannot set its own order id cannot reconcile its own orders.
+    #[test]
+    fn order_params_carry_the_client_order_id_through() {
+        let with = OrderParams {
+            symbol: "BTCUSDT".into(),
+            side: "buy".into(),
+            qty: "0.002".into(),
+            ord_type: "limit".into(),
+            price: Some("50000".into()),
+            reduce_only: false,
+            client_order_id: Some("hbot-abc-123".into()),
+        };
+        let v = serde_json::to_value(&with).expect("OrderParams serializes");
+        assert_eq!(
+            v.get("client_order_id").and_then(|x| x.as_str()),
+            Some("hbot-abc-123"),
+            "the id must reach the enclave — this is the whole point of the field"
+        );
+
+        let without = OrderParams {
+            client_order_id: None,
+            ..with
+        };
+        let v = serde_json::to_value(&without).expect("OrderParams serializes");
+        assert!(
+            v.get("client_order_id").is_none(),
+            "absent must stay absent: the enclave treats a missing id differently \
+             from an empty one, and pre-existing callers must serialize unchanged"
+        );
+
+        // And a caller may still pass it in: `deny_unknown_fields` would reject an
+        // unknown key, so this also pins the wire NAME.
+        let parsed: OrderParams = serde_json::from_str(
+            r#"{"symbol":"BTCUSDT","side":"buy","qty":"0.002","ord_type":"market","client_order_id":"x-1"}"#,
+        )
+        .expect("client_order_id is an accepted wire field");
+        assert_eq!(parsed.client_order_id.as_deref(), Some("x-1"));
+    }
 
     #[test]
     fn health_response_serializes_sign_liveness_fields() {

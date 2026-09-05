@@ -807,6 +807,9 @@ mod tests {
                 ord_type: ord_type.to_owned(),
                 price: None,
                 reduce_only: false,
+                // /hedge mints its own idempotency key per leg (PR-B); this test
+                // helper builds the spec BEFORE that step.
+                client_order_id: None,
             },
         }
     }
