@@ -1654,7 +1654,7 @@ fn binance_request_wire_error(
     (enclave_error_response(mapped, receipt), mapped)
 }
 
-//// Classify a `/sign/binance-request` op for the per-tenant kill switch.
+/// Classify a `/sign/binance-request` op for the per-tenant kill switch.
 ///
 /// 🔴 POSITIVE list, and only the GET reads are `Read`.
 ///
