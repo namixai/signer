@@ -1152,8 +1152,18 @@ mod tests {
         let layers = src
             .find(concat!(".layer(", "dos_hardening)"))
             .expect("the money tier applies dos_hardening");
+        // No trailing `;` in the needle: another layer chained after the merge is a
+        // legitimate edit, and a guard that goes red for it would train people to
+        // delete the guard (Gemini, #83).
+        let merge_needle = concat!(".merge(", "operator_router)");
+        assert_eq!(
+            src.matches(merge_needle).count(),
+            1,
+            "the operator router must be merged exactly once, or the position \
+             comparison below would test an arbitrary one of several merges"
+        );
         let merge = src
-            .find(concat!(".merge(", "operator_router);"))
+            .find(merge_needle)
             .expect("api_router merges the operator router");
         assert!(
             merge > layers,
