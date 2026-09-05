@@ -1654,7 +1654,40 @@ fn binance_request_wire_error(
     (enclave_error_response(mapped, receipt), mapped)
 }
 
-/// `POST /sign/binance-request` — the keyless-Hummingbot generic primitive.
+//// Classify a `/sign/binance-request` op for the per-tenant kill switch.
+///
+/// 🔴 POSITIVE list, and only the GET reads are `Read`.
+///
+/// The first version of this gate read `_ => RouteClass::Read`, which was wrong
+/// twice over (CTO gate on #82). An UNKNOWN op fell through to "read" and passed
+/// the stop — absence voting for the permissive default, the exact class of defect
+/// we keep paying for. And worse, three KNOWN ops are not reads at all: `leverage`
+/// and `positionMode` are POSTs that change risk (`/fapi/v1/leverage`,
+/// `/fapi/v1/positionSide/dual`), and `listenKey` opens a stream. Raising leverage
+/// while the tenant is in CANCEL_ONLY is exposure-increasing by any reading of the
+/// word.
+///
+/// So: order and cancel by name, the six GET reads by name, and EVERYTHING else —
+/// writes we did not name, and ops that do not exist yet — is `Unknown`, which
+/// CANCEL_ONLY refuses. A new op added to the enclave's allow-list is refused here
+/// until someone classifies it deliberately; that is the safe direction to be
+/// wrong in.
+///
+/// Names mirror the enclave's positive allow-list
+/// (`enclave/src/handler.rs`, `binance_request_method_path`).
+pub(crate) fn classify_binance_op(op: &str) -> crate::tenant_state::RouteClass {
+    use crate::tenant_state::RouteClass;
+    match op {
+        "order" => RouteClass::Order,
+        "cancel" | "allOpenOrders" => RouteClass::Cancel,
+        "account" | "positionRisk" | "openOrders" | "orderStatus" | "userTrades" | "income" => {
+            RouteClass::Read
+        }
+        _ => RouteClass::Unknown,
+    }
+}
+
+// `POST /sign/binance-request` — the keyless-Hummingbot generic primitive.
 /// Forwards `{op, payload}` to the enclave (`sign_binance_request`), which
 /// allow-lists the op's params (positive per-op whitelist — refuses smuggled
 /// withdraw/transfer payloads BEFORE signing), enforces the blob policy, and
@@ -1696,12 +1729,7 @@ pub async fn post_sign_binance_request(
     // the declared op sound (a mislabelled order-shaped payload is refused
     // there before signing).
     {
-        use crate::tenant_state::RouteClass;
-        let class = match req.op.as_str() {
-            "order" => RouteClass::Order,
-            "cancel" => RouteClass::Cancel,
-            _ => RouteClass::Read,
-        };
+        let class = classify_binance_op(req.op.as_str());
         if let Some((resp, code)) = crate::tenant_state::body_route_gate(&state, &customer, class) {
             return finish_log(resp, started, false, Some(code));
         }
@@ -3825,6 +3853,57 @@ mod tests {
     /// would then echo a value the client never chose, and the echo IS the
     /// freshness proof. A later `trim()` would break that silently; this test
     /// makes it fail loudly instead.
+    /// Every op the enclave will accept must be classified DELIBERATELY, and an
+    /// unknown one must land in `Unknown` — which `CANCEL_ONLY` refuses.
+    ///
+    /// Two defects this locks out, both found on #82 by the CTO gate:
+    ///  * `_ => Read` let an UNKNOWN op through a stopped tenant — absence voting
+    ///    for the permissive default;
+    ///  * it also called `leverage`, `positionMode` and `listenKey` reads. The
+    ///    first two are POSTs that change risk. Raising leverage on a tenant in
+    ///    CANCEL_ONLY is exposure-increasing by any reading of the word.
+    ///
+    /// If a new op is added to the enclave and not here, this test does not fail —
+    /// but the gate refuses it, which is the safe direction.
+    #[test]
+    fn binance_request_ops_are_classified_by_a_positive_list() {
+        use crate::tenant_state::RouteClass;
+        // The handler's own function, not a copy of it: a copy would keep passing
+        // after the gate itself changed.
+        let classify = super::classify_binance_op;
+        assert_eq!(classify("order"), RouteClass::Order);
+        for op in ["cancel", "allOpenOrders"] {
+            assert_eq!(classify(op), RouteClass::Cancel, "{op} reduces exposure");
+        }
+        for op in [
+            "account",
+            "positionRisk",
+            "openOrders",
+            "orderStatus",
+            "userTrades",
+            "income",
+        ] {
+            assert_eq!(classify(op), RouteClass::Read, "{op} is a GET read");
+        }
+        // The three that used to be miscounted as reads.
+        for op in ["leverage", "positionMode", "listenKey"] {
+            assert_eq!(
+                classify(op),
+                RouteClass::Unknown,
+                "{op} is a POST that changes risk or opens a stream — it must NOT be \
+                 classified as a read, or a CANCEL_ONLY tenant could still use it"
+            );
+        }
+        // And anything nobody has thought about yet.
+        for op in ["", "withdraw", "transfer", "futureOpNobodyWroteYet"] {
+            assert_eq!(
+                classify(op),
+                RouteClass::Unknown,
+                "an unclassified op must be Unknown, never Read"
+            );
+        }
+    }
+
     #[test]
     fn heartbeat_nonce_rule_is_pinned_including_the_no_trim_promise() {
         assert!(heartbeat_nonce_ok("aZ0-_"), "the allowed charset must pass");
