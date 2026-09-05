@@ -61,7 +61,7 @@ fn take_receipt(
     receipt
 }
 
-fn error_response(code: &str) -> Response {
+pub(crate) fn error_response(code: &str) -> Response {
     let status =
         StatusCode::from_u16(http_status_for(code)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(ErrorResponse::new(code))).into_response()
@@ -264,6 +264,26 @@ pub async fn post_sign(
             );
         }
     };
+
+    // Per-tenant kill switch, body half. The path-classified middleware let
+    // `/sign` through in CANCEL_ONLY because the class lives in `kind`; now that
+    // the action is known, settle it. HL `*_order` is an order; HL `*_cancel`
+    // reduces exposure; an OPAQUE HMAC body (kind=None) is unclassifiable here
+    // and could place an order → denied in CANCEL_ONLY (fail-closed). HALTED
+    // never reaches this point (middleware denies).
+    {
+        use crate::tenant_state::RouteClass;
+        let class = if action.ends_with("_order") {
+            RouteClass::Order
+        } else if action.ends_with("_cancel") {
+            RouteClass::Cancel
+        } else {
+            RouteClass::Unknown
+        };
+        if let Some((resp, code)) = crate::tenant_state::body_route_gate(&state, &customer, class) {
+            return finish_log(resp, started, false, Some(code));
+        }
+    }
 
     // B3 (б): Hyperliquid ORDER actions place orders through this generic
     // route — count them against the per-token daily cap. Explicit action
@@ -1634,7 +1654,40 @@ fn binance_request_wire_error(
     (enclave_error_response(mapped, receipt), mapped)
 }
 
-/// `POST /sign/binance-request` — the keyless-Hummingbot generic primitive.
+//// Classify a `/sign/binance-request` op for the per-tenant kill switch.
+///
+/// 🔴 POSITIVE list, and only the GET reads are `Read`.
+///
+/// The first version of this gate read `_ => RouteClass::Read`, which was wrong
+/// twice over (CTO gate on #82). An UNKNOWN op fell through to "read" and passed
+/// the stop — absence voting for the permissive default, the exact class of defect
+/// we keep paying for. And worse, three KNOWN ops are not reads at all: `leverage`
+/// and `positionMode` are POSTs that change risk (`/fapi/v1/leverage`,
+/// `/fapi/v1/positionSide/dual`), and `listenKey` opens a stream. Raising leverage
+/// while the tenant is in CANCEL_ONLY is exposure-increasing by any reading of the
+/// word.
+///
+/// So: order and cancel by name, the six GET reads by name, and EVERYTHING else —
+/// writes we did not name, and ops that do not exist yet — is `Unknown`, which
+/// CANCEL_ONLY refuses. A new op added to the enclave's allow-list is refused here
+/// until someone classifies it deliberately; that is the safe direction to be
+/// wrong in.
+///
+/// Names mirror the enclave's positive allow-list
+/// (`enclave/src/handler.rs`, `binance_request_method_path`).
+pub(crate) fn classify_binance_op(op: &str) -> crate::tenant_state::RouteClass {
+    use crate::tenant_state::RouteClass;
+    match op {
+        "order" => RouteClass::Order,
+        "cancel" | "allOpenOrders" => RouteClass::Cancel,
+        "account" | "positionRisk" | "openOrders" | "orderStatus" | "userTrades" | "income" => {
+            RouteClass::Read
+        }
+        _ => RouteClass::Unknown,
+    }
+}
+
+// `POST /sign/binance-request` — the keyless-Hummingbot generic primitive.
 /// Forwards `{op, payload}` to the enclave (`sign_binance_request`), which
 /// allow-lists the op's params (positive per-op whitelist — refuses smuggled
 /// withdraw/transfer payloads BEFORE signing), enforces the blob policy, and
@@ -1670,6 +1723,18 @@ pub async fn post_sign_binance_request(
     // Gating on the DECLARED op is sound because the enclave's positive
     // per-op param allow-list refuses an order-shaped payload under any
     // other declared op before signing. Reads/cancel are not counted.
+    // Per-tenant kill switch, body half: gate on the DECLARED op. In
+    // CANCEL_ONLY an `order` op is refused, `cancel` and read-only ops go
+    // through. The enclave's per-op param allow-list is what makes gating on
+    // the declared op sound (a mislabelled order-shaped payload is refused
+    // there before signing).
+    {
+        let class = classify_binance_op(req.op.as_str());
+        if let Some((resp, code)) = crate::tenant_state::body_route_gate(&state, &customer, class) {
+            return finish_log(resp, started, false, Some(code));
+        }
+    }
+
     if req.op == "order" {
         if let Some((resp, code)) = order_gate(&state, &raw_token).await {
             return finish_log(resp, started, false, Some(code));
@@ -2816,7 +2881,7 @@ pub(crate) fn okx_is_demo() -> bool {
 #[allow(clippy::result_large_err)]
 // Response is the canonical wire type — boxing adds indirection (same allow as enclave's enforce_policy).
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
-async fn sign_account_read(
+pub(crate) async fn sign_account_read(
     state: &AppState,
     customer_id: &str,
     raw_token: &str,
@@ -2909,7 +2974,11 @@ async fn sign_account_read(
         }
     };
 
-    // 7. Errors → allow-listed wire surface (CR037/CR049 parity).
+    // 7. Errors → allow-listed wire surface (CR037/CR049 parity). The receipt is
+    //    ARCHIVED here for reads too — every enclave decision leaves one, and a
+    //    read that was refused is a decision. Returning it to the caller on these
+    //    routes (SignedVenueRequest) is a follow-up; the archive is complete.
+    let receipt = take_receipt(&mut resp, customer_id);
     if let Some(code) = resp.error.as_deref() {
         let mapped = crate::proto::safe_wire_code(code);
         if mapped == err_code::RATE_LIMITED {
@@ -2922,7 +2991,7 @@ async fn sign_account_read(
             wire_code = mapped,
             vsock_latency_ms,
         );
-        return Err(enclave_error_response(mapped, None));
+        return Err(enclave_error_response(mapped, receipt));
     }
 
     state.backoff.report_success(&scope);
@@ -3174,7 +3243,7 @@ pub async fn get_account(
 /// Leaves only `X-MBX-APIKEY` in `headers`. Wrong order = invalid signature.
 /// Returns the `err_code` (`&'static str`) on failure — the caller maps it to the
 /// wire response (avoids returning a heavy `Response` from a small helper).
-fn binance_signed_url(
+pub(crate) fn binance_signed_url(
     path: &str,
     user_query: &str,
     headers: &mut std::collections::BTreeMap<String, String>,
@@ -3771,6 +3840,7 @@ fn finish_log(
     resp
 }
 
+#[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
 #[cfg(test)]
 mod tests {
 
@@ -3783,6 +3853,57 @@ mod tests {
     /// would then echo a value the client never chose, and the echo IS the
     /// freshness proof. A later `trim()` would break that silently; this test
     /// makes it fail loudly instead.
+    /// Every op the enclave will accept must be classified DELIBERATELY, and an
+    /// unknown one must land in `Unknown` — which `CANCEL_ONLY` refuses.
+    ///
+    /// Two defects this locks out, both found on #82 by the CTO gate:
+    ///  * `_ => Read` let an UNKNOWN op through a stopped tenant — absence voting
+    ///    for the permissive default;
+    ///  * it also called `leverage`, `positionMode` and `listenKey` reads. The
+    ///    first two are POSTs that change risk. Raising leverage on a tenant in
+    ///    CANCEL_ONLY is exposure-increasing by any reading of the word.
+    ///
+    /// If a new op is added to the enclave and not here, this test does not fail —
+    /// but the gate refuses it, which is the safe direction.
+    #[test]
+    fn binance_request_ops_are_classified_by_a_positive_list() {
+        use crate::tenant_state::RouteClass;
+        // The handler's own function, not a copy of it: a copy would keep passing
+        // after the gate itself changed.
+        let classify = super::classify_binance_op;
+        assert_eq!(classify("order"), RouteClass::Order);
+        for op in ["cancel", "allOpenOrders"] {
+            assert_eq!(classify(op), RouteClass::Cancel, "{op} reduces exposure");
+        }
+        for op in [
+            "account",
+            "positionRisk",
+            "openOrders",
+            "orderStatus",
+            "userTrades",
+            "income",
+        ] {
+            assert_eq!(classify(op), RouteClass::Read, "{op} is a GET read");
+        }
+        // The three that used to be miscounted as reads.
+        for op in ["leverage", "positionMode", "listenKey"] {
+            assert_eq!(
+                classify(op),
+                RouteClass::Unknown,
+                "{op} is a POST that changes risk or opens a stream — it must NOT be \
+                 classified as a read, or a CANCEL_ONLY tenant could still use it"
+            );
+        }
+        // And anything nobody has thought about yet.
+        for op in ["", "withdraw", "transfer", "futureOpNobodyWroteYet"] {
+            assert_eq!(
+                classify(op),
+                RouteClass::Unknown,
+                "an unclassified op must be Unknown, never Read"
+            );
+        }
+    }
+
     #[test]
     fn heartbeat_nonce_rule_is_pinned_including_the_no_trim_promise() {
         assert!(heartbeat_nonce_ok("aZ0-_"), "the allowed charset must pass");

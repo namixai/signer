@@ -1008,7 +1008,7 @@ fn store_daily_state(path: &Path, state: &DailyState) -> std::io::Result<()> {
 /// configured `x.tmp` would make tmp == target and truncate it in place,
 /// breaking the atomicity — Gemini #223). Used by BOTH the daily counter and
 /// the H2 x402 spend accumulator.
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = PathBuf::from(tmp_name);
