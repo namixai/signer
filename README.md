@@ -144,8 +144,8 @@ actually guarantees before leaning on it:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
 - **Canonical owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Active on-chain, production lane**: `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — `isPCR0Active` re-read on
-  2026-09-06, owned by the owner
+- **Active on-chain, production lane**: `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — `isPCR0Active` re-read 2026-09-06;
+  registered in Base block `50817711` (2026-09-03 08:39 UTC), owned by the owner
   above. That is what the registry says. What a box is *running* is a separate fact from
   a separate source: that box's `/attestation`. This file used to print one number for
   both, and that is how it went stale.
