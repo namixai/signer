@@ -414,12 +414,14 @@ nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
 # Compare the output to the LIVE /attestation document, not to a number printed
 # in this file and not to the on-chain registry entry — both can lag the running
 # enclave, and as of 2026-08-06 the registry entry does (see Step 4).
-# Expected for the strict build at commit 96cd4e46, which is the MAINNET/PRODUCTION
-# enclave as of 2026-08-24:
+# Expected for the strict build at commit 96cd4e46, which WAS the MAINNET/PRODUCTION
+# enclave from 2026-08-24 to 2026-09-03; production moved to tag pcr0-60036cd3 on
+# 2026-09-03, so read the current one from the registry and that box's /attestation:
 #   103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
 # The demo endpoint is a SEPARATE box that rotates on its own schedule: it ran the
 # pre-rotation image from 2026-08-24 until 2026-08-27. One number stopped covering both
-# boxes on 2026-08-24, covers both again since 2026-08-27, and can stop in any window.
+# boxes on 2026-08-24, covered both again from 2026-08-27, and stopped once more on
+# 2026-09-03 when production rotated and the demo box did not. Never assume one covers both.
 # Build the commit you mean to check, and compare against that box's own /attestation.
 ```
 
