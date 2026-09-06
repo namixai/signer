@@ -347,7 +347,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 >
 > | build | PCR0 |
 > |---|---|
-> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `103ccd79…` on tag `pcr0-103ccd79` — **the strict build; this is the flag the production lane runs** |
+> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `103ccd79…` on tag `pcr0-103ccd79` — **the strict build.** The flag is what production runs; this particular measurement ran production 2026-08-24 → 2026-09-03 |
 > | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh` | `9f80b8d4…` — not deployed anywhere |
 >
 > The strict value is measured on commit `96cd4e46` (production 2026-08-24 → 2026-09-03), the
