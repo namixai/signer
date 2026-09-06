@@ -108,11 +108,13 @@ sdk/
 
 > ## What the registry says, and how to hold a live box to it
 >
-> Every row re-measured against Base on **2026-08-27**, with the `cast` call below:
+> The two production-lane rows were re-measured against Base on **2026-09-06**; the
+> retired rows on **2026-08-27**. The `cast` call below is what re-measures them:
 >
 > | PCR0 | what it is | `isPCR0Active` → `(active, owner)` |
 > |---|---|---|
-> | `103ccd79…` | **production**, since rotation #4 on 2026-08-24 | **`(true, 0x21538eBF…)`** |
+> | `60036cd3…` | **production**, since the cutover on 2026-09-03 | **`(true, 0x21538eBF…)`** |
+> | `103ccd79…` | production 2026-08-24 → 2026-09-03; the demo box runs it today | `(false, 0x0000…0000)` — deregistered |
 > | `32d25d8c…` | production 2026-08-10 → 08-24, then the demo box alone until 2026-08-27 | `(false, 0x0000…0000)` |
 > | `7c9e8b26…` | registered 2026-06-23, auto-deprecated | `(false, 0x0000…0000)` |
 > | `ff53e1fe…` | retired 2026-08-10 | `(false, 0x0000…0000)` |
@@ -142,7 +144,8 @@ actually guarantees before leaning on it:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
 - **Canonical owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Active on-chain, production lane**: `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — registered 2026-08-24 by the owner
+- **Active on-chain, production lane**: `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — `isPCR0Active` re-read on
+  2026-09-06, owned by the owner
   above. That is what the registry says. What a box is *running* is a separate fact from
   a separate source: that box's `/attestation`. This file used to print one number for
   both, and that is how it went stale.
@@ -210,7 +213,7 @@ cast call 0x38b42eED740b0fDeb211bBDf773F2238cAEec240 \
 # → true
 #   0x21538eBF6598e5866BA496A954dE8E39097bFB59
 # BOTH lines must match: `false` or a different owner = stop, do not use the service.
-# The production lane has been 0x103ccd79de6c… since 2026-08-24. Whether the demo box is
+# Which measurement the production lane holds is what this call answers. Whether the demo box is
 # on the same measurement depends on where the rotation windows fall — which is why the
 # value above is read from /attestation rather than pasted out of this file.
 ```
@@ -325,9 +328,9 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > |---|---|---|
 > | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — previous production (2026-08-10 → 2026-08-24) |
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
-> | tag `pcr0-103ccd79` = commit `96cd4e46` (2026-08-23, merge of #55) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured 2026-08-23/26; deployed to production 2026-08-24 → 2026-09-03 |
-> | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
-> | commit `1207d37` (2026-08-19, current `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9` — **not deployed**; differs because `anyhow` and `thiserror` were bumped after the measurement |
+> | tag `pcr0-103ccd79` = commit `96cd4e46` (2026-08-23, merge of #55) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured 2026-08-23/26; **previously** deployed to production 2026-08-24 → 2026-09-03, deregistered since |
+> | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; **production since 2026-09-03**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
+> | commit `1207d37` (2026-08-19, on the `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | a previous measurement that **belongs to no lane — never deployed, never registered**: `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9`. HEAD no longer reproduces it: `anyhow` and `thiserror` were bumped after it was taken |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
 > production number. Anyone who followed it got `b502601b…` and had every reason to
@@ -344,10 +347,10 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 >
 > | build | PCR0 |
 > |---|---|
-> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `103ccd79…` — **this is production** |
+> | `SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh` | `103ccd79…` on tag `pcr0-103ccd79` — **the strict build; this is the flag the production lane runs** |
 > | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0 ./scripts/build-eif.sh` | `9f80b8d4…` — not deployed anywhere |
 >
-> The strict value is measured on commit `96cd4e46` (production since 2026-08-24), the
+> The strict value is measured on commit `96cd4e46` (production 2026-08-24 → 2026-09-03), the
 > permissive one on `db68182`. Measured, not asserted, and each measurement belongs to
 > the commit it was taken on. Set **both** variables
 > explicitly for the permissive build: the script honours whatever
@@ -406,7 +409,7 @@ For Hyperliquid EIP-712 signing, see `poc/enclave/src/signer.rs::tests::action_h
 
 **Mainnet, operator's own funds only (dogfood).** Three venues have signed on mainnet: Binance USD-M (completed round trip 2026-07-27), Hyperliquid (enclave-born agent key 2026-08-16, completed round trip 2026-08-19), OKX (signed, accepted into the book and cancelled 2026-08-18 — never filled; an hourly place→verify→cancel timer has run clean since). KuCoin, Bybit and Asterdex have adapters but no mainnet key; under a capped policy their generic path is fail-closed. Zero paying customers, zero third-party money in production, no external audit. EIP-712 signing is verified byte-for-byte against the official Hyperliquid SDK.
 
-Production PCR0: `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` (since 2026-08-24; tag `pcr0-103ccd79`)
+Production PCR0: deliberately not printed here. This line still named `103ccd79…` on 2026-09-06, three days after that measurement left the production lane — the same way every earlier number in this file went stale while the mechanism behind it was fine. Read it from the registry (`isPCR0Active` + owner, command above) and from the box's own `/attestation`.
 
 Check it yourself rather than taking this file's word for it — `/attestation` returns an
 NSM-signed COSE document carrying the running measurement, and it is the authority here.
