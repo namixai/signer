@@ -278,7 +278,7 @@ async fn sign_leg(
 
 // ── Execute phase ──
 
-fn venue_client() -> &'static reqwest::Client {
+pub(crate) fn venue_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -364,7 +364,7 @@ fn classify_receipt(venue: &str, parsed: &serde_json::Value) -> LegOutcome {
 /// `resp.bytes()` would buffer an arbitrarily large venue/WAF body BEFORE any
 /// size check (OOM lever — Gemini/CodeRabbit #152 round 2); streaming lets us
 /// abort the read the moment the cap is crossed.
-async fn read_capped_body(resp: &mut reqwest::Response) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_capped_body(resp: &mut reqwest::Response) -> Result<Vec<u8>, String> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         match resp.chunk().await {
@@ -401,6 +401,27 @@ fn leg_result(
         error,
         duration_ms: Some(duration_ms),
     }
+}
+
+/// Format a venue transport error WITHOUT echoing the request URL.
+///
+/// `reqwest`'s `Display` prints the URL it was handed — `error sending request
+/// for url (https://…?…&signature=…)`. Binance signs its GET and DELETE calls
+/// in the QUERY STRING, so on those routes the URL carries a live HMAC. Echoed
+/// verbatim it lands in the client's error AND in our own logs, which is the
+/// one place a signature has no business being: log retention outlives the
+/// signature's validity window by orders of magnitude.
+///
+/// The comment this replaces read "reqwest errors don't include response
+/// bodies; safe to echo". True about bodies, and about a different thing.
+///
+/// Measured on this reqwest version rather than assumed: `is_connect()` still
+/// answers correctly AFTER `without_url()`, so stripping does not blur the
+/// rejected/unknown split that decides whether an order may be live at the
+/// venue. Callers still read the classification first — it costs nothing, and
+/// correctness should not rest on an internal detail a version bump can change.
+pub(crate) fn transport_error_detail(prefix: &str, e: reqwest::Error) -> String {
+    format!("{prefix}: {}", e.without_url())
 }
 
 async fn execute_leg(mut leg: SignedLeg) -> HedgeLegResult {

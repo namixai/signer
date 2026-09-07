@@ -23,7 +23,9 @@ mod hedge;
 mod limits;
 mod proto;
 mod receipts;
+mod reconcile;
 mod state;
+mod tenant_state;
 mod vsock;
 
 use anyhow::{Context, Result};
@@ -210,7 +212,26 @@ async fn main() -> Result<()> {
     // Attested-signed-data (P2): the enclave opaque_token forwarded for sign_data
     // (resolves to the data-signing service identity). None until provisioned.
     .with_data_signing_token(std::env::var("SIGNER_DATA_SIGNING_TOKEN").ok())
-    .with_limits(b3_limits);
+    .with_limits(b3_limits)
+    .with_tenants({
+        let path = std::env::var(tenant_state::STATE_PATH_ENV)
+            .ok()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| tenant_state::DEFAULT_STATE_PATH.to_owned());
+        let store = tenant_state::TenantStateStore::load(std::path::PathBuf::from(&path))
+            .with_context(|| format!("load tenant-state file {path}"))?;
+        // Prove the path is WRITABLE at boot (same discipline as the daily
+        // counter): an unwritable /var/lib/signer must fail here, not at the
+        // first halt.
+        store.boot_probe().with_context(|| {
+            format!(
+                "tenant-state file {path} is not writable ({})",
+                tenant_state::STATE_PATH_ENV
+            )
+        })?;
+        store
+    });
 
     // C22 (ZLODEY 2026-05-18): load bearer-token config and apply to /sign.
     // Healthz stays unauthenticated for Cloudflare/AWS liveness probes.
@@ -298,6 +319,19 @@ async fn main() -> Result<()> {
             state.clone(),
             limits::rate_limit_mw,
         ))
+        // Per-tenant kill switch: OUTSIDE the rate limiter (a halted bot's
+        // retries must not drain the bucket a legitimate cancel needs) and
+        // INSIDE auth (needs ResolvedCustomer). Path-classified routes are
+        // settled here; `/sign` and `/sign/binance-request` finish in-handler.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tenant_state::tenant_state_mw,
+        ))
+        // Tenant dimension on every lifecycle event (customer/method/path span):
+        // without it "what did tenant X do in the last hour" cannot be answered
+        // from the gateway log. Directly inside auth so the span wraps
+        // everything below, denials included.
+        .route_layer(axum::middleware::from_fn(tenant_state::request_span_mw))
         .route_layer(axum::middleware::from_fn_with_state(
             // Cloned so the original survives the operator/tenant overlap check
             // below (LOW#2) before it is dropped.
@@ -404,11 +438,64 @@ async fn main() -> Result<()> {
         .layer(operator_hardening)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
 
+    // 🔴 The kill switch gets its OWN router, outside the per-token rate limiter
+    // AND outside BOTH concurrency pools. Do not "tidy" it back under either one.
+    //
+    // Why no rate limiter: the press that matters happens under load. A bot that
+    // has run away is, by definition, the one that saturated its own minute
+    // bucket — on the shared `sign_router` its next request, the halt, would be
+    // refused 429 by the limiter its own traffic filled. The stop would be
+    // unreachable exactly when it is needed, which is worse than not advertising
+    // one (CodeRabbit on #82).
+    //
+    // Why no pool either — and this is the half that the #83 merge would have
+    // silently undone. As written on this branch, `halt_router` was merged BEFORE
+    // the layers and therefore sat inside `dos_hardening` (the money pool). Merge
+    // it under `operator_hardening` instead and it lands in a 32-slot pool; leave
+    // it under `dos_hardening` and a money-path flood shuts it. Either way the
+    // availability property this route exists for evaporates, and no test catches
+    // it, because every test reaches an unloaded server. So the halt keeps trace,
+    // a body limit and a timeout — the protections that do not gate reachability —
+    // and neither `load_shed` nor `concurrency_limit`.
+    //
+    // Unbounded concurrency on one route is a real cost, accepted deliberately: it
+    // is auth-gated, tiny, and can only TIGHTEN. `post_tenant_halt` escalates
+    // ACTIVE -> CANCEL_ONLY -> HALTED and cannot release — release is an operator
+    // action over the admin socket — so an attacker holding the token gains
+    // nothing by calling it repeatedly except stopping themselves.
+    //
+    // `.load_shed()` is present but INERT here, and that is deliberate, not a
+    // contradiction of the paragraph above: load-shed refuses a request only when
+    // the inner service reports itself not-ready, and the only thing that makes it
+    // not-ready in this stack is `concurrency_limit`. With no limit there is never
+    // a pending readiness, so nothing is ever shed. It stays because it is what
+    // boxes the error type into `BoxError`, which is what `HandleErrorLayer`
+    // consumes — drop it and the timeout no longer composes.
+    let halt_hardening = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_middleware_error))
+        .load_shed()
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ));
+
+    let halt_router = Router::new()
+        .route("/tenant/halt", post(tenant_state::post_tenant_halt))
+        .route_layer(axum::middleware::from_fn(tenant_state::request_span_mw))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth::require_bearer,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(halt_hardening)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+
     let api_router = sign_router
         .layer(TraceLayer::new_for_http())
         .layer(dos_hardening)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-        .merge(operator_router);
+        .merge(operator_router)
+        .merge(halt_router);
 
     // Q2a (attested-data): fail-loud at boot if the provisioned data-signing key
     // drifts from the published pubkey. Runs BEFORE `state` is moved into the
@@ -429,7 +516,50 @@ async fn main() -> Result<()> {
         .merge(api_router)
         .merge(public_router)
         .route("/healthz", get(handlers::get_healthz))
-        .with_state(state);
+        // Cloned: `reconcile::resume_all` and the admin-socket task below both
+        // need the state after the router takes ownership. AppState is Arc-backed.
+        .with_state(state.clone());
+
+    // PR-2: restart any reconcile job a previous process left non-final — a
+    // restart mid-unwind must not leave orders resting unnoticed.
+    reconcile::resume_all(state.clone());
+
+    // Cloned for the admin-socket task, which outlives this scope.
+    let admin_state = state.clone();
+
+    // Operator control socket for the per-tenant kill switch. Unix socket, no
+    // bearer: the file mode (0660) is the permission to press, and no TLS
+    // front can ever proxy to it. `SIGNER_ADMIN_SOCKET=off` disables it (dev).
+    {
+        let sock = std::env::var(tenant_state::ADMIN_SOCKET_ENV)
+            .ok()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| tenant_state::DEFAULT_ADMIN_SOCKET.to_owned());
+        if sock == "off" {
+            warn!(
+                event = "tenant_admin_socket_disabled",
+                "SIGNER_ADMIN_SOCKET=off — operator per-tenant stop is NOT reachable on this box"
+            );
+        } else {
+            // Bind is a BOOT-time concern: if the operator control path cannot
+            // exist, the gateway must not serve signing traffic without it
+            // (CodeRabbit). Only the accept loop is spawned.
+            let sock_path = std::path::PathBuf::from(&sock);
+            let listener = tenant_state::bind_admin_socket(&sock_path).with_context(|| {
+                format!(
+                    "bind operator admin socket {sock} ({})",
+                    tenant_state::ADMIN_SOCKET_ENV
+                )
+            })?;
+            let admin_app = tenant_state::admin_router(admin_state.clone());
+            tokio::spawn(async move {
+                if let Err(e) = tenant_state::serve_admin_socket(listener, admin_app).await {
+                    error!(event = "tenant_admin_socket_failed", error = %e, "operator per-tenant stop NOT reachable");
+                }
+            });
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(cli.bind)
         .await
@@ -1124,6 +1254,60 @@ mod tests {
     ///
     /// Paths are read from this file's own source rather than listed here, so a
     /// route added tomorrow is covered without anyone remembering to add it.
+    /// 🔴 The route table is a CONTRACT, and losing a route is as much a defect
+    /// as adding a broken one.
+    ///
+    /// Measured 2026-09-04: the production gateway had been rebuilt on 09-03 from
+    /// this repository, which at the time carried no `tenant_state.rs` — so
+    /// `POST /tenant/halt` went from `401` (2026-08-31) to `404`, and the
+    /// per-tenant kill switch was gone from production for a day before anyone
+    /// noticed. Nothing went red, because every check asked "did the new thing
+    /// appear?" and none asked "did the old thing survive?".
+    ///
+    /// This list is that second question. Removing or renaming a route must be a
+    /// deliberate edit here, in the same commit, with the reason in the message.
+    #[test]
+    fn the_route_table_has_not_silently_lost_anything() {
+        let mut found: Vec<&str> = route_paths(include_str!("main.rs"));
+        found.sort_unstable();
+        found.dedup();
+        // Every tenant- and operator-facing route this file registers, listed in
+        // full rather than sampled: the five binance signing routes were missing
+        // from the first version of this guard (both review bots caught it), and a
+        // guard that covers part of the table teaches people it covers all of it.
+        // Test-only routes (/probe, /slow, /fast, /block) are deliberately absent.
+        for expected in [
+            "/account/{venue}",
+            "/attestation",
+            "/cancel-all/{venue}",
+            "/healthz",
+            "/hedge",
+            "/open-orders/{venue}",
+            "/receipts/heartbeat",
+            "/sign",
+            "/sign-data",
+            "/sign-x402",
+            "/sign/binance-cancel",
+            "/sign/binance-order",
+            "/sign/binance-request",
+            "/sign/binance-spot-cancel",
+            "/sign/binance-spot-order",
+            "/sign/okx-cancel",
+            "/sign/okx-order",
+            "/tenant/halt",
+            "/user-trades/{venue}",
+            "/verify-blob",
+        ] {
+            assert!(
+                found.contains(&expected),
+                "route {expected} is gone from main.rs. If that is intentional, delete it \
+                 from this list in the SAME commit and say why in the message — otherwise \
+                 you are repeating 2026-09-03, when /tenant/halt vanished from production \
+                 for a day and no test noticed. Routes currently registered: {found:?}"
+            );
+        }
+    }
+
     /// The operator tier must keep its OWN in-flight pool, and the money tier's
     /// must stay the larger of the two.
     ///
@@ -1169,6 +1353,55 @@ mod tests {
             merge > layers,
             "operator_router is merged BEFORE the money tier's layers, which puts it \
              back on the shared pool — merge it after, so it keeps operator_hardening"
+        );
+    }
+
+    /// The kill switch must stay outside BOTH concurrency pools.
+    ///
+    /// The comment at the wiring says why; this says it in a form that goes red.
+    /// The failure it guards is invisible to every other test, because every other
+    /// test reaches an UNLOADED server — and an unreachable-under-load stop looks
+    /// perfectly healthy until the one moment it is needed.
+    ///
+    /// Two ways to lose it, both of which read as tidying:
+    ///   * merge `halt_router` before the money tier's layers → it inherits
+    ///     `dos_hardening` (which is how this branch had it before the #83 merge);
+    ///   * give `halt_hardening` a `concurrency_limit` → it gets a pool of its own,
+    ///     and a pool is exactly what must not sit in front of the stop.
+    #[test]
+    fn the_kill_switch_is_outside_both_pools() {
+        let src = include_str!("main.rs");
+        // `concat!` so the needles do not match this test's own text.
+        let halt_stack = concat!("let halt_hardening = ", "ServiceBuilder::new()");
+        let start = src
+            .find(halt_stack)
+            .expect("the halt route builds its own hardening stack");
+        let end = src[start..]
+            .find("let halt_router")
+            .expect("halt_router follows its hardening stack")
+            + start;
+        assert!(
+            !src[start..end].contains(concat!("concurrency", "_limit")),
+            "halt_hardening gained a concurrency limit — the stop must not sit behind \
+             a pool, that is the whole reason it has its own stack"
+        );
+
+        let dos = src
+            .find(concat!(".layer(", "dos_hardening)"))
+            .expect("the money tier applies dos_hardening");
+        let needle = concat!(".merge(", "halt_router)");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "halt_router must be merged exactly once, or the position check below \
+             would test an arbitrary one of several merges"
+        );
+        let merge = src.find(needle).expect("api_router merges the halt router");
+        assert!(
+            merge > dos,
+            "halt_router is merged BEFORE the money tier's layers, which puts the stop \
+             inside dos_hardening — a money-path flood would then shut the very route \
+             that stops it"
         );
     }
 

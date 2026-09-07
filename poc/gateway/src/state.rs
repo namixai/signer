@@ -147,6 +147,10 @@ pub struct AppState {
     /// read by `/healthz`. Shared (`Arc`) so the spawned probe task and the
     /// request handlers see the same cell.
     pub sign_health: Arc<SignHealth>,
+    /// Per-tenant kill switch (ACTIVE / CANCEL_ONLY / HALTED), switched at
+    /// runtime without a restart and persisted so a halt survives one. In-memory
+    /// by default; `main()` installs the file-backed store via `with_tenants`.
+    pub tenants: Arc<crate::tenant_state::TenantStateStore>,
 }
 
 impl AppState {
@@ -159,7 +163,14 @@ impl AppState {
             data_signing_token: None,
             limits: Arc::new(crate::limits::Limits::disabled()),
             sign_health: Arc::new(SignHealth::default()),
+            tenants: Arc::new(crate::tenant_state::TenantStateStore::in_memory()),
         }
+    }
+
+    /// Install the file-backed tenant-state store (see `tenant_state::TenantStateStore::load`).
+    pub fn with_tenants(mut self, tenants: crate::tenant_state::TenantStateStore) -> Self {
+        self.tenants = Arc::new(tenants);
+        self
     }
 
     /// Set the data-signing service token (from `SIGNER_DATA_SIGNING_TOKEN`).

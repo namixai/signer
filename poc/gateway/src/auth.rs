@@ -473,6 +473,48 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// The raw bearer token for a customer label, read from the gateway's OWN
+/// environment (`SIGNER_API_TOKENS`, the same value `from_env` hashed at boot).
+///
+/// Why this exists: the enclave resolves identity from the OPAQUE TOKEN it is
+/// handed (registry.rs) — there is no "operator signs on behalf of tenant"
+/// identity, by design. So a gateway-side job that must cancel a tenant's
+/// orders (the kill-switch reconcile, PR-2) can only do so AS the tenant, with
+/// the tenant's token. The gateway already holds that token in its unit
+/// environment — this reads it back, matching on the customer label (never
+/// "the first entry": the 08-19 box script took the first token and hit a
+/// wrong-tenant `exchange_blob_missing`). Returned zeroized-on-drop; callers
+/// must not log or persist it. `None` when the label has no token.
+pub fn raw_token_for_customer(label: &str) -> Option<zeroize::Zeroizing<String>> {
+    use zeroize::Zeroize;
+    // The whole variable holds EVERY tenant's token: keep it in a buffer we wipe
+    // on the way out, not a plain String left on the heap (Gemini).
+    let mut raw = zeroize::Zeroizing::new(std::env::var("SIGNER_API_TOKENS").ok()?);
+    let mut found = None;
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        // Same split as `from_env_var` (`split_once`, not `rsplit_once`): the
+        // boot parser refuses labels containing ':', so both derive identical
+        // fields; sharing the direction removes the implicit dependency on
+        // that rule (CodeRabbit). Empty token or label: skipped exactly as the
+        // boot parser skips them — an entry like `:alice` must not yield an
+        // empty opaque token that fails at the enclave instead of here.
+        let Some((token, cust)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let (token, cust) = (token.trim(), cust.trim());
+        if token.is_empty() || cust.is_empty() {
+            continue;
+        }
+        if cust == label {
+            found = Some(zeroize::Zeroizing::new(token.to_owned()));
+            break;
+        }
+    }
+    raw.zeroize();
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
