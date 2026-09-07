@@ -541,6 +541,36 @@ fn validate_hedge_shape(req: &HedgeRequest) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    // Same venue + the SAME client order id = the venue rejects the second leg as a
+    // duplicate, and a hedge that placed one leg is a naked position, not a hedge.
+    // This became reachable the moment `client_order_id` stopped being dropped: the
+    // field is client-supplied (`proto.rs`: "forwarded verbatim to the enclave") and
+    // `sign_leg` serialises `leg.order` wholesale — nothing on the path rewrites it.
+    //
+    // The venue rejection is the SMALLER half. For an AF-2 tenant the order's
+    // `client_order_id` IS the replay nonce — double-duty, `enclave/handler.rs:916`.
+    // Two legs sharing an id therefore present the same replay nonce for two
+    // different orders, which is a collision in the anti-replay primitive itself and
+    // not merely a venue-side duplicate.
+    //
+    // Only same-venue collides — two venues are separate id namespaces, and a bot that
+    // labels both legs of one hedge with one id is doing something reasonable there.
+    // `None` legs never collide with each other: the venue assigns its own ids.
+    if a.venue() == b.venue() {
+        if let (Some(ida), Some(idb)) = (
+            a.order.client_order_id.as_deref(),
+            b.order.client_order_id.as_deref(),
+        ) {
+            if !ida.trim().is_empty() && ida == idb {
+                return Err(format!(
+                    "both legs are venue={} with the same client_order_id={ida:?} — the \
+                     venue rejects the second as a duplicate, leaving ONE leg live. Give \
+                     each leg its own id, or omit it and let the venue assign one",
+                    a.venue(),
+                ));
+            }
+        }
+    }
     let envs: Vec<Option<&'static str>> = [a, b].iter().map(|l| leg_env(&l.venue())).collect();
     if let (Some(ea), Some(eb)) = (envs[0], envs[1]) {
         let live_a = ea == "live";
@@ -807,8 +837,12 @@ mod tests {
                 ord_type: ord_type.to_owned(),
                 price: None,
                 reduce_only: false,
-                // /hedge mints its own idempotency key per leg (PR-B); this test
-                // helper builds the spec BEFORE that step.
+                // No id by default. NOTE: this used to say "/hedge mints its own
+                // idempotency key per leg" — it does not, and no such code exists
+                // anywhere on the path (`sign_leg` forwards `leg.order` verbatim).
+                // A comment asserting a safety property the code lacks is worse than
+                // no comment: it is exactly what makes a reader dismiss a real
+                // collision report as already-handled.
                 client_order_id: None,
             },
         }
@@ -848,6 +882,76 @@ mod tests {
         };
         // binance defaults to testnet + okx defaults to demo in tests (no
         // env vars set) — both non-live, so env coherence passes too.
+        assert!(validate_hedge_shape(&req).is_ok());
+    }
+
+    fn leg_with_id(venue: &str, symbol: &str, side: &str, id: Option<&str>) -> HedgeLegSpec {
+        let mut l = leg(venue, symbol, side, "market");
+        l.order.client_order_id = id.map(str::to_owned);
+        l
+    }
+
+    #[test]
+    fn validate_rejects_same_venue_sharing_one_client_order_id() {
+        // The venue rejects the duplicate id, leaving ONE leg live; and for an AF-2
+        // tenant the id doubles as the replay nonce (enclave/handler.rs:916), so the
+        // two legs would also present one nonce for two orders.
+        let req = HedgeRequest {
+            legs: vec![
+                leg_with_id("binance", "BTCUSDT", "buy", Some("hbot-1")),
+                leg_with_id("binance", "ETHUSDT", "sell", Some("hbot-1")),
+            ],
+        };
+        let err = validate_hedge_shape(&req).unwrap_err();
+        assert!(err.contains("same client_order_id"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_same_venue_with_distinct_ids() {
+        let req = HedgeRequest {
+            legs: vec![
+                leg_with_id("binance", "BTCUSDT", "buy", Some("hbot-1")),
+                leg_with_id("binance", "ETHUSDT", "sell", Some("hbot-2")),
+            ],
+        };
+        assert!(validate_hedge_shape(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_one_id_across_two_venues() {
+        // Separate id namespaces — labelling both legs of one hedge is reasonable.
+        let req = HedgeRequest {
+            legs: vec![
+                leg_with_id("binance", "BTCUSDT", "buy", Some("hbot-1")),
+                leg_with_id("okx", "BTC-USDT-SWAP", "sell", Some("hbot-1")),
+            ],
+        };
+        assert!(validate_hedge_shape(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_two_legs_with_no_ids() {
+        // `None` == "venue assigns" — two of those are not a collision, and the old
+        // behaviour (field always dropped) must keep working unchanged.
+        let req = HedgeRequest {
+            legs: vec![
+                leg_with_id("binance", "BTCUSDT", "buy", None),
+                leg_with_id("binance", "ETHUSDT", "sell", None),
+            ],
+        };
+        assert!(validate_hedge_shape(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_treats_blank_ids_as_absent_not_as_a_match() {
+        // Two empty strings are equal, but neither reaches the venue as an id.
+        // Rejecting them would refuse a legal hedge on a technicality.
+        let req = HedgeRequest {
+            legs: vec![
+                leg_with_id("binance", "BTCUSDT", "buy", Some("   ")),
+                leg_with_id("binance", "ETHUSDT", "sell", Some("   ")),
+            ],
+        };
         assert!(validate_hedge_shape(&req).is_ok());
     }
 
