@@ -489,8 +489,33 @@ pub struct OrderParams {
     /// Hummingbot shim onto this endpoint: a bot that cannot set its own order id
     /// cannot reconcile its own orders, which turns "place an order" into "place an
     /// order and lose track of it". Optional, so nothing that worked before changes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// 🔴 A blank id is normalised to `None` AT THE BOUNDARY, not checked for later.
+    /// `skip_serializing_if = "Option::is_none"` omits only `None`, so `Some("   ")`
+    /// would be forwarded to the venue as a real `newClientOrderId` — and two hedge
+    /// legs both carrying `"   "` are a duplicate id at the venue, which is exactly
+    /// the naked-leg case `validate_hedge_shape` exists to prevent. Normalising here
+    /// means blank cannot reach ANY route: order, cancel-adjacent, hedge legs. Fixing
+    /// it in the hedge check alone would have left the single-order route — where the
+    /// id doubles as the AF-2 replay nonce — carrying a blank nonce.
+    #[serde(
+        default,
+        deserialize_with = "blank_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub client_order_id: Option<String>,
+}
+
+/// `Some("")` / `Some("   ")` → `None`. A whitespace-only id is the caller saying
+/// "no id" in a way `Option` alone cannot express; treating it as a value forwards
+/// a meaningless string to the venue and makes two such orders collide with each
+/// other. Absent field → `None` via `default` without calling this.
+fn blank_as_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.trim().is_empty()))
 }
 
 /// Same dropped-typo'd-field rationale as `OrderParams`.

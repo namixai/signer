@@ -943,9 +943,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_treats_blank_ids_as_absent_not_as_a_match() {
-        // Two empty strings are equal, but neither reaches the venue as an id.
-        // Rejecting them would refuse a legal hedge on a technicality.
+    fn blank_ids_are_normalised_away_before_anything_sees_them() {
+        // The blank exemption in `validate_hedge_shape` was a HOLE while blanks could
+        // still be serialised: `skip_serializing_if = "Option::is_none"` omits only
+        // `None`, so two legs carrying `"   "` passed the duplicate check and then
+        // collided at the venue anyway (CodeRabbit on #84). Fixed at the boundary —
+        // `OrderParams` deserialises a blank id to `None` — so assert the OUTBOUND
+        // shape, which is what actually reaches the venue.
+        let parsed: OrderParams = serde_json::from_str(
+            r#"{"symbol":"BTCUSDT","side":"buy","qty":"1","ord_type":"market","client_order_id":"   "}"#,
+        )
+        .expect("parses");
+        assert_eq!(parsed.client_order_id, None, "blank id must not survive parsing");
+        let out = serde_json::to_string(&parsed).expect("serialises");
+        assert!(
+            !out.contains("client_order_id"),
+            "a blank id must not reach the venue at all: {out}"
+        );
+
+        let kept: OrderParams = serde_json::from_str(
+            r#"{"symbol":"BTCUSDT","side":"buy","qty":"1","ord_type":"market","client_order_id":"hbot-1"}"#,
+        )
+        .expect("parses");
+        assert_eq!(kept.client_order_id.as_deref(), Some("hbot-1"));
+    }
+
+    #[test]
+    fn validate_still_tolerates_blank_ids_reaching_it_directly() {
+        // Defence in depth: the normaliser runs on deserialisation, but a future
+        // caller could build the struct in code. Two blanks are not a collision the
+        // check should reject — they carry no id — so the guard keeps its own trim.
         let req = HedgeRequest {
             legs: vec![
                 leg_with_id("binance", "BTCUSDT", "buy", Some("   ")),
