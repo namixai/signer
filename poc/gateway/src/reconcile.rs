@@ -405,29 +405,50 @@ pub struct GatewayOps {
     token: zeroize::Zeroizing<String>,
 }
 
-/// A 400 from the sign path during unwind almost always means ONE thing, and the
-/// bare status hides it: the tenant's policy carries `intent_pubkey`, so the
-/// enclave demands a signed cancel intent (`enforce_agent_intent_cancel`,
-/// enclave `handler.rs`), and this job has no intent to present.
+/// What kind of signing was refused. A 400 means different things on the two
+/// paths, and a hint that ignores the difference is worse than no hint: it sends
+/// the operator to the venue UI to cancel by hand when the book merely failed to
+/// LIST (CodeRabbit on #82 — the first version of this helper did exactly that).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SignKind {
+    /// Listing the book — `sign_account_read`. Cannot involve a cancel intent.
+    Read,
+    /// Cancelling a resting order — the path the AF-2 intent gate guards.
+    Cancel,
+}
+
+/// Turn a bare status into the reason an operator can act on.
 ///
-/// 🔴 It has none BY CONSTRUCTION, and no amount of code here changes that: the
-/// intent key belongs to the AGENT. The gateway does not hold it and must not.
-/// So for an AF-2 tenant the operator stop halts NEW signing but does NOT unwind
-/// the resting book — that is the architecture, not a defect, and the operator
-/// has to cancel by hand at the venue. The job reports `Failed` (the phase starts
-/// there and only a verified-empty book turns it `Done`), so nothing claims
-/// success; what was missing is the REASON, which is what this adds.
-fn refusal_hint(status: u16) -> &'static str {
-    match status {
-        400 => {
-            " — most likely this tenant's policy requires a signed cancel intent \
-(AF-2) and the unwind job holds no agent key, so it cannot cancel here at all: \
-cancel by hand via the venue UI. Other 400 causes: the venue blob is missing for \
-this customer, or the token no longer resolves"
+/// 🔴 On a CANCEL, a 400 almost always means the tenant's policy carries
+/// `intent_pubkey`, so the enclave demands a signed cancel intent
+/// (`enforce_agent_intent_cancel`, enclave `handler.rs`), and this job has none
+/// BY CONSTRUCTION — the intent key belongs to the AGENT. The gateway does not
+/// hold it and must not. So for an AF-2 tenant the operator stop halts NEW
+/// signing but does NOT unwind the resting book: that is the architecture, not a
+/// defect, and the book has to be cleared by hand at the venue.
+///
+/// The job reports `Failed` either way (the phase starts there and only a
+/// verified-empty book turns it `Done`), so nothing ever claimed success — what
+/// was missing is the REASON, which is all this adds.
+fn refusal_hint(status: u16, kind: SignKind) -> &'static str {
+    match (status, kind) {
+        (400, SignKind::Cancel) => {
+            " — most likely this tenant's policy requires a \
+signed cancel intent (AF-2) and the unwind job holds no agent key, so it cannot \
+cancel here at all: cancel by hand via the venue UI. Other 400 causes: the venue \
+blob is missing for this customer, or the token no longer resolves"
         }
-        401 | 403 => {
-            " — the token was refused or the action is not in this key's \
-policy; the unwind cannot proceed until an operator fixes the grant"
+        // Deliberately does NOT mention the intent gate: a listing is never
+        // refused by it, and naming it here would send the operator to cancel by
+        // hand a book they simply could not read.
+        (400, SignKind::Read) => {
+            " — a read is never refused by the cancel-intent \
+gate; look instead for a missing venue blob for this customer, a token that no \
+longer resolves, or a venue this key's policy does not allow"
+        }
+        (401 | 403, _) => {
+            " — the token was refused or the action is not in this \
+key's policy; the unwind cannot proceed until an operator fixes the grant"
         }
         _ => "",
     }
@@ -506,7 +527,7 @@ impl GatewayOps {
                     let status = resp.status().as_u16();
                     last = format!(
                         "sign {method} {path} refused: HTTP {status}{}",
-                        refusal_hint(status)
+                        refusal_hint(status, SignKind::Read)
                     );
                     if status == 429 && attempt < CANCEL_ATTEMPTS {
                         tokio::time::sleep(CANCEL_BACKOFF_BASE * attempt).await;
@@ -691,7 +712,7 @@ impl GatewayOps {
                     );
                     last = format!(
                         "sign okx cancel refused: HTTP {status}{}",
-                        refusal_hint(status)
+                        refusal_hint(status, SignKind::Cancel)
                     );
                     if status == 429 && attempt < CANCEL_ATTEMPTS {
                         tokio::time::sleep(CANCEL_BACKOFF_BASE * attempt).await;
@@ -1386,21 +1407,42 @@ mod tests {
     }
 
     /// No venues at all (no blobs staged) — nothing could ever rest: Done.
-    /// A bare `HTTP 400` sent the operator hunting for a malformed request; the
-    /// actual cause is almost always the AF-2 intent gate, and the unwind can
-    /// NEVER satisfy it — the intent key belongs to the agent. Naming it is the
-    /// whole fix (MED-2): the stop already reports `Failed`, it just did not say
-    /// why.
+    /// A bare `HTTP 400` sent the operator hunting for a malformed request; on a
+    /// cancel the actual cause is almost always the AF-2 intent gate, and the
+    /// unwind can NEVER satisfy it — the intent key belongs to the agent. Naming
+    /// it is the whole fix (MED-2): the stop already reports `Failed`, it just did
+    /// not say why.
     #[test]
-    fn a_400_during_unwind_names_the_intent_gate_and_the_manual_way_out() {
-        let hint = refusal_hint(400);
+    fn a_cancel_400_names_the_intent_gate_and_the_manual_way_out() {
+        let hint = refusal_hint(400, SignKind::Cancel);
         assert!(
             hint.contains("intent"),
-            "400 must name the intent gate: {hint}"
+            "cancel 400 must name the intent gate: {hint}"
         );
         assert!(
             hint.contains("by hand"),
-            "400 must tell the operator what to do instead: {hint}"
+            "cancel 400 must tell the operator what to do instead: {hint}"
+        );
+    }
+
+    /// 🔴 The half the first version got wrong (CodeRabbit on #82): `signed_read`
+    /// shares this helper, and a listing is NEVER refused by the cancel-intent
+    /// gate. Blaming it there sends the operator to the venue UI to cancel by hand
+    /// a book they merely failed to READ — a wrong hint is worse than none.
+    #[test]
+    fn a_read_400_never_blames_the_cancel_intent_gate() {
+        let hint = refusal_hint(400, SignKind::Read);
+        assert!(
+            !hint.contains("intent gate") || hint.contains("never refused"),
+            "a read must not be blamed on the intent gate: {hint}"
+        );
+        assert!(
+            !hint.contains("cancel by hand"),
+            "a failed listing must not send the operator to cancel by hand: {hint}"
+        );
+        assert!(
+            hint.contains("blob"),
+            "a read 400 must name a cause it can have: {hint}"
         );
     }
 
@@ -1408,25 +1450,70 @@ mod tests {
     fn an_auth_refusal_is_not_reported_as_the_intent_gate() {
         // Same-shaped failure, different cause — conflating them would send the
         // operator to the venue UI when the real fix is a grant.
-        for s in [401u16, 403] {
-            let hint = refusal_hint(s);
-            assert!(
-                !hint.contains("intent"),
-                "{s} must not blame the intent gate"
-            );
-            assert!(
-                hint.contains("grant"),
-                "{s} must point at the grant: {hint}"
-            );
+        for st in [401u16, 403] {
+            for kind in [SignKind::Read, SignKind::Cancel] {
+                let hint = refusal_hint(st, kind);
+                assert!(!hint.contains("AF-2"), "{st}/{kind:?} must not blame AF-2");
+                assert!(
+                    hint.contains("grant"),
+                    "{st}/{kind:?} must point at the grant: {hint}"
+                );
+            }
         }
+    }
+
+    /// 🔴 The three tests above check the FUNCTION; this one checks the WIRING,
+    /// and without it they are close to worthless. Falsified while writing them:
+    /// swapping `SignKind::Read` for `SignKind::Cancel` at the call site left all
+    /// of them green, because none of them ever reaches a call site. That is the
+    /// same defect CodeRabbit caught in the auto-cycle test on the same day — a
+    /// test that stubs the thing it claims to verify.
+    #[test]
+    fn each_sign_path_passes_its_own_kind() {
+        let src = include_str!("reconcile.rs");
+        // `concat!` so the needles do not match this test's own text.
+        let read_fn = src
+            .find(concat!("async fn ", "signed_read"))
+            .expect("signed_read exists");
+        let read_end = src[read_fn..]
+            .find(concat!("async fn ", "cancel_okx_one"))
+            .map(|i| i + read_fn)
+            .unwrap_or(src.len());
+        let read_body = &src[read_fn..read_end];
+        assert!(
+            read_body.contains(concat!("refusal_hint(status, ", "SignKind::Read)")),
+            "signed_read must ask for the READ hint — a listing is never refused by \
+             the cancel-intent gate"
+        );
+        assert!(
+            !read_body.contains(concat!("refusal_hint(status, ", "SignKind::Cancel)")),
+            "signed_read is asking for the CANCEL hint: a failed listing would tell the \
+             operator to cancel by hand a book they merely could not read"
+        );
+
+        let cancel_fn = src
+            .find(concat!("async fn ", "cancel_okx_one"))
+            .expect("cancel_okx_one exists");
+        let cancel_body = &src[cancel_fn..];
+        assert!(
+            cancel_body.contains(concat!("refusal_hint(status, ", "SignKind::Cancel)")),
+            "the cancel path must ask for the CANCEL hint — that is the only path the \
+             AF-2 intent gate guards"
+        );
     }
 
     #[test]
     fn statuses_we_have_no_story_for_stay_bare() {
         // Inventing a cause for 429/500 would be worse than the bare status: the
         // operator would chase the wrong thing. Silence is honest here.
-        for s in [429u16, 500, 503] {
-            assert_eq!(refusal_hint(s), "", "{s} must not gain a made-up cause");
+        for st in [429u16, 500, 503] {
+            for kind in [SignKind::Read, SignKind::Cancel] {
+                assert_eq!(
+                    refusal_hint(st, kind),
+                    "",
+                    "{st}/{kind:?} must not gain a made-up cause"
+                );
+            }
         }
     }
 
