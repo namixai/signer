@@ -114,6 +114,28 @@ const HEADER_READ_TIMEOUT_SECS: u64 = 2;
 /// /sign in flight at peak in dogfood).
 const MAX_CONCURRENT_REQUESTS: usize = 256;
 
+/// In-flight cap for the OPERATOR tier (`/sign-data`, `/verify-blob`) — its own
+/// pool, deliberately much smaller than the money tier's.
+///
+/// Why a separate pool at all (Alex, 2026-09-05, as a condition of enabling the
+/// attested-snapshot path): the marketplace signs ~1757 snapshots per cycle
+/// through `/sign-data`. Sharing one bounded pool with `/sign` means a slow
+/// enclave, a retry storm, or simply a long cycle can hold slots that money
+/// traffic then cannot get — and load-shed answers `/sign` with 503 for a reason
+/// that has nothing to do with trading. Operator work must not be able to shed
+/// the money path; the reverse is acceptable.
+///
+/// Why 32: the caller is synchronous, one snapshot at a time, so this is already
+/// an order of magnitude above its real concurrency — it bounds a runaway, it
+/// does not shape normal traffic. Raise it if a legitimate operator client ever
+/// needs more; the number that must NOT move is the money tier's.
+const MAX_CONCURRENT_OPERATOR_REQUESTS: usize = 32;
+
+/// Compile-time, not a test: equal or larger would make the split real but
+/// pointless — operator work could again shed the money path. A build that gets
+/// this wrong must not exist, rather than fail a test someone can skip.
+const _: () = assert!(MAX_CONCURRENT_OPERATOR_REQUESTS < MAX_CONCURRENT_REQUESTS);
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -400,35 +422,80 @@ async fn main() -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
-    // 🔴 The kill switch gets its OWN router, WITHOUT the per-token rate limiter.
+    // Same stack, own pool: the operator tier cannot starve the money tier, and a
+    // money-path flood cannot lock the operator out of `/verify-blob` either.
+    let operator_hardening = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_middleware_error))
+        .load_shed()
+        .concurrency_limit(MAX_CONCURRENT_OPERATOR_REQUESTS)
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ));
+
+    let operator_router = operator_router
+        .layer(TraceLayer::new_for_http())
+        .layer(operator_hardening)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+
+    // 🔴 The kill switch gets its OWN router, outside the per-token rate limiter
+    // AND outside BOTH concurrency pools. Do not "tidy" it back under either one.
     //
-    // Why: the press that matters happens under load. A bot that has run away is,
-    // by definition, the one that saturated its own minute bucket — and on the
-    // shared sign_router its next request, the halt, would be refused 429 by the
-    // limiter its own traffic filled. The stop would be unreachable exactly when
-    // it is needed, which is worse than not advertising one (CodeRabbit on #82;
-    // the private tree has the same layering and inherits the fix).
+    // Why no rate limiter: the press that matters happens under load. A bot that
+    // has run away is, by definition, the one that saturated its own minute
+    // bucket — on the shared `sign_router` its next request, the halt, would be
+    // refused 429 by the limiter its own traffic filled. The stop would be
+    // unreachable exactly when it is needed, which is worse than not advertising
+    // one (CodeRabbit on #82).
     //
-    // Safe to exempt because the route can only TIGHTEN: `post_tenant_halt`
-    // escalates ACTIVE → CANCEL_ONLY → HALTED and cannot release — release is an
-    // operator action over the admin socket. So an attacker holding the token
-    // gains nothing by calling it repeatedly except stopping themselves. It keeps
-    // auth (a bearer is still required) and the tenant span, and it is exempt from
-    // the tenant-state middleware by construction.
+    // Why no pool either — and this is the half that the #83 merge would have
+    // silently undone. As written on this branch, `halt_router` was merged BEFORE
+    // the layers and therefore sat inside `dos_hardening` (the money pool). Merge
+    // it under `operator_hardening` instead and it lands in a 32-slot pool; leave
+    // it under `dos_hardening` and a money-path flood shuts it. Either way the
+    // availability property this route exists for evaporates, and no test catches
+    // it, because every test reaches an unloaded server. So the halt keeps trace,
+    // a body limit and a timeout — the protections that do not gate reachability —
+    // and neither `load_shed` nor `concurrency_limit`.
+    //
+    // Unbounded concurrency on one route is a real cost, accepted deliberately: it
+    // is auth-gated, tiny, and can only TIGHTEN. `post_tenant_halt` escalates
+    // ACTIVE -> CANCEL_ONLY -> HALTED and cannot release — release is an operator
+    // action over the admin socket — so an attacker holding the token gains
+    // nothing by calling it repeatedly except stopping themselves.
+    //
+    // `.load_shed()` is present but INERT here, and that is deliberate, not a
+    // contradiction of the paragraph above: load-shed refuses a request only when
+    // the inner service reports itself not-ready, and the only thing that makes it
+    // not-ready in this stack is `concurrency_limit`. With no limit there is never
+    // a pending readiness, so nothing is ever shed. It stays because it is what
+    // boxes the error type into `BoxError`, which is what `HandleErrorLayer`
+    // consumes — drop it and the timeout no longer composes.
+    let halt_hardening = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_middleware_error))
+        .load_shed()
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ));
+
     let halt_router = Router::new()
         .route("/tenant/halt", post(tenant_state::post_tenant_halt))
         .route_layer(axum::middleware::from_fn(tenant_state::request_span_mw))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             auth::require_bearer,
-        ));
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(halt_hardening)
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
 
     let api_router = sign_router
-        .merge(halt_router)
-        .merge(operator_router)
         .layer(TraceLayer::new_for_http())
         .layer(dos_hardening)
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+        .merge(operator_router)
+        .merge(halt_router);
 
     // Q2a (attested-data): fail-loud at boot if the provisioned data-signing key
     // drifts from the published pubkey. Runs BEFORE `state` is moved into the
@@ -1239,6 +1306,103 @@ mod tests {
                  for a day and no test noticed. Routes currently registered: {found:?}"
             );
         }
+    }
+
+    /// The operator tier must keep its OWN in-flight pool, and the money tier's
+    /// must stay the larger of the two.
+    ///
+    /// Condition of enabling the attested-snapshot path (Alex, 2026-09-05): the
+    /// marketplace signs ~1757 snapshots per cycle on `/sign-data`. On one shared
+    /// pool that work can hold slots `/sign` then cannot get, and load-shed answers
+    /// money traffic with 503 for a reason that has nothing to do with trading.
+    ///
+    /// Guarded here because it is easy to undo by accident: merging
+    /// `operator_router` into `api_router` BEFORE the layers silently puts it back
+    /// on the money pool, and nothing else would notice.
+    #[test]
+    fn the_operator_tier_has_its_own_smaller_pool() {
+        // The size relation is a compile-time assert next to the constants; this
+        // test guards the WIRING, which the compiler cannot see.
+        let src = include_str!("main.rs");
+        // `concat!` so these needles do not match themselves in this test's own text.
+        let hardening = concat!("let operator_hardening = ", "ServiceBuilder::new()");
+        assert_eq!(
+            src.matches(hardening).count(),
+            1,
+            "the operator tier must build its own hardening stack exactly once"
+        );
+        // The merge has to come AFTER the money tier's layers: `.merge()` before
+        // them would wrap the operator routes in `dos_hardening` again.
+        let layers = src
+            .find(concat!(".layer(", "dos_hardening)"))
+            .expect("the money tier applies dos_hardening");
+        // No trailing `;` in the needle: another layer chained after the merge is a
+        // legitimate edit, and a guard that goes red for it would train people to
+        // delete the guard (Gemini, #83).
+        let merge_needle = concat!(".merge(", "operator_router)");
+        assert_eq!(
+            src.matches(merge_needle).count(),
+            1,
+            "the operator router must be merged exactly once, or the position \
+             comparison below would test an arbitrary one of several merges"
+        );
+        let merge = src
+            .find(merge_needle)
+            .expect("api_router merges the operator router");
+        assert!(
+            merge > layers,
+            "operator_router is merged BEFORE the money tier's layers, which puts it \
+             back on the shared pool — merge it after, so it keeps operator_hardening"
+        );
+    }
+
+    /// The kill switch must stay outside BOTH concurrency pools.
+    ///
+    /// The comment at the wiring says why; this says it in a form that goes red.
+    /// The failure it guards is invisible to every other test, because every other
+    /// test reaches an UNLOADED server — and an unreachable-under-load stop looks
+    /// perfectly healthy until the one moment it is needed.
+    ///
+    /// Two ways to lose it, both of which read as tidying:
+    ///   * merge `halt_router` before the money tier's layers → it inherits
+    ///     `dos_hardening` (which is how this branch had it before the #83 merge);
+    ///   * give `halt_hardening` a `concurrency_limit` → it gets a pool of its own,
+    ///     and a pool is exactly what must not sit in front of the stop.
+    #[test]
+    fn the_kill_switch_is_outside_both_pools() {
+        let src = include_str!("main.rs");
+        // `concat!` so the needles do not match this test's own text.
+        let halt_stack = concat!("let halt_hardening = ", "ServiceBuilder::new()");
+        let start = src
+            .find(halt_stack)
+            .expect("the halt route builds its own hardening stack");
+        let end = src[start..]
+            .find("let halt_router")
+            .expect("halt_router follows its hardening stack")
+            + start;
+        assert!(
+            !src[start..end].contains(concat!("concurrency", "_limit")),
+            "halt_hardening gained a concurrency limit — the stop must not sit behind \
+             a pool, that is the whole reason it has its own stack"
+        );
+
+        let dos = src
+            .find(concat!(".layer(", "dos_hardening)"))
+            .expect("the money tier applies dos_hardening");
+        let needle = concat!(".merge(", "halt_router)");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "halt_router must be merged exactly once, or the position check below \
+             would test an arbitrary one of several merges"
+        );
+        let merge = src.find(needle).expect("api_router merges the halt router");
+        assert!(
+            merge > dos,
+            "halt_router is merged BEFORE the money tier's layers, which puts the stop \
+             inside dos_hardening — a money-path flood would then shut the very route \
+             that stops it"
+        );
     }
 
     #[test]

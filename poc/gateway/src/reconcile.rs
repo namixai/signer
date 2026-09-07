@@ -405,6 +405,34 @@ pub struct GatewayOps {
     token: zeroize::Zeroizing<String>,
 }
 
+/// A 400 from the sign path during unwind almost always means ONE thing, and the
+/// bare status hides it: the tenant's policy carries `intent_pubkey`, so the
+/// enclave demands a signed cancel intent (`enforce_agent_intent_cancel`,
+/// enclave `handler.rs`), and this job has no intent to present.
+///
+/// 🔴 It has none BY CONSTRUCTION, and no amount of code here changes that: the
+/// intent key belongs to the AGENT. The gateway does not hold it and must not.
+/// So for an AF-2 tenant the operator stop halts NEW signing but does NOT unwind
+/// the resting book — that is the architecture, not a defect, and the operator
+/// has to cancel by hand at the venue. The job reports `Failed` (the phase starts
+/// there and only a verified-empty book turns it `Done`), so nothing claims
+/// success; what was missing is the REASON, which is what this adds.
+fn refusal_hint(status: u16) -> &'static str {
+    match status {
+        400 => {
+            " — most likely this tenant's policy requires a signed cancel intent \
+(AF-2) and the unwind job holds no agent key, so it cannot cancel here at all: \
+cancel by hand via the venue UI. Other 400 causes: the venue blob is missing for \
+this customer, or the token no longer resolves"
+        }
+        401 | 403 => {
+            " — the token was refused or the action is not in this key's \
+policy; the unwind cannot proceed until an operator fixes the grant"
+        }
+        _ => "",
+    }
+}
+
 impl GatewayOps {
     pub fn new(state: AppState, customer: &str) -> Option<Self> {
         let token = crate::auth::raw_token_for_customer(customer)?;
@@ -476,7 +504,10 @@ impl GatewayOps {
                 Ok(h) => return Ok(h),
                 Err(resp) => {
                     let status = resp.status().as_u16();
-                    last = format!("sign {method} {path} refused: HTTP {status}");
+                    last = format!(
+                        "sign {method} {path} refused: HTTP {status}{}",
+                        refusal_hint(status)
+                    );
                     if status == 429 && attempt < CANCEL_ATTEMPTS {
                         tokio::time::sleep(CANCEL_BACKOFF_BASE * attempt).await;
                         continue;
@@ -658,7 +689,10 @@ impl GatewayOps {
                         outcome = "denied",
                         attempt_ms = attempt_started.elapsed().as_millis() as u64,
                     );
-                    last = format!("sign okx cancel refused: HTTP {status}");
+                    last = format!(
+                        "sign okx cancel refused: HTTP {status}{}",
+                        refusal_hint(status)
+                    );
                     if status == 429 && attempt < CANCEL_ATTEMPTS {
                         tokio::time::sleep(CANCEL_BACKOFF_BASE * attempt).await;
                         continue;
@@ -1352,6 +1386,50 @@ mod tests {
     }
 
     /// No venues at all (no blobs staged) — nothing could ever rest: Done.
+    /// A bare `HTTP 400` sent the operator hunting for a malformed request; the
+    /// actual cause is almost always the AF-2 intent gate, and the unwind can
+    /// NEVER satisfy it — the intent key belongs to the agent. Naming it is the
+    /// whole fix (MED-2): the stop already reports `Failed`, it just did not say
+    /// why.
+    #[test]
+    fn a_400_during_unwind_names_the_intent_gate_and_the_manual_way_out() {
+        let hint = refusal_hint(400);
+        assert!(
+            hint.contains("intent"),
+            "400 must name the intent gate: {hint}"
+        );
+        assert!(
+            hint.contains("by hand"),
+            "400 must tell the operator what to do instead: {hint}"
+        );
+    }
+
+    #[test]
+    fn an_auth_refusal_is_not_reported_as_the_intent_gate() {
+        // Same-shaped failure, different cause — conflating them would send the
+        // operator to the venue UI when the real fix is a grant.
+        for s in [401u16, 403] {
+            let hint = refusal_hint(s);
+            assert!(
+                !hint.contains("intent"),
+                "{s} must not blame the intent gate"
+            );
+            assert!(
+                hint.contains("grant"),
+                "{s} must point at the grant: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn statuses_we_have_no_story_for_stay_bare() {
+        // Inventing a cause for 429/500 would be worse than the bare status: the
+        // operator would chase the wrong thing. Silence is honest here.
+        for s in [429u16, 500, 503] {
+            assert_eq!(refusal_hint(s), "", "{s} must not gain a made-up cause");
+        }
+    }
+
     #[tokio::test]
     async fn no_venues_at_all_is_done() {
         let d = tmpdir("novenues");

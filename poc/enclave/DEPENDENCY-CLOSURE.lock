@@ -4,17 +4,21 @@
 # closure differs from this file — see the script header for why.
 #
 # Header is maintained BY HAND, only together with a fresh measurement:
-#   closure commit : 96cd4e468d2e094271d6633e95e9d552001c7860 (2026-08-23, merge of #55)
-#   strict PCR0    : 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
-#                    (SIGNER_REQUIRE_POLICY=1; measured twice 2026-08-23, three more times 2026-08-26)
-#   measured on    : 2026-08-23 and 2026-08-26, x86_64 EC2 build host, nitro-cli 1.4.4, clean anonymous
-#                    clone at tag pcr0-103ccd79, env -i
-#   production     : the same 103ccd79de6c… — the cutover COMPLETED on 2026-08-24. Read live from
-#                    https://signer.usenami.io:8443/attestation on 2026-08-26: that value, nonce
-#                    echoed. The previous production measurement, 32d25d8c2f0bde… on commit db68182
-#                    (2026-08-11), was a DIFFERENT closure. The live value is ALWAYS /attestation,
-#                    never this file — the line above went stale for two days saying the cutover was
-#                    still in progress after it had finished.
+#   closure commit : 96cd4e468d2e094271d6633e95e9d552001c7860 (2026-08-23, merge of #55); the SAME
+#                    closure is what tag pcr0-60036cd3 (commit 3bf4f62c, 2026-09-02) compiles — the
+#                    lockfile changed between them, the enclave's transitive closure did not.
+#   strict PCR0s   : 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
+#                    (tag pcr0-103ccd79; SIGNER_REQUIRE_POLICY=1; measured 2026-08-23 and 2026-08-26)
+#                    60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71
+#                    (tag pcr0-60036cd3; SIGNER_REQUIRE_POLICY=1; measured 2026-09-02 by
+#                    scripts/reproducibility-from-public-clone.sh from a clean public clone)
+#   measured on    : x86_64 EC2 build host, nitro-cli 1.4.4, env -i, clean anonymous clone at the tag
+#   production     : NOT NAMED HERE. Twice this line called a value "production" and twice it went
+#                    stale (2026-08-24..26 said the cutover was in progress after it had finished;
+#                    2026-09-03..04 kept naming 103ccd79 after rotation R1 moved production off it).
+#                    The live value is ALWAYS https://signer.usenami.io:8443/attestation, then
+#                    isPCR0Active + owner on the registry. This file records closures and
+#                    measurements, dated — nothing about what runs today.
 #
 # Compare PCR0, never `sha256sum signer.eif`. Measured 2026-08-26: two builds of an
 # IDENTICAL tree gave two different EIF sha256 (f2a75885… and a2ea3c48…) with identical

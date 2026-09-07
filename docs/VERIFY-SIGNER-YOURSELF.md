@@ -112,8 +112,8 @@ def check(cond, msg):
 #      "Reproducible build"). This is the only source that owes nothing to us
 #      telling you the truth.
 #   2. Ask the on-chain registry which measurement is active and who owns it, then
-#      hold this endpoint to that. Production as of 2026-08-24:
-#      103ccd79…
+#      hold this endpoint to that. This file does not print the production value:
+#      read it from /attestation of the endpoint you are verifying.
 #   3. The measurement table in the README: commit -> flag -> value, and when each
 #      was deployed.
 #
@@ -264,7 +264,7 @@ names the source instead:
 
 | endpoint | measurement it attests | on-chain |
 |---|---|---|
-| mainnet / production | `103ccd79…`, registered 2026-08-24 | `(true, 0x21538eBF…)` |
+| mainnet / production | read it from that endpoint's `/attestation`; the dated record of what measured to what is the README table | `(true, 0x21538eBF…)` — the owner is the check, `true` alone is not |
 | `signer-demo.usenami.io:8443` | read it from that endpoint's `/attestation` | `true` while the box is on the registered image; `false` inside a rotation window (as on 2026-08-26) |
 
 So pick your expectation deliberately. Build the commit you intend to trust and use
