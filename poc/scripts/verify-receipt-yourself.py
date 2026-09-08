@@ -188,19 +188,37 @@ def cbor_load(b: bytes, i: int = 0):
 
     if mt == 0: return val, i
     if mt == 1: return -1 - val, i
+    # 🔴 Indefinite-length items are not an exotic corner: a live AWS NSM document
+    # uses them for the payload map, and the first version of this decoder refused
+    # them and never got past the outer array. Found by running against a real
+    # document, not by reading the spec — which is the whole argument for doing so.
     if mt in (2, 3):
-        if val is None: raise ValueError("CBOR: indefinite-length strings not supported")
+        if val is None:                             # chunks until the break marker
+            parts = []
+            while b[i] != 0xFF:
+                chunk, i = cbor_load(b, i); parts.append(chunk)
+            i += 1
+            joined = b"".join(parts) if mt == 2 else "".join(parts)
+            return joined, i
         raw = b[i:i + val]; i += val
         return (raw if mt == 2 else raw.decode("utf-8")), i
     if mt == 4:
         out = []
-        if val is None: raise ValueError("CBOR: indefinite-length arrays not supported")
+        if val is None:
+            while b[i] != 0xFF:
+                v, i = cbor_load(b, i); out.append(v)
+            return out, i + 1
         for _ in range(val):
             v, i = cbor_load(b, i); out.append(v)
         return out, i
     if mt == 5:
         out = {}
-        if val is None: raise ValueError("CBOR: indefinite-length maps not supported")
+        if val is None:
+            while b[i] != 0xFF:
+                k, i = cbor_load(b, i)
+                v, i = cbor_load(b, i)
+                out[k] = v
+            return out, i + 1
         for _ in range(val):
             k, i = cbor_load(b, i)
             v, i = cbor_load(b, i)
@@ -213,14 +231,29 @@ def cbor_load(b: bytes, i: int = 0):
     raise ValueError("CBOR: unsupported major type %d" % mt)
 
 
+def _cbor_head(major: int, n: int) -> bytes:
+    base = major << 5
+    if n < 24: return bytes([base | n])
+    if n < 256: return bytes([base | 24, n])
+    if n < 65536: return bytes([base | 25]) + n.to_bytes(2, "big")
+    return bytes([base | 26]) + n.to_bytes(4, "big")
+
+
 def cbor_bstr(x: bytes) -> bytes:
-    """Encode a byte string header + payload (only what Sig_structure needs)."""
-    n = len(x)
-    if n < 24: h = bytes([0x40 | n])
-    elif n < 256: h = bytes([0x58, n])
-    elif n < 65536: h = bytes([0x59]) + n.to_bytes(2, "big")
-    else: h = bytes([0x5A]) + n.to_bytes(4, "big")
-    return h + x
+    """Byte string (major type 2)."""
+    return _cbor_head(2, len(x)) + x
+
+
+def cbor_tstr(x: str) -> bytes:
+    """Text string (major type 3).
+
+    🔴 Sig_structure's first element is the TEXT "Signature1", not a byte string.
+    Encoding it as bytes gives a preimage that differs in exactly one header byte, so
+    every real signature fails to verify while every self-made test passes — the test
+    signs the same wrong preimage it checks. Found only against a live AWS document.
+    """
+    b = x.encode("utf-8")
+    return _cbor_head(3, len(b)) + b
 
 
 # NIST P-384 — the curve the NSM signs with. Same group arithmetic as secp256k1,
@@ -435,14 +468,19 @@ AWS_NITRO_ROOT_SHA256 = "641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c
 
 
 def parse_attestation_doc(doc_b64: str):
-    """Unwrap COSE_Sign1 and return (payload, protected_raw, sig, cert_der, cabundle)."""
+    """Unwrap COSE_Sign1 → (payload, protected, sig, payload_bytes, cert, cabundle).
+
+    `payload_bytes` is carried out as-is. The signature covers those exact bytes, and
+    re-encoding a parsed map would produce different ones — the first version did that
+    and the signature failed against a real AWS document for no other reason.
+    """
     import base64
     cose, _ = cbor_load(base64.b64decode(doc_b64))
     if not isinstance(cose, list) or len(cose) != 4:
         raise ValueError("not a COSE_Sign1 array of 4 elements")
     protected, _unprotected, payload_bytes, sig = cose
     payload, _ = cbor_load(payload_bytes)
-    return payload, protected, sig, payload.get("certificate"), payload.get("cabundle") or []
+    return payload, protected, sig, payload_bytes, payload.get("certificate"), payload.get("cabundle") or []
 
 
 def verify_attestation(doc_b64: str, report):
@@ -455,7 +493,7 @@ def verify_attestation(doc_b64: str, report):
     own key, signs their own document, and it verifies.
     """
     import base64, hashlib
-    payload, protected, sig, leaf, cabundle = parse_attestation_doc(doc_b64)
+    payload, protected, sig, payload_bytes, leaf, cabundle = parse_attestation_doc(doc_b64)
 
     # The pinned root is checked FIRST, and deliberately so. Verifying the COSE
     # signature against the certificate that came inside the same document proves
@@ -474,8 +512,8 @@ def verify_attestation(doc_b64: str, report):
                    % (root_fp[:16], AWS_NITRO_ROOT_SHA256[:16]))
         return None
 
-    sig_struct = b"\x84" + cbor_bstr(b"Signature1") + cbor_bstr(protected) \
-        + cbor_bstr(b"") + cbor_bstr(cbor_encode_payload(payload, doc_b64))
+    sig_struct = b"\x84" + cbor_tstr("Signature1") + cbor_bstr(protected) \
+        + cbor_bstr(b"") + cbor_bstr(payload_bytes)
     digest = hashlib.sha384(sig_struct).digest()
     r, s_ = int.from_bytes(sig[:48], "big"), int.from_bytes(sig[48:], "big")
     _tbs, leaf_key, _ = cert_parts(leaf)
@@ -495,25 +533,6 @@ def verify_attestation(doc_b64: str, report):
             return None
     report.ok("the chain ends at the pinned AWS Nitro root (%d certificates)" % len(chain))
     return payload
-
-
-def cbor_encode_payload(_payload, doc_b64: str) -> bytes:
-    """The payload bytes EXACTLY as they were signed — taken from the document, never
-    re-encoded. Re-serialising a parsed map would change bytes the signature covers."""
-    import base64
-    raw = base64.b64decode(doc_b64)
-    cose, _ = cbor_load(raw)
-    # Locate the third element's byte string without rebuilding it.
-    i = 1                                   # skip the array header (4 elements)
-    for _ in range(2):
-        _v, i = cbor_load(raw, i)
-    ib = raw[i]; ai = ib & 0x1F; j = i + 1
-    if ai == 24: n = raw[j]; j += 1
-    elif ai == 25: n = int.from_bytes(raw[j:j+2], "big"); j += 2
-    elif ai == 26: n = int.from_bytes(raw[j:j+4], "big"); j += 4
-    elif ai == 27: n = int.from_bytes(raw[j:j+8], "big"); j += 8
-    else: n = ai
-    return raw[j:j + n]
 
 
 # ── checks ───────────────────────────────────────────────────────────────────
@@ -884,6 +903,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest", help="offline: sign a receipt, then tamper with it and require every guard to bite")
+    at = sub.add_parser("attestation", help="check only the attestation document — chain, signature, measurement")
+    at.add_argument("--attestation", required=True, help="JSON you fetched yourself from GET /attestation")
+    at.add_argument("--nonce", help="the nonce you asked for; the signed document must echo it")
     v = sub.add_parser("verify", help="check a receipt you were handed")
     v.add_argument("--attestation", required=True, help="JSON you fetched yourself from GET /attestation")
     v.add_argument("--receipt", required=True, help="the receipt object from the response you were given")
@@ -894,6 +916,44 @@ def main() -> int:
 
     if a.cmd == "selftest":
         return selftest()
+
+    if a.cmd == "attestation":
+        att = _load(a.attestation, "attestation")
+        doc = att.get("attestation_doc_b64") if isinstance(att, dict) else None
+        if not doc:
+            print("NOT CHECKED: no attestation_doc_b64 in that file")
+            return 2
+        r = Report()
+        payload = verify_attestation(doc, r)
+        if payload is None:
+            print("\nVERIFICATION FAILED: the document did not hold up")
+            return 1
+        pcr0 = (payload.get("pcrs") or {}).get(0)
+        if isinstance(pcr0, (bytes, bytearray)):
+            r.ok("measurement in the signed document: %s… (pin it out of band)" % pcr0.hex()[:16])
+        if a.nonce:
+            got = payload.get("nonce")
+            got = got.hex() if isinstance(got, (bytes, bytearray)) else got
+            if got == a.nonce:
+                r.ok("the signed document echoes the nonce you asked for")
+            else:
+                r.bad("the signed document echoes the nonce you asked for",
+                      "asked %r, document says %r — this may be a cached document" % (a.nonce, got))
+        key = attested_signer(payload)
+        if key:
+            r.ok("receipt key in the signed document: %s" % key)
+            claimed = (att.get("data_pubkey_address") or "").lower()
+            if claimed and claimed != key:
+                r.bad("the gateway agrees with the signed document",
+                      "gateway says %s, document says %s" % (claimed, key))
+        else:
+            r.cant("this lane issues receipts",
+                   "the signed document carries no public_key — no data key provisioned here")
+        print()
+        if r.fail: print("VERIFICATION FAILED"); return 1
+        if r.skip: print("NOT FULLY CHECKED — this is not a pass"); return 2
+        print("VERIFIED: this attestation document was issued by AWS Nitro and says what it says")
+        return 0
 
     att = _load(a.attestation, "attestation")
     rec = _load(a.receipt, "receipt")
