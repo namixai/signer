@@ -253,24 +253,20 @@ check; a non-AWS chain fails the pinned-root path validation.
 
 ### Which commit rebuilds which measurement
 
-"Build it at a tag" is only useful if you know the tag. Each lane's measurement has one
-in this repository, and the tag answers "what source produced the number this enclave
-is attesting right now":
-
-| tag | commit | lane it was cut for |
-|---|---|---|
-| `pcr0-60036cd3` | `3bf4f62c99be` | production |
-| `pcr0-103ccd79` | `96cd4e468d2e` | public demo |
+"Build it at a tag" is only useful if you know the tag. The tag for each lane is listed
+in [Which commit rebuilds which measurement](REPRODUCIBLE-BUILD.md#which-commit-rebuilds-which-measurement),
+in the build guide — one table, kept in the document that is about building. Two copies
+of a table drift, and the copy that drifts is the one nobody is looking at.
 
 Build at the tag for the lane you are checking, take the measurement out of that lane's
 own attestation document, and compare the two.
 
-Do not take the pairing from this table alone. Lanes rotate independently, a table in
+Do not take the pairing from that table alone. Lanes rotate independently, a table in
 prose ages, and the document you fetch is what decides. If a lane's live measurement
-does not match the tag named here, the table is stale — that is a reason to ask us, not
+does not match the tag named there, the table is stale — that is a reason to ask us, not
 a failed build on your side.
 
-## Where the expected PCR0 comes from
+### Where the expected PCR0 comes from
 
 Nothing is baked in above, and that is the point. Earlier revisions of this file
 carried a default, which is how it drifted: between 2026-08-10 and 2026-08-24 the two
