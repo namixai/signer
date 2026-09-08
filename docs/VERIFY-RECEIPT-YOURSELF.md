@@ -75,10 +75,28 @@ counting holes as green is how a verifier turns into decoration.
 
 ## The four checks
 
-**Signed by the attested key.** The receipt is canonicalised (RFC 8785, keys sorted,
-every numeric carried as a decimal string so nothing rounds), hashed under a fixed
-domain tag, and the signature recovered to an address. That address has to equal
-`data_pubkey_address` in the attestation you fetched. Not one we sent you.
+**The attestation document is real before anything inside it is read.** The COSE
+document is unwrapped, its certificate chain is required to end at the AWS Nitro root
+pinned in the script, and the COSE signature is checked against the certificate that
+made it. Order matters here: verifying the signature against a certificate that
+arrived in the same document proves nothing, because someone forging the whole thing
+signs it with their own key. Only the pinned root makes any of it evidence.
+
+**Signed by the key the enclave attested.** The receipt is canonicalised (RFC 8785,
+keys sorted, every numeric a decimal string so nothing rounds), hashed under a fixed
+domain tag, and the signature recovered to an address. That address must equal the one
+derived from `public_key` **inside the signed document**.
+
+Not `data_pubkey_address` from the JSON beside it. That field is filled from the
+gateway's own configuration and binds nothing; a gateway that is compromised, or just
+misconfigured, puts whatever it likes there. The script compares the two and treats a
+disagreement as a finding of its own: the gateway is reporting something the enclave
+did not sign.
+
+**Signatures are canonical.** A high-`s` signature is a valid twin of a low-`s` one
+over the same digest and key. Accepting both would mean two byte-different receipts
+are each an authentic record of one decision, which is the thing a receipt exists to
+prevent. Low-`s` only, recovery id 27 or 28.
 
 **Bound to a measurement.** The script reads the measurement out of your attestation,
 prints it, and stops. It ships no expected value, deliberately. A number written into
@@ -95,6 +113,13 @@ yours, and the script says so instead of guessing.
 **Names what it judged against.** A denial carries the hash of the policy it was
 judged against. Empty `policy_hash` on a denial means the receipt says no without
 saying against what. The script fails on that.
+
+## Which lane you can run this on
+
+A lane that has not been given a data-signing key issues no receipts, and its
+attestation document carries no `public_key`. That is a real state, not a fault, and
+the script says `NOT CHECKED` rather than passing. The demo lane is in that state
+today, so this page is exercisable against production and not against demo.
 
 ## If it fails
 
