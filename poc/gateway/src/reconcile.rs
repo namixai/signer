@@ -238,6 +238,10 @@ pub async fn run<O: VenueOps, C: Clock>(
         .cloned()
         .collect();
     let mut phase = ReconcilePhase::Failed;
+    // Set the moment a cancel comes back through the AF-2 intent gate. Not a retry
+    // counter: this failure never becomes a success, so the only useful number of
+    // further attempts is zero.
+    let mut intent_gated = false;
 
     'rounds: while rounds < MAX_ROUNDS {
         rounds += 1;
@@ -281,6 +285,16 @@ pub async fn run<O: VenueOps, C: Clock>(
                             CancelOutcome::Failed(e) => {
                                 pv.error = Some(truncate(e, 300));
                                 warn!(event = "tenant_reconcile_cancel_failed", customer = %customer, venue = %v, order_id = %o.order_id, error = %e);
+                                // 🔴 MED-2, gateway half. For an AF-2 tenant EVERY cancel
+                                // fails the same way and always will: the intent key belongs
+                                // to the agent and this job cannot hold it. Retrying is not
+                                // just useless, it is harmful — N orders x MAX_ROUNDS pointless
+                                // enclave round-trips during an incident, when the box is
+                                // busiest, and the operator gets N identical errors instead of
+                                // one instruction. Stop on the first one and say what to do.
+                                if e.contains(INTENT_GATE_MARK) {
+                                    intent_gated = true;
+                                }
                             }
                         }
                     }
@@ -291,6 +305,9 @@ pub async fn run<O: VenueOps, C: Clock>(
             s.rounds = rounds;
             s.venues = progress.clone();
         });
+        if intent_gated {
+            break 'rounds;
+        }
         if all_clean && rounds > 1 {
             // A round with nothing to cancel anywhere AFTER cancels were sent —
             // the re-list confirms the book is clean.
@@ -321,6 +338,19 @@ pub async fn run<O: VenueOps, C: Clock>(
     // page to the operator. Any unsupported venue now fails the job and names
     // itself in the error the healthcheck pages with.
     let mut job_error: Option<String> = None;
+    if intent_gated {
+        // Phase stays `Failed` — it starts there and only a verified-empty book turns
+        // it `Done`, so nothing here claims success. What was missing is the
+        // instruction, and an operator reading N identical HTTP 400s does not get one.
+        job_error = Some(
+            "this tenant's policy requires a signed cancel intent (AF-2) and the unwind job \
+             holds no agent key — it cannot cancel ANY of these orders, now or on a retry. \
+             The stop itself is in force: no NEW signing happens. The resting book must be \
+             cleared by hand at the venue. Stopped after the first refusal rather than \
+             repeating it per order per round."
+                .to_owned(),
+        );
+    }
     let unsupported: Vec<&str> = venues
         .iter()
         .filter(|v| !ops.supported(v))
@@ -430,10 +460,16 @@ enum SignKind {
 /// The job reports `Failed` either way (the phase starts there and only a
 /// verified-empty book turns it `Done`), so nothing ever claimed success — what
 /// was missing is the REASON, which is all this adds.
+/// Stable marker inside the cancel-400 hint. The round loop keys off THIS, not off
+/// the prose around it: a message is written for a human and will be reworded, and a
+/// control decision that depends on wording breaks silently the first time someone
+/// improves the sentence.
+pub const INTENT_GATE_MARK: &str = "af2-intent-gate";
+
 fn refusal_hint(status: u16, kind: SignKind) -> &'static str {
     match (status, kind) {
         (400, SignKind::Cancel) => {
-            " — most likely this tenant's policy requires a \
+            " [af2-intent-gate] — most likely this tenant's policy requires a \
 signed cancel intent (AF-2) and the unwind job holds no agent key, so it cannot \
 cancel here at all: cancel by hand via the venue UI. Other 400 causes: the venue \
 blob is missing for this customer, or the token no longer resolves"
@@ -1412,6 +1448,50 @@ mod tests {
     /// unwind can NEVER satisfy it — the intent key belongs to the agent. Naming
     /// it is the whole fix (MED-2): the stop already reports `Failed`, it just did
     /// not say why.
+    /// 🔴 The control decision keys off a STABLE MARKER, never off the prose.
+    /// A hint is written for a human and will be reworded; a short-circuit that
+    /// depends on wording breaks silently the first time someone improves the
+    /// sentence, and the breakage looks like "the unwind just retries a lot".
+    #[test]
+    fn the_cancel_hint_carries_the_marker_the_round_loop_keys_off() {
+        assert!(
+            refusal_hint(400, SignKind::Cancel).contains(INTENT_GATE_MARK),
+            "the cancel-400 hint must carry {INTENT_GATE_MARK} — the round loop stops on it"
+        );
+        // And nothing else may carry it: a read 400 is not the intent gate, and a
+        // short-circuit fired on a listing failure would abandon a book we could
+        // still have cleared.
+        for (st, kind) in [
+            (400, SignKind::Read),
+            (401, SignKind::Cancel),
+            (403, SignKind::Cancel),
+            (500, SignKind::Cancel),
+        ] {
+            assert!(
+                !refusal_hint(st, kind).contains(INTENT_GATE_MARK),
+                "{st}/{kind:?} must not carry the intent-gate marker"
+            );
+        }
+    }
+
+    /// The whole point of the short-circuit: this failure never becomes a success,
+    /// so the only useful number of further attempts is zero.
+    #[test]
+    fn the_marker_is_detectable_in_a_real_failure_string() {
+        let e = format!(
+            "sign okx cancel refused: HTTP 400{}",
+            refusal_hint(400, SignKind::Cancel)
+        );
+        assert!(
+            e.contains(INTENT_GATE_MARK),
+            "round loop would not see it: {e}"
+        );
+        assert!(
+            e.contains("by hand"),
+            "the operator still needs the instruction: {e}"
+        );
+    }
+
     #[test]
     fn a_cancel_400_names_the_intent_gate_and_the_manual_way_out() {
         let hint = refusal_hint(400, SignKind::Cancel);
