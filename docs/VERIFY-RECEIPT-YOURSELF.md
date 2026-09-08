@@ -100,6 +100,27 @@ keys sorted, every numeric a decimal string so nothing rounds), hashed under a f
 domain tag, and the signature recovered to an address. That address must equal the one
 derived from `public_key` **inside the signed document**.
 
+If you are writing your own verifier rather than running this one, two details about
+that canonical form will decide whether you ever reach a digest at all.
+
+The canonicalisation is RFC 8785 with one restriction: **JSON numbers are refused, not
+encoded.** Every numeric in a receipt — `seq`, `supplied_ts_ms` — travels as a decimal
+string, so there is no float to round and no integer whose JSON spelling differs
+between one language and the next. If a number reaches the canonicaliser, the receipt
+is not the shape we sign, and guessing at an encoding would hand you a signature check
+that passes for the wrong reason. Keep those fields as strings when you parse; a
+language that helpfully turns `"41"` into `41` will give you a digest nobody signed.
+
+And the signature covers a fixed list of fields, not "the receipt as it arrived":
+
+    v, decision, reason_code, customer_id, action, request_hash,
+    intent_sig_hash, policy_hash, supplied_ts_ms, boot_id, seq
+
+Every one must be present — a missing field is a refusal to compute, not a field
+skipped. The heartbeat signs its own shorter list: `v`, `boot_id`, `customer_id`,
+`seq_next`, `client_nonce`, `registry_version`, `entry_hash`. Anything outside these
+lists is not signed, so treat it as the gateway talking, not the enclave.
+
 Not `data_pubkey_address` from the JSON beside it. That field is filled from the
 gateway's own configuration and binds nothing; a gateway that is compromised, or just
 misconfigured, puts whatever it likes there. The script compares the two and treats a

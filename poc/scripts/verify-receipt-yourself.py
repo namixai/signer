@@ -445,20 +445,32 @@ def receipt_digest(receipt: dict) -> bytes:
     return keccak256(DOMAIN + canonical_v1(body))
 
 
-def recover_receipt_signer(receipt: dict) -> str:
-    sig = receipt.get("signature") or {}
+def canonical_sig(sig, what: str = "receipt") -> tuple:
+    """(r, s, v) from a signature object, or a named refusal.
+
+    Shared by receipts and heartbeats on purpose. The low-s rule was on receipts only,
+    and the heartbeat — whose counter every continuity check rests on — took whatever
+    it was handed. One rule, one place, so the next signed thing cannot quietly get a
+    weaker one.
+    """
+    if not isinstance(sig, dict):
+        raise ValueError("%s signature is missing or is not an object" % what)
     for f in ("r", "s", "v"):
         if f not in sig:
-            raise ValueError("receipt signature is missing '%s'" % f)
-    r_i, s_i, v_i = int(sig["r"], 16), int(sig["s"], 16), int(sig["v"])
-    # 🔴 Malleability. (r, s, v) and (r, N-s, v^1) are both valid signatures over the
-    # same digest by the same key. Accepting the high-s form lets anyone hand you a
-    # byte-different receipt that still verifies — two distinct "authentic" records of
-    # one decision, which is exactly what a receipt exists to prevent.
+            raise ValueError("%s signature is missing '%s'" % (what, f))
+    try:
+        r_i, s_i, v_i = int(str(sig["r"]), 16), int(str(sig["s"]), 16), int(sig["v"])
+    except (TypeError, ValueError):
+        raise ValueError("%s signature fields are not hex/int" % what) from None
     if s_i > _N // 2:
-        raise ValueError("signature uses the high-s form; canonical receipts are low-s only")
+        raise ValueError("%s signature uses the high-s form; canonical signatures are low-s only" % what)
     if v_i not in (27, 28):
-        raise ValueError("recovery id is %d; receipts use 27 or 28" % v_i)
+        raise ValueError("%s recovery id is %d; 27 or 28 expected" % (what, v_i))
+    return r_i, s_i, v_i
+
+
+def recover_receipt_signer(receipt: dict) -> str:
+    r_i, s_i, v_i = canonical_sig(receipt.get("signature"), "receipt")
     digest = receipt_digest(receipt)
     return address_of_point(recover_pubkey(digest, r_i, s_i, v_i))
 
@@ -540,6 +552,10 @@ class Report:
     def __init__(self):
         self.fail = 0
         self.skip = 0
+        # The names of what failed, not just how many. A test that asserts "it went red"
+        # passes when it goes red for the wrong reason — which is how a check that only
+        # ever fails in the parser gets mistaken for a check of the thing it names.
+        self.failed = []
 
     def ok(self, what: str) -> None:
         print("  ok    %s" % what)
@@ -547,6 +563,7 @@ class Report:
     def bad(self, what: str, detail: str = "") -> None:
         print("  FAIL  %s%s" % (what, (" — " + detail) if detail else ""))
         self.fail += 1
+        self.failed.append(what)
 
     def cant(self, what: str, why: str) -> None:
         # Not a pass. A check you could not run is a hole, and calling it green is
@@ -613,12 +630,16 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
     #     enclave did not sign is itself the finding.
     claimed = att_json.get("data_pubkey_address")
     if want and isinstance(claimed, str) and claimed:
-        if claimed.lower() == want:
+        # A bare hex address without the 0x prefix is a formatting difference, not a
+        # disagreement; reporting it as one would send the reader hunting a phantom.
+        claimed = claimed.strip().lower()
+        claimed = claimed if claimed.startswith("0x") else "0x" + claimed
+        if claimed == want:
             r.ok("the gateway's data_pubkey_address agrees with the signed document")
         else:
             r.bad("the gateway's data_pubkey_address agrees with the signed document",
                   "gateway says %s, the signed document says %s — the gateway is not "
-                  "reporting what the enclave attested" % (claimed.lower(), want))
+                  "reporting what the enclave attested" % (claimed, want))
 
     # 2. Bound to the measurement of the lane you asked. We deliberately do NOT
     #    print an expected measurement here: a number written into a script is
@@ -655,8 +676,8 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
             try:
                 body = {k: hb[k] for k in HEARTBEAT_SIGNED_FIELDS if k in hb}
                 d = keccak256(HEARTBEAT_DOMAIN + canonical_v1(body))
-                got_hb = address_of_point(recover_pubkey(
-                    d, int(hb_sig["r"], 16), int(hb_sig["s"], 16), int(hb_sig["v"])))
+                hr, hs, hv = canonical_sig(hb_sig, "heartbeat")
+                got_hb = address_of_point(recover_pubkey(d, hr, hs, hv))
                 if got_hb == want:
                     r.ok("heartbeat is signed by the attested key")
                 else:
@@ -679,13 +700,16 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
                   "receipt boot_id %s, heartbeat %s — different boot, counts are not comparable"
                   % (receipt.get("boot_id"), hb_boot))
         else:
+            seq = receipt.get("seq")
             try:
-                if int(receipt["seq"]) < int(seq_next):
-                    r.ok("receipt is inside the current chain (seq %s < next %s)" % (receipt["seq"], seq_next))
+                if seq is None:
+                    r.bad("receipt is inside the current chain", "the receipt carries no seq")
+                elif int(seq) < int(seq_next):
+                    r.ok("receipt is inside the current chain (seq %s < next %s)" % (seq, seq_next))
                 else:
                     r.bad("receipt is inside the current chain",
                           "seq %s is not below next %s — the receipt claims a decision the enclave has not issued"
-                          % (receipt["seq"], seq_next))
+                          % (seq, seq_next))
             except (TypeError, ValueError) as e:
                 r.bad("receipt is inside the current chain", "seq/seq_next not decimal strings: %s" % e)
 
@@ -716,15 +740,96 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
     return r
 
 
+
+# ── building a forgery, for the selftest only ────────────────────────────────
+#
+# An attacker does not send garbage. They send a document that is well-formed in every
+# respect and signed by their own key. To test that the pinned root is what refuses it,
+# the test has to be able to build exactly that.
+def _der(tag: int, content: bytes) -> bytes:
+    n = len(content)
+    if n < 0x80:
+        ln = bytes([n])
+    elif n < 0x100:
+        ln = bytes([0x81, n])
+    else:
+        ln = bytes([0x82]) + n.to_bytes(2, "big")
+    return bytes([tag]) + ln + content
+
+
+def _der_int(x: int) -> bytes:
+    b = x.to_bytes((x.bit_length() + 7) // 8 or 1, "big")
+    return _der(0x02, (b"\x00" + b) if b[0] & 0x80 else b)
+
+
+def _p384_sign(d: int, digest: bytes) -> tuple:
+    """Test-only P-384 ECDSA; nonce derived from the message, as in `_sign_digest`."""
+    import hashlib
+    z = int.from_bytes(digest[:48], "big")
+    k = int.from_bytes(hashlib.sha384(digest + b"forged-attestation").digest(), "big") % _P384_N or 1
+    R = _p384_mul(k, (_P384_GX, _P384_GY))
+    r = R[0] % _P384_N
+    return r, (pow(k, _P384_N - 2, _P384_N) * (z + r * d)) % _P384_N
+
+
+def _forged_cert(d: int, pub: tuple) -> bytes:
+    """A self-signed certificate that this verifier's own parser accepts.
+
+    Minimal on purpose: exactly the shape `cert_parts` reads — a tbsCertificate whose
+    SubjectPublicKeyInfo carries an uncompressed P-384 point, and a signature over that
+    tbs made with the matching key. An attacker has no reason to send more than the
+    verifier looks at.
+    """
+    import hashlib
+    point = b"\x04" + pub[0].to_bytes(48, "big") + pub[1].to_bytes(48, "big")
+    algid = _der(0x30, b"\x06\x07\x2a\x86\x48\xce\x3d\x02\x01")      # id-ecPublicKey
+    spki = _der(0x30, algid + _der(0x03, b"\x00" + point))
+    tbs = _der(0x30, _der_int(1) + spki)
+    r, sg = _p384_sign(d, hashlib.sha384(tbs).digest())
+    return _der(0x30, tbs + algid + _der(0x03, b"\x00" + _der(0x30, _der_int(r) + _der_int(sg))))
+
+
+def _forged_attestation() -> tuple:
+    """(base64 COSE_Sign1, the leaf certificate). Signed for real, chains to itself."""
+    import base64, hashlib
+    d_att = 0xA77AC4E12F9B3D7615C0E48A2B6D91F03E5C87A4D2B90F16E3C7A85B4D2F901E6C3A79B5
+    pub = _p384_mul(d_att, (_P384_GX, _P384_GY))
+    cert = _forged_cert(d_att, pub)
+    prot = b"\xa1\x01\x38\x22"                                       # {1: -35} — ES384
+    payload_bytes = (_cbor_head(5, 4)
+                     + cbor_tstr("pcrs") + _cbor_head(5, 1) + _cbor_head(0, 0) + cbor_bstr(b"\xbb" * 48)
+                     + cbor_tstr("public_key") + cbor_bstr(b"\x02" + b"\x11" * 32)
+                     + cbor_tstr("certificate") + cbor_bstr(cert)
+                     + cbor_tstr("cabundle") + _cbor_head(4, 1) + cbor_bstr(cert))
+    sig_struct = b"\x84" + cbor_tstr("Signature1") + cbor_bstr(prot) \
+        + cbor_bstr(b"") + cbor_bstr(payload_bytes)
+    r, sg = _p384_sign(d_att, hashlib.sha384(sig_struct).digest())
+    cose = (bytes([0x84]) + cbor_bstr(prot) + bytes([0xA0]) + cbor_bstr(payload_bytes)
+            + cbor_bstr(r.to_bytes(48, "big") + sg.to_bytes(48, "big")))
+    return base64.b64encode(cose).decode(), cert
+
+
 # ── selftest: offline, and it FALSIFIES itself ───────────────────────────────
 #
 # A checker that only ever sees good input has not been tested — it has been
 # demonstrated. So the selftest builds a receipt, signs it, confirms the check
 # passes, and then breaks each guarded property in turn and requires the check to
 # go red. If any tamper still passes, the corresponding guard is decorative.
-def _sign_digest(pk: int, digest: bytes, k: int) -> dict:
-    """Test-only ECDSA. Fixed nonce `k` — fine here (one key, one message per run),
-    NEVER acceptable for real signing: two signatures under one k leak the key."""
+def _sign_digest(pk: int, digest: bytes) -> dict:
+    """Test-only ECDSA over secp256k1.
+
+    The nonce is derived from the message, so two different digests never share one.
+    That is not a stylistic point: ECDSA leaks the private key outright to anyone who
+    sees two signatures made under the same k, by subtracting the two equations. The
+    earlier version took a fixed k as an argument and the selftest passed the same one
+    to four different receipts — harmless with a hardcoded test key, and exactly the
+    shape a reader would copy into something that is not a test.
+
+    Still not what real signing should use: RFC 6979 also mixes in the private key, so
+    the nonce cannot be predicted from the message alone. This derivation is enough to
+    keep the selftest honest and nothing more.
+    """
+    k = int.from_bytes(keccak256(digest + b"verify-receipt-yourself/selftest"), "big") % _N or 1
     z = int.from_bytes(digest, "big")
     R = _pt_mul(k, _G)
     r = R[0] % _N
@@ -733,6 +838,44 @@ def _sign_digest(pk: int, digest: bytes, k: int) -> dict:
     if s > _N // 2:
         s = _N - s
     return {"r": "0x%064x" % r, "s": "0x%064x" % s, "v": 27 + recid}
+
+
+def known_answer_vectors() -> int:
+    """Check each primitive against a value this code did not produce.
+
+    🔴 Why this runs before anything else. The rest of the selftest signs with the same
+    keccak, the same canonical form and the same recovery code it then checks — so a
+    primitive that is WRONG BUT SELF-CONSISTENT stays green forever while nothing real
+    ever verifies. That is not hypothetical: `Sig_structure`'s first element was encoded
+    as a byte string instead of a text string, one header byte, and every self-made test
+    passed while every genuine AWS signature failed. It was caught only by a signature
+    this code did not make.
+
+    So: values from outside. Keccak-256 published digests, an Ethereum key/address pair
+    from public test material, and the RFC 8785 key-ordering example.
+    """
+    bad = 0
+    cases = [
+        ("keccak256 of the empty string", keccak256(b"").hex(),
+         "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+        ("keccak256 of 'abc'", keccak256(b"abc").hex(),
+         "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45"),
+        ("address from a published private key",
+         address_of_privkey("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"),
+         "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"),
+        # RFC 8785 sorts object keys by UTF-16 code unit, which is NOT byte order:
+        # get it wrong and every signature over a multi-key object is wrong with it.
+        ("canonical-v1 key order (RFC 8785)",
+         canonical_v1({"\u20ac": "Euro", "\u05d3\u05bc": "Hebrew", "1": "One",
+                       "\U0001f602": "Emoji"}).decode("utf-8"),
+         '{"1":"One","\u05d3\u05bc":"Hebrew","\u20ac":"Euro","\U0001f602":"Emoji"}'),
+    ]
+    for name, got, want in cases:
+        if got == want:
+            print("  ok    %s" % name)
+        else:
+            print("  FAIL  %s\n        got  %s\n        want %s" % (name, got, want)); bad += 1
+    return bad
 
 
 def selftest() -> int:
@@ -754,16 +897,19 @@ def selftest() -> int:
         "policy_hash": "0x" + "22" * 32, "supplied_ts_ms": "1757000000000",
         "boot_id": "boot-abc", "seq": "41",
     }
-    rec["signature"] = _sign_digest(pk, receipt_digest(rec), k=0x1234567890ABCDEF)
+    rec["signature"] = _sign_digest(pk, receipt_digest(rec))
     hb_body = {"v": "1", "boot_id": "boot-abc", "customer_id": "acme",
                "seq_next": "42", "client_nonce": "n0"}
     hb_sig = _sign_digest(pk, keccak256(HEARTBEAT_DOMAIN + canonical_v1(
-        {k: hb_body[k] for k in HEARTBEAT_SIGNED_FIELDS if k in hb_body})), k=0x2468ACE0)
+        {k: hb_body[k] for k in HEARTBEAT_SIGNED_FIELDS if k in hb_body})))
     hb = {"heartbeat": dict(hb_body, signature=hb_sig)}
+
+    print("── primitives against values this code did not produce")
+    fails_kav = known_answer_vectors()
 
     print("── the receipt as issued")
     base = check(payload, att, json.loads(json.dumps(rec)), hb, "notional_over_cap", "n0")
-    fails = 0
+    fails = fails_kav
     if base.fail or base.skip:
         print("  FAIL  a well-formed receipt must verify cleanly")
         fails += 1
@@ -783,7 +929,7 @@ def selftest() -> int:
         bad = json.loads(json.dumps(rec))
         mutate(bad)
         if resign:
-            bad["signature"] = _sign_digest(pk, receipt_digest(bad), k=0x0FEDCBA987654321)
+            bad["signature"] = _sign_digest(pk, receipt_digest(bad))
         print("── tampered%s: %s" % (" and re-signed" if resign else "", name))
         rep = check(payload, att, bad, hb, "notional_over_cap", "n0")
         if rep.fail == 0:
@@ -854,7 +1000,7 @@ def selftest() -> int:
     # E: a receipt shape this script does not understand must not be waved through.
     print("── receipt of an unknown version")
     d = json.loads(json.dumps(rec)); d["v"] = "9"
-    d["signature"] = _sign_digest(pk, receipt_digest(d), k=0x13579BDF)
+    d["signature"] = _sign_digest(pk, receipt_digest(d))
     rep = check(payload, att, d, hb, "notional_over_cap", "n0")
     if rep.skip == 0 and rep.fail == 0:
         print("  FAIL  an unknown receipt version was accepted"); fails += 1
@@ -865,24 +1011,55 @@ def selftest() -> int:
     if rep.skip == 0:
         print("  FAIL  a document with no public_key was treated as checkable"); fails += 1
 
-    # A: a document forged end to end. This is the finding that made the first
-    # version worthless: it never looked at the COSE document at all, so an
-    # attacker's own attestation plus a receipt under their own key printed VERIFIED.
-    print("── attestation forged whole (own key, own chain)")
-    import base64
-    fake_payload = {"pcrs": {0: b"\xbb" * 48}, "public_key": b"\x02" + b"\x11" * 32,
-                    "certificate": b"not-a-cert", "cabundle": [b"not-a-root"]}
-    # A CBOR array of four: protected, unprotected, payload, signature.
-    fake = bytes([0x84]) + cbor_bstr(b"") + bytes([0xA0]) + cbor_bstr(b"\xA0") + cbor_bstr(b"\x00" * 96)
+    # A: a document forged end to end, and forged WELL. This is the finding that made
+    # the first version of this script worthless: it never looked at the COSE document
+    # at all, so an attacker's own attestation plus a receipt under their own key
+    # printed VERIFIED.
+    #
+    # 🔴 The version after that fixed the script but not the test. It handed
+    #    `verify_attestation` a stub — an empty CBOR map, a zero signature, the literal
+    #    bytes `not-a-cert` — which died in the certificate parser, and the test called
+    #    that "rejected". A parse error says nothing about the guard the test names.
+    #    The document below is well-formed in every respect: a real P-384 key, a real
+    #    self-signed certificate, a real COSE signature over the real payload bytes. It
+    #    verifies perfectly against itself. The only thing that can refuse it is the
+    #    pinned root — so the test asserts not merely that it went red, but WHICH check
+    #    went red, and then proves the forgery was sound by pinning the attacker's own
+    #    root and requiring the very same document to pass.
+    global AWS_NITRO_ROOT_SHA256
+    import hashlib
+    forged_b64, forged_cert = _forged_attestation()
+
+    print("── attestation forged whole (own key, own chain, valid signature)")
     r_fake = Report()
     try:
-        got = verify_attestation(base64.b64encode(fake).decode(), r_fake)
-    except Exception:                                             # noqa: BLE001
-        got, _ = None, r_fake.bad("forged attestation is rejected", "parse failed, which is a rejection")
-    if got is not None or r_fake.fail == 0:
+        got = verify_attestation(forged_b64, r_fake)
+    except Exception as e:                                        # noqa: BLE001
+        got = None
+        r_fake.bad("forged attestation is rejected", "parse failed: %s" % e)
+    if got is not None:
         print("  FAIL  a forged attestation document was accepted"); fails += 1
+    elif not any("pinned AWS Nitro root" in w for w in r_fake.failed):
+        print("  FAIL  the forgery was refused, but NOT by the root pin: %s" % r_fake.failed)
+        fails += 1
     else:
-        print("  ok    forged attestation rejected before anything inside it was read")
+        print("  ok    forged attestation refused by the pinned root")
+
+    print("── the same forged document, with the attacker's own root pinned")
+    real_root = AWS_NITRO_ROOT_SHA256
+    AWS_NITRO_ROOT_SHA256 = hashlib.sha256(forged_cert).hexdigest()
+    try:
+        r_pin = Report()
+        got2 = verify_attestation(forged_b64, r_pin)
+    finally:
+        AWS_NITRO_ROOT_SHA256 = real_root
+    if got2 is None or r_pin.fail:
+        print("  FAIL  the forgery is malformed, so the rejection above was the parser, "
+              "not the pin (%s)" % r_pin.failed)
+        fails += 1
+    else:
+        print("  ok    it passes once its own root is pinned — the document was sound,")
+        print("        and the pin is what refused it")
 
     print()
     print("selftest: every guard bites" if fails == 0 else "selftest: %d GUARD(S) DECORATIVE" % fails)
@@ -896,7 +1073,30 @@ def _load(path: str, what: str):
         with open(path, "rb") as fh:
             return json.load(fh)
     except Exception as e:                                        # noqa: BLE001
-        sys.exit("cannot read %s (%s): %s" % (what, path, e))
+        # 2, not 1. "I could not read your file" is not "your receipt failed": exit 1
+        # tells the reader the thing they hold is bad, when in fact nothing was checked.
+        print("NOT CHECKED: cannot read %s (%s): %s" % (what, path, e))
+        sys.exit(2)
+
+
+def _load_obj(path: str, what: str):
+    """`_load`, and the result must be a JSON object.
+
+    🔴 Three different things must not print the same way, and the difference is the
+    whole point of this script. "Your receipt does not hold up" is exit 1. "I could not
+    check it" is exit 2. And "the file you handed me is not the thing you think it is"
+    is also exit 2, but it has to SAY that — otherwise a reader who passed a JSON array
+    by mistake reads `no attestation_doc_b64` and concludes the enclave failed to
+    attest, or reads `the gateway refused` and concludes something about the gateway.
+    Neither happened. Nothing was checked at all.
+    """
+    v = _load(path, what)
+    if v is None or isinstance(v, dict):
+        return v
+    print("NOT CHECKED: %s (%s) is a JSON %s, not an object — this is about the file you"
+          % (what, path, type(v).__name__))
+    print("passed, not about the %s itself. Nothing was verified." % what)
+    sys.exit(2)
 
 
 def main() -> int:
@@ -918,8 +1118,8 @@ def main() -> int:
         return selftest()
 
     if a.cmd == "attestation":
-        att = _load(a.attestation, "attestation")
-        doc = att.get("attestation_doc_b64") if isinstance(att, dict) else None
+        att = _load_obj(a.attestation, "attestation")
+        doc = att.get("attestation_doc_b64")
         if not doc:
             print("NOT CHECKED: no attestation_doc_b64 in that file")
             return 2
@@ -955,21 +1155,21 @@ def main() -> int:
         print("VERIFIED: this attestation document was issued by AWS Nitro and says what it says")
         return 0
 
-    att = _load(a.attestation, "attestation")
-    rec = _load(a.receipt, "receipt")
+    att = _load_obj(a.attestation, "attestation")
+    rec = _load_obj(a.receipt, "receipt")
     if isinstance(rec, dict) and "receipt" in rec and isinstance(rec["receipt"], dict):
         rec = rec["receipt"]          # a whole response was passed; take the receipt out of it
     # 🔴 A refusal WITHOUT a receipt is not a failed verification — there is nothing to
     #    verify. Reporting it as FAILED would tell the reader the receipt is bad when
     #    the gateway simply did not issue one.
-    if not isinstance(rec, dict) or "signature" not in rec:
+    if "signature" not in rec:
         print("NOT CHECKED: the response carries no receipt — the gateway refused before")
         print("the enclave decided, or this lane issues no receipts. Nothing to verify.")
         return 2
 
     print("── the attestation document")
     r0 = Report()
-    doc = att.get("attestation_doc_b64") if isinstance(att, dict) else None
+    doc = att.get("attestation_doc_b64")
     if not doc:
         r0.cant("attestation document present",
                 "no attestation_doc_b64 — without the signed document there is nothing to "
@@ -984,8 +1184,8 @@ def main() -> int:
         if payload is None:
             payload = {}
     print()
-    rep = check(payload, att if isinstance(att, dict) else {}, rec,
-                _load(a.heartbeat, "heartbeat"), a.expect_reason, a.nonce)
+    rep = check(payload, att, rec,
+                _load_obj(a.heartbeat, "heartbeat"), a.expect_reason, a.nonce)
     rep.fail += r0.fail
     rep.skip += r0.skip
     print()
