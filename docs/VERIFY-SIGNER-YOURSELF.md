@@ -251,6 +251,21 @@ Any tampering fails loudly: a forged document breaks the COSE signature; a docum
 from a different image fails the PCR0 check; a stale/cached document fails the nonce
 check; a non-AWS chain fails the pinned-root path validation.
 
+### Which commit rebuilds which measurement
+
+"Build it at a tag" is only useful if you know the tag. The tag for each lane is listed
+in [Which commit rebuilds which measurement](REPRODUCIBLE-BUILD.md#which-commit-rebuilds-which-measurement),
+in the build guide — one table, kept in the document that is about building. Two copies
+of a table drift, and the copy that drifts is the one nobody is looking at.
+
+Build at the tag for the lane you are checking, take the measurement out of that lane's
+own attestation document, and compare the two.
+
+Do not take the pairing from that table alone. Lanes rotate independently, a table in
+prose ages, and the document you fetch is what decides. If a lane's live measurement
+does not match the tag named there, the table is stale — that is a reason to ask us, not
+a failed build on your side.
+
 ### Where the expected PCR0 comes from
 
 Nothing is baked in above, and that is the point. Earlier revisions of this file

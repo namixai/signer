@@ -46,6 +46,25 @@ real source of drift we hit and closed:
 
 ---
 
+## Which commit rebuilds which measurement
+
+"Build it at a tag" is only useful if you know the tag. Each lane's measurement has one
+in this repository, and the tag answers "what source produced the number this enclave
+is attesting right now":
+
+| tag | commit | lane it was cut for |
+|---|---|---|
+| `pcr0-60036cd3` | `3bf4f62c99be` | production |
+| `pcr0-103ccd79` | `96cd4e468d2e` | public demo |
+
+Build at the tag for the lane you are checking, take the measurement out of that lane's
+own attestation document, and compare the two.
+
+Do not take the pairing from this table alone. Lanes rotate independently, a table in
+prose ages, and the document you fetch is what decides. If a lane's live measurement
+does not match the tag named here, the table is stale — that is a reason to ask us, not
+a failed build on your side.
+
 ## Prerequisites
 
 - A Linux host with **Docker** and **AWS `nitro-cli`** installed (`nitro-cli`
