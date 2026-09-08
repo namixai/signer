@@ -110,13 +110,49 @@ for KEY in alias/signer-mainnet-binance alias/signer-mainnet-okx \
            alias/signer-mainnet-hyperliquid alias/signer-mainnet-registry ; do
   echo "== $KEY =="
   aws kms get-key-policy --key-id "$KEY" --policy-name default --query Policy --output text \
-  | python3 -c 'import sys,json; p=json.load(sys.stdin)
-allow=[s["Condition"]["StringEquals"]["kms:RecipientAttestation:ImageSha384"]
-       for s in p["Statement"] if s.get("Effect")=="Allow" and "Attestation" in s.get("Sid","")]
-deny =[s for s in p["Statement"] if s.get("Effect")=="Deny" and s.get("Principal")=="*"
-       and set(s.get("Action",[]))>={"kms:Decrypt","kms:ReEncryptFrom","kms:ReEncryptTo"}]
+  | python3 -c 'import sys,json
+p = json.load(sys.stdin)
+
+def as_list(v):
+    # An IAM policy may write a single Action or Principal as a bare string. Treating
+    # a string as a collection iterates its CHARACTERS, and the membership test below
+    # then fails on a key that is in fact protected — a false "not covered" in the one
+    # place where a false negative is worst.
+    if v is None: return []
+    return v if isinstance(v, list) else [v]
+
+def principals(s):
+    pr = s.get("Principal")
+    if isinstance(pr, dict): return [x for v in pr.values() for x in as_list(v)]
+    return as_list(pr)
+
+# Select on the CONDITION, never on the Sid. A Sid is a free-form label: ours read
+# "EnclaveAttestedDecryptOnly", and a filter looking for the substring "Attestation"
+# matched none of them — so this printed an empty allow-set on keys that are in fact
+# attestation-bound, and the acceptance test below could never pass. Verified against
+# a live policy, not by eye.
+allow, skipped = [], []
+for s in p.get("Statement", []):
+    if s.get("Effect") != "Allow": continue
+    cond = (s.get("Condition") or {}).get("StringEquals") or {}
+    m = cond.get("kms:RecipientAttestation:ImageSha384")
+    if m is not None:
+        allow += as_list(m)
+    elif "attest" in json.dumps(s).lower():
+        # Looks attestation-related but carries no measurement condition. Not a crash,
+        # and not a silent drop either: an unread statement is not a checked one.
+        skipped.append(s.get("Sid", "<no Sid>"))
+
+need = {"kms:Decrypt", "kms:ReEncryptFrom", "kms:ReEncryptTo"}
+deny = [s for s in p.get("Statement", [])
+        if s.get("Effect") == "Deny" and "*" in principals(s)
+        and need <= set(as_list(s.get("Action")))]
+
 print("  attested-decrypt PCR0 allow-set:", allow)
-print("  deny-without-attestation present:", bool(deny))   # MUST be True on every money key'
+print("  deny-without-attestation present:", bool(deny))   # MUST be True on every money key
+if skipped:
+    print("  NOT CHECKED — attestation-shaped statements with no ImageSha384 condition:", skipped)
+    print("  read those by hand; this script did not verify them")'
 done
 ```
 
