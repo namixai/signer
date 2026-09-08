@@ -21,7 +21,8 @@ credentials and no access to our box. The public source at a given commit is eno
 
 ## What makes the build deterministic
 
-Reproducibility is engineered (Day-3 "Finding F/J" fixes), not incidental:
+Reproducibility here is engineered, not incidental. Each of the following was a
+real source of drift we hit and closed:
 
 - **Toolchain pinned exact** — `rust-toolchain.toml` (`1.95.0`), and the builder
   base image `clux/muslrust` is pinned by **digest** (`@sha256:…`), not a floating
@@ -31,7 +32,7 @@ Reproducibility is engineered (Day-3 "Finding F/J" fixes), not incidental:
   base images are digest-pinned. Recorded in `policies/build-pins.txt`.
 - **Vendored NSM deps** — `aws-nitro-enclaves-nsm-api` (the C `libnsm.so`) is
   vendored under `vendor/nsm-api/` and built `--offline --locked`, because
-  upstream ships no `Cargo.lock` (that was the last non-determinism source, H5).
+  upstream ships no `Cargo.lock`, and that was the last source of drift we found.
 - **`Cargo.lock` committed + `--locked`** — the workspace build is
   `cargo build --locked`, so dependency versions cannot drift.
 - **Timestamp / locale pinning** — `SOURCE_DATE_EPOCH=1714900000`, `LC_ALL=C`,
@@ -58,7 +59,7 @@ Reproducibility is engineered (Day-3 "Finding F/J" fixes), not incidental:
 ## Build + capture PCR0
 
 ```bash
-git clone <usenami-platform repo> && cd <repo>/_signer/poc
+git clone https://github.com/namixai/signer && cd signer/poc
 git checkout <COMMIT_SHA>            # the exact revision under audit
 
 # Strict/mainnet EIF (the money-path image). Baked SIGNER_REQUIRE_POLICY=1 →
@@ -97,7 +98,7 @@ Once you have `PCR0_rebuilt`, confirm it equals what is *running*, what is
 
 ```bash
 # (a) LIVE: the running enclave's signed attestation (verify the COSE doc, then read pcrs[0]):
-#     see ATTESTATION-VERIFICATION.md  →  PCR0_live
+#     see VERIFY-SIGNER-YOURSELF.md  ->  PCR0_live
 # (b) ON-CHAIN: the Base UsenamiAttestationRegistry record (contracts/)  →  PCR0_onchain
 # (c) KMS money-gate — check EVERY money-path key (the venue key AND the registry
 #     key), for BOTH the attested-decrypt allow-set AND the deny-without-attestation:
@@ -129,8 +130,10 @@ principal (incl. admin/root) can decrypt off-enclave.
 > which we can grant an auditor read-only; you do **not** need Decrypt. The
 > stronger property, that a non-attested principal is denied Decrypt, is
 > demonstrable live: even our own admin identity is `AccessDenied` on the
-> registry key without a matching attestation (the `Deny Principal:"*"` statement
-> in `infra/kms.tf`).
+> registry key without a matching attestation. That deny statement lives in our
+> Terraform, which is not in this repository — so do not take its existence from us:
+> the check above reads it back out of the live key policy, which is the copy that
+> actually governs the key.
 
 ---
 
