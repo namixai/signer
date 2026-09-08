@@ -55,6 +55,19 @@ AWS Nitro root pinned in the script, checks the COSE signature, prints the measu
 and confirms the document echoes the nonce you picked rather than being one cached
 earlier. If this step does not pass, nothing after it is worth running.
 
+**This is the step a stranger can finish today, and it is worth being plain about why
+the next one is harder.** The attestation is served to anyone who asks. A receipt is
+not: it comes back from a decision, and asking for a decision needs a token, which
+means a receipt reaches you only if someone hands you one. So the honest order is —
+verify the attestation yourself, then ask whoever gave you the receipt where it came
+from, and check it against the document you fetched, not one they supplied.
+
+Two things you will run into. The production lane's signed document carries a receipt
+key, so a receipt from it can be bound to the attestation. Other lanes may have no key
+provisioned, and the script says so and exits 2 rather than passing — a lane that
+cannot issue receipts is not a lane whose receipts checked out. And a `2` on the
+receipt step is not a failure of the receipt; it means the check could not run.
+
 ## Checking a live refusal
 
 Three files, all fetched by you:
