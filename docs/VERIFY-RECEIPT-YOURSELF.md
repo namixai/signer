@@ -42,6 +42,19 @@ policy and reason guards would never once fire as the reason. Re-signing removes
 signature as the explanation and makes each guard answer on its own. It is also the
 real case: someone holding the key has no need to forge.
 
+## Check the attestation on its own first
+
+```bash
+NONCE=$(openssl rand -hex 16)
+curl -s "https://<lane>/attestation?nonce=$NONCE" > att.json
+python3 poc/scripts/verify-receipt-yourself.py attestation --attestation att.json --nonce "$NONCE"
+```
+
+No token, nothing touched. It unwraps the document, walks its certificate chain to the
+AWS Nitro root pinned in the script, checks the COSE signature, prints the measurement,
+and confirms the document echoes the nonce you picked rather than being one cached
+earlier. If this step does not pass, nothing after it is worth running.
+
 ## Checking a live refusal
 
 Three files, all fetched by you:
