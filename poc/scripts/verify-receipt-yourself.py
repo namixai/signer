@@ -572,6 +572,37 @@ class Report:
         self.skip += 1
 
 
+def attested_measurement(payload: dict):
+    """The measurement out of a signed payload, as hex — or None if it carries none.
+
+    🔴 One rule, two callers. This existed twice: `check()` accepted the CBOR key `0`
+    and the string `"0"` and reported a missing measurement; the `attestation` command
+    read only `0` and, when it found nothing, printed no line at all and could still
+    end in VERIFIED. Two implementations of one rule drift, and the half that drifts
+    silently is the one that stops telling you something is absent.
+    """
+    pcrs = payload.get("pcrs") or {}
+    pcr0 = pcrs.get(0) or pcrs.get("0")
+    if isinstance(pcr0, (bytes, bytearray)):
+        pcr0 = pcr0.hex()
+    return pcr0 if isinstance(pcr0, str) and pcr0 else None
+
+
+def claimed_address(att_json: dict):
+    """`data_pubkey_address` as the gateway reported it, normalised — or None.
+
+    A bare hex address without the `0x` prefix is a formatting difference, not a
+    disagreement. Reporting it as one sends the reader hunting a phantom; and having
+    this rule in one command and not the other meant the same file could pass under
+    `verify` and fail under `attestation`.
+    """
+    v = att_json.get("data_pubkey_address")
+    if not isinstance(v, str) or not v.strip():
+        return None
+    v = v.strip().lower()
+    return v if v.startswith("0x") else "0x" + v
+
+
 def address_from_compressed(pub: bytes) -> str:
     """secp256k1 compressed point -> Ethereum-style address."""
     x = int.from_bytes(pub[1:], "big")
@@ -628,12 +659,8 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
 
     # 1b. The JSON field is COMPARED, never trusted. A gateway saying something the
     #     enclave did not sign is itself the finding.
-    claimed = att_json.get("data_pubkey_address")
-    if want and isinstance(claimed, str) and claimed:
-        # A bare hex address without the 0x prefix is a formatting difference, not a
-        # disagreement; reporting it as one would send the reader hunting a phantom.
-        claimed = claimed.strip().lower()
-        claimed = claimed if claimed.startswith("0x") else "0x" + claimed
+    claimed = claimed_address(att_json)
+    if want and claimed:
         if claimed == want:
             r.ok("the gateway's data_pubkey_address agrees with the signed document")
         else:
@@ -645,11 +672,8 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
     #    print an expected measurement here: a number written into a script is
     #    stale the day after a rotation, and a reader trusting it would compare
     #    against a value we no longer run — a mismatch that looks like THEIR error.
-    pcrs = payload.get("pcrs") or {}
-    pcr0 = pcrs.get(0) or pcrs.get("0")
-    if isinstance(pcr0, (bytes, bytearray)):
-        pcr0 = pcr0.hex()
-    if isinstance(pcr0, str) and pcr0:
+    pcr0 = attested_measurement(payload)
+    if pcr0:
         r.ok("attestation carries a measurement (%s…) — pin it out-of-band, it is not asserted here" % pcr0[:8])
     else:
         r.cant("attestation carries a measurement", "the signed payload has no pcrs[0]")
@@ -1048,9 +1072,14 @@ def selftest() -> int:
     print("── the same forged document, with the attacker's own root pinned")
     real_root = AWS_NITRO_ROOT_SHA256
     AWS_NITRO_ROOT_SHA256 = hashlib.sha256(forged_cert).hexdigest()
+    r_pin = Report()
     try:
-        r_pin = Report()
         got2 = verify_attestation(forged_b64, r_pin)
+    except Exception as e:                                        # noqa: BLE001
+        # Without this the traceback escapes selftest and the summary below — the
+        # line that says how many guards are decorative — never prints at all.
+        got2 = None
+        r_pin.bad("the forged document is well-formed", "%s" % e)
     finally:
         AWS_NITRO_ROOT_SHA256 = real_root
     if got2 is None or r_pin.fail:
@@ -1124,13 +1153,25 @@ def main() -> int:
             print("NOT CHECKED: no attestation_doc_b64 in that file")
             return 2
         r = Report()
-        payload = verify_attestation(doc, r)
+        try:
+            payload = verify_attestation(doc, r)
+        except Exception as e:                                    # noqa: BLE001
+            # 🔴 `verify_attestation` RAISES on a malformed document rather than
+            #    returning None — a payload that is not a CBOR map, a `certificate`
+            #    that is absent while `cabundle` is not. The verify path wraps this
+            #    and this one did not, so a malformed document printed a traceback
+            #    and threw away the documented 0/1/2 contract exactly when the
+            #    reader most needs to be told which of the three happened.
+            r.bad("attestation document parses", "%s" % e)
+            payload = None
         if payload is None:
             print("\nVERIFICATION FAILED: the document did not hold up")
             return 1
-        pcr0 = (payload.get("pcrs") or {}).get(0)
-        if isinstance(pcr0, (bytes, bytearray)):
-            r.ok("measurement in the signed document: %s… (pin it out of band)" % pcr0.hex()[:16])
+        pcr0 = attested_measurement(payload)
+        if pcr0:
+            r.ok("measurement in the signed document: %s… (pin it out of band)" % pcr0[:16])
+        else:
+            r.cant("the document carries a measurement", "the signed payload has no pcrs[0]")
         if a.nonce:
             got = payload.get("nonce")
             got = got.hex() if isinstance(got, (bytes, bytearray)) else got
@@ -1142,7 +1183,7 @@ def main() -> int:
         key = attested_signer(payload)
         if key:
             r.ok("receipt key in the signed document: %s" % key)
-            claimed = (att.get("data_pubkey_address") or "").lower()
+            claimed = claimed_address(att)
             if claimed and claimed != key:
                 r.bad("the gateway agrees with the signed document",
                       "gateway says %s, document says %s" % (claimed, key))

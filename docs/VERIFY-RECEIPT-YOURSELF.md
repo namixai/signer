@@ -126,8 +126,10 @@ language that helpfully turns `"41"` into `41` will give you a digest nobody sig
 
 And the signature covers a fixed list of fields, not "the receipt as it arrived":
 
-    v, decision, reason_code, customer_id, action, request_hash,
-    intent_sig_hash, policy_hash, supplied_ts_ms, boot_id, seq
+```text
+v, decision, reason_code, customer_id, action, request_hash,
+intent_sig_hash, policy_hash, supplied_ts_ms, boot_id, seq
+```
 
 Every one must be present — a missing field is a refusal to compute, not a field
 skipped. The heartbeat signs its own shorter list: `v`, `boot_id`, `customer_id`,
