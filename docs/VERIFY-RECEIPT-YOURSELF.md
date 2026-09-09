@@ -99,7 +99,7 @@ There are three exit codes, not two. `0` verified. `1` a check did not hold. `2`
 check could not run, which is not a pass. A check you could not run is a hole, and
 counting holes as green is how a verifier turns into decoration.
 
-## The four checks
+## What gets checked
 
 **The attestation document is real before anything inside it is read.** The COSE
 document is unwrapped, its certificate chain is required to end at the AWS Nitro root
@@ -107,6 +107,21 @@ pinned in the script, and the COSE signature is checked against the certificate 
 made it. Order matters here: verifying the signature against a certificate that
 arrived in the same document proves nothing, because someone forging the whole thing
 signs it with their own key. Only the pinned root makes any of it evidence.
+
+**And a chain of valid signatures is not yet a valid chain.** Signatures alone would
+accept a document from an enclave that stopped running two days ago, so the walk also
+requires: every certificate inside its own `notBefore`/`notAfter` window, every
+certificate above the leaf carrying `basicConstraints: CA`, each certificate naming its
+parent as issuer, and the document's own timestamp falling inside the leaf's window.
+
+The freshness threshold is not one this script invented. AWS gives a Nitro leaf
+certificate a window of about three hours, on purpose, and the script reads that window
+rather than picking a staleness limit of its own — a verifier that guesses its own
+limit is guessing; one that reads `notAfter` is quoting the issuer.
+
+These findings are reported together rather than stopping at the first. "Chain fine,
+binding fine, expired" is a different situation from "nothing about this document holds
+up", and a check that stops at the first red cannot tell you which one you have.
 
 **Signed by the key the enclave attested.** The receipt is canonicalised (RFC 8785,
 keys sorted, every numeric a decimal string so nothing rounds), hashed under a fixed
@@ -146,6 +161,14 @@ did not sign.
 over the same digest and key. Accepting both would mean two byte-different receipts
 are each an authentic record of one decision, which is the thing a receipt exists to
 prevent. Low-`s` only, recovery id 27 or 28.
+
+**The counter belongs to you.** `seq` counts per customer since `boot_id`, and the
+heartbeat carries `customer_id` inside its signed body. The gateway is the party that
+hands you that heartbeat, and it can hand you a genuine, correctly signed one belonging
+to a **different** customer from the same boot — the signature would check out and the
+counter would be someone else's. The two `customer_id` values are compared before the
+counters are, and if they disagree the continuity check is reported as not run rather
+than answered wrongly.
 
 **Bound to a measurement.** The script reads the measurement out of your attestation,
 prints it, and stops. It ships no expected value, deliberately. A number written into

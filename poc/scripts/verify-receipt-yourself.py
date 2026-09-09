@@ -236,7 +236,10 @@ def _cbor_head(major: int, n: int) -> bytes:
     if n < 24: return bytes([base | n])
     if n < 256: return bytes([base | 24, n])
     if n < 65536: return bytes([base | 25]) + n.to_bytes(2, "big")
-    return bytes([base | 26]) + n.to_bytes(4, "big")
+    if n < 4294967296: return bytes([base | 26]) + n.to_bytes(4, "big")
+    # Метка времени NSM — миллисекунды, она больше 2^32. Без этой ветки подделку с
+    # настоящим `timestamp` не собрать, а значит и проверку свежести не испытать.
+    return bytes([base | 27]) + n.to_bytes(8, "big")
 
 
 def cbor_bstr(x: bytes) -> bytes:
@@ -314,6 +317,118 @@ def der_seq(b: bytes):
         tag, content, i = der_tlv(b, i)
         out.append((tag, content, b[start:i]))
     return out
+
+
+def _utc(epoch: int) -> str:
+    import datetime
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _age(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds < 0:
+        return "issued in the FUTURE by %dm" % (-seconds // 60)
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+
+def _der_time(el) -> int:
+    """UTCTime / GeneralizedTime → секунды эпохи. Возвращает 0, если разобрать нечем."""
+    import calendar
+    tag, content, _ = el
+    t = content.decode("ascii", "replace").strip()
+    try:
+        if tag == 0x17:            # UTCTime: YYMMDDHHMMSSZ
+            yy = int(t[0:2]); year = 2000 + yy if yy < 50 else 1900 + yy
+            rest = t[2:]
+        elif tag == 0x18:          # GeneralizedTime: YYYYMMDDHHMMSSZ
+            year = int(t[0:4]); rest = t[4:]
+        else:
+            return 0
+        mo, d, h, mi = (int(rest[0:2]), int(rest[2:4]), int(rest[4:6]), int(rest[6:8]))
+        sec = int(rest[8:10]) if len(rest) >= 11 else 0
+        return calendar.timegm((year, mo, d, h, mi, sec, 0, 0, 0))
+    except Exception:              # noqa: BLE001
+        return 0
+
+
+def _ca_flag(ext_content: bytes):
+    """`True`/`False` из basicConstraints, или `None`, если расширения нет.
+
+    OID 2.5.29.19 в DER — `06 03 55 1D 13`. Значение лежит в OCTET STRING, внутри
+    `SEQUENCE { cA BOOLEAN DEFAULT FALSE, … }`: пустая последовательность означает
+    `cA = FALSE`, а не «не указано».
+    """
+    if not ext_content:
+        return None
+    for _t, content, _raw in der_seq(ext_content):
+        parts = der_seq(content)
+        if not parts or parts[0][1] != b"\x55\x1d\x13":
+            continue
+        octets = next((c for t, c, _ in parts if t == 0x04), None)
+        if octets is None:
+            return None
+        inner = der_seq(der_tlv(octets)[1])
+        for t, c, _ in inner:
+            if t == 0x01:                      # BOOLEAN
+                return bool(c and c[0])
+        return False                            # SEQUENCE есть, cA опущен ⇒ FALSE
+    return None
+
+
+def cert_fields(der: bytes) -> dict:
+    """Разбор сертификата по ПОЛЯМ, а не только «дай мне ключ и подпись».
+
+    🔴 Зачем понадобилось. Прежний обход цепочки проверял ТОЛЬКО подписи: не читал окно
+    годности, не требовал у промежуточных `basicConstraints: CA`, не связывал `issuer`
+    ребёнка с `subject` родителя. Следствие измерено, а не выведено: сохранённый боевой
+    документ возрастом 47 часов проходил как VERIFIED. Листовые сертификаты Nitro живут
+    считанные часы намеренно — окно годности и есть то, что делает документ
+    свидетельством о ТЕКУЩЕМ энклаве, а не о когда-то работавшем.
+
+    Порядок полей TBSCertificate позиционный: [0] version, serial, sigAlg, issuer,
+    validity, subject, spki, [3] extensions. Версия необязательна, поэтому смещение
+    определяется по тегу, а не по номеру.
+    """
+    body = der_seq(der_tlv(der)[1])
+    tbs_raw = body[0][2]
+    sigval = body[2][1]
+    if sigval and sigval[0] == 0:
+        sigval = sigval[1:]                     # BIT STRING unused-bits octet
+    rs = der_seq(der_tlv(sigval)[1])
+    sig = (int.from_bytes(rs[0][1], "big"), int.from_bytes(rs[1][1], "big"))
+
+    els = der_seq(der_tlv(tbs_raw)[1])
+    i = 1 if els and els[0][0] == 0xA0 else 0   # EXPLICIT version
+    i += 2                                       # serialNumber, signature
+    issuer = els[i][2] if i < len(els) else b""; i += 1
+    validity = els[i] if i < len(els) else None; i += 1
+    subject = els[i][2] if i < len(els) else b""; i += 1
+    spki_el = els[i] if i < len(els) else None
+    exts = next((c for t, c, _ in els[i + 1:] if t == 0xA3), None)
+
+    nb = na = 0
+    if validity is not None:
+        times = der_seq(validity[1])
+        if len(times) >= 2:
+            nb, na = _der_time(times[0]), _der_time(times[1])
+
+    spki = None
+    if spki_el is not None:
+        inner = der_seq(spki_el[1])
+        if len(inner) == 2 and inner[1][0] == 0x03:
+            bits = inner[1][1]
+            if bits and bits[0] == 0:
+                bits = bits[1:]
+            if len(bits) == 97 and bits[0] == 0x04:
+                spki = (int.from_bytes(bits[1:49], "big"), int.from_bytes(bits[49:], "big"))
+    if spki is None:
+        raise ValueError("certificate carries no uncompressed P-384 public key")
+
+    return {"tbs": tbs_raw, "key": spki, "sig": sig, "issuer": issuer, "subject": subject,
+            "not_before": nb, "not_after": na,
+            "ca": _ca_flag(der_tlv(exts)[1] if exts else b"")}
 
 
 def cert_parts(der: bytes):
@@ -544,6 +659,74 @@ def verify_attestation(doc_b64: str, report):
                        "a certificate in the bundle is not signed by the one above it")
             return None
     report.ok("the chain ends at the pinned AWS Nitro root (%d certificates)" % len(chain))
+
+    # ── 🔴 A CHAIN OF VALID SIGNATURES IS NOT A VALID CHAIN.
+    #
+    # Until now this walk checked signatures and nothing else: no validity window, no
+    # `basicConstraints: CA` on the certificates above the leaf, no binding of a child's
+    # `issuer` to its parent's `subject`. Measured, not reasoned: a saved production
+    # document 47 hours old printed VERIFIED. Nitro leaf certificates carry a window of
+    # about three hours ON PURPOSE — that window is what makes the document evidence of a
+    # CURRENT enclave rather than of one that ran two days ago.
+    #
+    # Note where the threshold comes from: it is AWS's, written into the certificate, not
+    # a number this script invented. A verifier that picks its own staleness limit is
+    # guessing; one that reads notAfter is quoting the issuer.
+    #
+    # These findings are RECORDED and the walk continues, rather than returning on the
+    # first one. The reader gets the whole picture in one run — "chain fine, binding fine,
+    # expired" is a different situation from "nothing about this document holds up", and a
+    # check that stops at the first red cannot tell them apart. `Report.bad` still makes
+    # the run exit non-zero.
+    import time
+    now = int(time.time())
+    fields = [cert_fields(c) for c in chain]
+    fresh = True
+    for idx, f in enumerate(fields):
+        leaf_here = idx == len(fields) - 1
+        label = "leaf" if leaf_here else ("pinned root" if idx == 0 else "intermediate #%d" % idx)
+        if not f["not_before"] or not f["not_after"]:
+            report.cant("every certificate is inside its validity window",
+                        "%s carries no readable notBefore/notAfter" % label); fresh = False
+        elif not (f["not_before"] <= now <= f["not_after"]):
+            report.bad("every certificate is inside its validity window",
+                       "%s is valid %s … %s UTC, and it is %s UTC now — this document is "
+                       "not evidence about a running enclave, whatever else it says"
+                       % (label, _utc(f["not_before"]), _utc(f["not_after"]), _utc(now)))
+            fresh = False
+        if not leaf_here and f["ca"] is not True:
+            report.bad("every certificate above the leaf is a CA",
+                       "%s has basicConstraints cA=%r — a non-CA certificate must not sign "
+                       "another one, or anyone holding an ordinary leaf under this root "
+                       "could mint their own chain" % (label, f["ca"]))
+    if fresh:
+        report.ok("every certificate is inside its validity window (leaf: %s … %s UTC)"
+                  % (_utc(fields[-1]["not_before"]), _utc(fields[-1]["not_after"])))
+
+    bound = True
+    for child, parent in zip(fields[1:], fields[:-1]):
+        if child["issuer"] != parent["subject"]:
+            report.bad("each certificate names its parent as issuer",
+                       "a child's issuer does not equal its parent's subject — the bundle is "
+                       "an assortment of certificates, not one chain")
+            bound = False
+    if bound:
+        report.ok("each certificate names its parent as issuer")
+
+    # Freshness of the document itself, measured against the LEAF's own window.
+    ts = payload.get("timestamp")
+    if not isinstance(ts, int):
+        report.cant("the document was issued inside its certificate's window",
+                    "the signed payload carries no integer `timestamp`")
+    else:
+        ts_s, lf = ts // 1000, fields[-1]
+        if lf["not_before"] and lf["not_after"] and not (lf["not_before"] <= ts_s <= lf["not_after"]):
+            report.bad("the document was issued inside its certificate's window",
+                       "issued %s UTC, leaf valid %s … %s UTC"
+                       % (_utc(ts_s), _utc(lf["not_before"]), _utc(lf["not_after"])))
+        else:
+            report.ok("the document was issued inside its certificate's window (%s UTC, %s old)"
+                      % (_utc(ts_s), _age(now - ts_s)))
     return payload
 
 
@@ -685,7 +868,13 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
     if heartbeat is None:
         r.cant("receipt belongs to the current chain", "no heartbeat supplied (--heartbeat)")
     else:
-        hb = heartbeat.get("heartbeat") or heartbeat
+        # Тип читается ДО обращения: `{"heartbeat": [...]}` — валидный JSON, и `.get`
+        # на списке падает трейсбеком, разрушая контракт 0/1/2.
+        hb = heartbeat.get("heartbeat") if isinstance(heartbeat.get("heartbeat"), dict) else heartbeat
+        if not isinstance(hb, dict):
+            r.cant("receipt belongs to the current chain",
+                   "the heartbeat file is a JSON %s, not an object" % type(hb).__name__)
+            return r
         # 🔴 An unsigned heartbeat is a claim by the gateway, and the gateway is the
         #    party this whole page exists to not trust. Without a signature it can
         #    name any seq_next it likes and every continuity check below becomes
@@ -716,9 +905,30 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
                 r.bad("heartbeat echoes the nonce you chose",
                       "sent %r, got %r — this may be a cached heartbeat"
                       % (expect_nonce, hb.get("client_nonce")))
+        # 🔴 СЧЁТЧИК ПРИНАДЛЕЖИТ КЛИЕНТУ, А НЕ ТОЛЬКО ЗАГРУЗКЕ. `seq` считается ПО
+        #    КЛИЕНТУ с момента `boot_id`, и `customer_id` лежит внутри ПОДПИСАННОГО тела
+        #    heartbeat — а сверялся только `boot_id`. Heartbeat выдаёт шлюз, то есть та
+        #    самая сторона, которой эта страница и не доверяет: он вправе отдать
+        #    подлинный, корректно подписанный heartbeat ДРУГОГО клиента из той же
+        #    загрузки. Подпись сойдётся, и дальше чужой `seq_next` сравнивается с вашим
+        #    `seq`. Неверно в обе стороны: квитанция с завышенным `seq` пройдёт, а
+        #    честная получит ОТКАЗ. Сравнивать клиентов надо ДО сравнения счётчиков.
+        hb_cust, rec_cust = hb.get("customer_id"), receipt.get("customer_id")
         hb_boot, seq_next = hb.get("boot_id"), hb.get("seq_next")
+        if not hb_cust or not rec_cust:
+            r.cant("the heartbeat counts the same customer as the receipt",
+                   "customer_id missing on %s" % ("the heartbeat" if not hb_cust else "the receipt"))
+        elif hb_cust != rec_cust:
+            r.bad("the heartbeat counts the same customer as the receipt",
+                  "receipt is for %r, heartbeat counts %r — a counter for someone else says "
+                  "nothing about your sequence, in either direction" % (rec_cust, hb_cust))
+        else:
+            r.ok("the heartbeat counts the same customer as the receipt (%s)" % rec_cust)
         if not hb_boot or seq_next is None:
             r.cant("receipt belongs to the current chain", "heartbeat has no boot_id/seq_next")
+        elif hb_cust and rec_cust and hb_cust != rec_cust:
+            r.cant("receipt belongs to the current chain",
+                   "the heartbeat is for another customer — counters are not comparable")
         elif hb_boot != receipt.get("boot_id"):
             r.bad("receipt belongs to the current chain",
                   "receipt boot_id %s, heartbeat %s — different boot, counts are not comparable"
@@ -756,8 +966,15 @@ def check(payload: dict, att_json: dict, receipt: dict, heartbeat: dict | None,
         else:
             r.bad("reason_code is %s" % expect_reason, "receipt says %r" % reason)
     if decision == "deny" or (reason and reason not in ("", "allow")):
-        if receipt.get("policy_hash"):
-            r.ok("the refusal names the policy it judged against (%s…)" % receipt["policy_hash"][:12])
+        ph = receipt.get("policy_hash")
+        if isinstance(ph, str) and ph:
+            r.ok("the refusal names the policy it judged against (%s…)" % ph[:12])
+        elif ph:
+            # Поле пришло от шлюза, и его тип ничем не связан. `5[:12]` — трейсбек в
+            # скрипте, который обещает три исхода и не обещает падений.
+            r.bad("the refusal names the policy it judged against",
+                  "policy_hash is a JSON %s, not a string — this receipt is not the shape "
+                  "we sign" % type(ph).__name__)
         else:
             r.bad("the refusal names the policy it judged against",
                   "policy_hash is empty — the receipt says no, but not against what")
@@ -796,34 +1013,64 @@ def _p384_sign(d: int, digest: bytes) -> tuple:
     return r, (pow(k, _P384_N - 2, _P384_N) * (z + r * d)) % _P384_N
 
 
-def _forged_cert(d: int, pub: tuple) -> bytes:
-    """A self-signed certificate that this verifier's own parser accepts.
+def _forged_cert(d: int, pub: tuple, *, ca: bool = True, valid: bool = True,
+                 cn: bytes = b"forged-not-aws") -> bytes:
+    """A self-signed certificate the verifier's own parser accepts — now a REAL one.
 
-    Minimal on purpose: exactly the shape `cert_parts` reads — a tbsCertificate whose
-    SubjectPublicKeyInfo carries an uncompressed P-384 point, and a signature over that
-    tbs made with the matching key. An attacker has no reason to send more than the
-    verifier looks at.
+    🔴 Раньше здесь лежал минимальный огрызок: `SEQUENCE { INTEGER 1, spki }`. Его хватало,
+    пока обход цепочки смотрел только на подписи. Как только появились окно годности,
+    `basicConstraints` и связка issuer↔subject, огрызок перестал разбираться — и это
+    правильно: подделка обязана быть настолько же well-formed, насколько настоящий
+    документ, иначе тест снова доказывает работу ПАРСЕРА, а не пина.
+
+    Поэтому TBS собирается по-настоящему: version, serial, sigAlg, issuer, validity,
+    subject, spki, extensions. `issuer` равен `subject` (самоподписанный), окно живое,
+    `cA=TRUE` — то есть по всем структурным признакам сертификат безупречен. Отвергнуть
+    его может ровно одно: он не ведёт к прибитому корню.
     """
-    import hashlib
+    import hashlib, time
+    def utctime(ts):
+        t = time.strftime("%y%m%d%H%M%SZ", time.gmtime(ts))
+        return _der(0x17, t.encode())
     point = b"\x04" + pub[0].to_bytes(48, "big") + pub[1].to_bytes(48, "big")
     algid = _der(0x30, b"\x06\x07\x2a\x86\x48\xce\x3d\x02\x01")      # id-ecPublicKey
     spki = _der(0x30, algid + _der(0x03, b"\x00" + point))
-    tbs = _der(0x30, _der_int(1) + spki)
+    # Name: SEQUENCE { SET { SEQUENCE { OID commonName, PrintableString } } }
+    name = _der(0x30, _der(0x31, _der(0x30,
+              b"\x06\x03\x55\x04\x03" + _der(0x13, cn))))
+    now = int(time.time())
+    nb, na = (now - 600, now + 3600) if valid else (now - 7200, now - 3600)
+    validity = _der(0x30, utctime(nb) + utctime(na))
+    bc = _der(0x30, b"\x06\x03\x55\x1d\x13" +
+              _der(0x04, _der(0x30, _der(0x01, b"\xff" if ca else b"\x00"))))
+    exts = _der(0xA3, _der(0x30, bc))
+    tbs = _der(0x30, _der(0xA0, _der_int(2)) + _der_int(1) + algid
+                     + name + validity + name + spki + exts)
     r, sg = _p384_sign(d, hashlib.sha384(tbs).digest())
     return _der(0x30, tbs + algid + _der(0x03, b"\x00" + _der(0x30, _der_int(r) + _der_int(sg))))
 
+def _forged_attestation(*, ca: bool = True, valid: bool = True, break_binding: bool = False) -> tuple:
+    """(base64 COSE_Sign1, корневой сертификат цепочки). Подписано по-настоящему.
 
-def _forged_attestation() -> tuple:
-    """(base64 COSE_Sign1, the leaf certificate). Signed for real, chains to itself."""
+    Дефект задаётся параметром — так проверяется, что каждый новый сторож НЕ декоративен:
+    без него подделка с истёкшим сертификатом, с не-CA промежуточным или с порванной
+    связкой issuer↔subject прошла бы, стоит только прибить её собственный корень.
+    """
     import base64, hashlib
     d_att = 0xA77AC4E12F9B3D7615C0E48A2B6D91F03E5C87A4D2B90F16E3C7A85B4D2F901E6C3A79B5
     pub = _p384_mul(d_att, (_P384_GX, _P384_GY))
-    cert = _forged_cert(d_att, pub)
+    cert = _forged_cert(d_att, pub, ca=ca, valid=valid)
+    # Лист с ДРУГИМ субъектом: подпись цепочки сойдётся (ключ тот же), а связка
+    # issuer↔subject — нет. Именно это и должно ловиться отдельно от подписи.
+    leaf = _forged_cert(d_att, pub, ca=ca, valid=valid,
+                        cn=b"forged-other") if break_binding else cert
     prot = b"\xa1\x01\x38\x22"                                       # {1: -35} — ES384
-    payload_bytes = (_cbor_head(5, 4)
+    import time as _t
+    payload_bytes = (_cbor_head(5, 5)
+                     + cbor_tstr("timestamp") + _cbor_head(0, int(_t.time() * 1000))
                      + cbor_tstr("pcrs") + _cbor_head(5, 1) + _cbor_head(0, 0) + cbor_bstr(b"\xbb" * 48)
                      + cbor_tstr("public_key") + cbor_bstr(b"\x02" + b"\x11" * 32)
-                     + cbor_tstr("certificate") + cbor_bstr(cert)
+                     + cbor_tstr("certificate") + cbor_bstr(leaf)
                      + cbor_tstr("cabundle") + _cbor_head(4, 1) + cbor_bstr(cert))
     sig_struct = b"\x84" + cbor_tstr("Signature1") + cbor_bstr(prot) \
         + cbor_bstr(b"") + cbor_bstr(payload_bytes)
@@ -1069,6 +1316,81 @@ def selftest() -> int:
     else:
         print("  ok    forged attestation refused by the pinned root")
 
+    # 🔴 Каждый новый сторож цепочки — со своим случаем. Иначе они «проверены» тем, что
+    #    зелёный прогон их не задел: сторож, который ни разу не краснел, ничем не отличим
+    #    от декоративного. Корень подделки прибивается НАМЕРЕННО — так проверка доходит
+    #    до структурных свойств, а не останавливается на пине.
+    def with_own_root(label: str, marker: str, **defect) -> None:
+        nonlocal_fails = 0
+        b64, root_cert = _forged_attestation(**defect)
+        global AWS_NITRO_ROOT_SHA256
+        keep = AWS_NITRO_ROOT_SHA256
+        AWS_NITRO_ROOT_SHA256 = hashlib.sha256(root_cert).hexdigest()
+        try:
+            rep_d = Report()
+            try:
+                verify_attestation(b64, rep_d)
+            except Exception as e:                                # noqa: BLE001
+                rep_d.bad("forged document parses", "%s" % e)
+        finally:
+            AWS_NITRO_ROOT_SHA256 = keep
+        if any(marker in w for w in rep_d.failed):
+            print("  ok    %s" % label)
+        else:
+            print("  FAIL  %s — не сработало; красным было: %s" % (label, rep_d.failed))
+            nonlocal_fails = 1
+        return nonlocal_fails
+
+    # ── 🔴 Heartbeat ЧУЖОГО клиента. Его выдаёт шлюз, и он вправе отдать подлинный,
+    #    корректно подписанный heartbeat другого клиента из той же загрузки. Подпись
+    #    сойдётся, а счётчик будет не ваш — неверно в ОБЕ стороны.
+    print("── heartbeat, посчитанный для другого клиента")
+    hb_other = json.loads(json.dumps(hb))
+    hb_other["heartbeat"]["customer_id"] = "someone-else"
+    rep = check(payload, att, json.loads(json.dumps(rec)), hb_other, "notional_over_cap", "n0")
+    if not any("same customer" in w for w in rep.failed):
+        print("  FAIL  чужой счётчик принят как свой"); fails += 1
+    else:
+        print("  ok    чужой счётчик назван чужим, а непрерывность НЕ сверялась")
+
+    # ── Поля от шлюза приходят без гарантии типа. Скрипт обещает три исхода и не
+    #    обещает падений; трейсбек ломает контракт ровно там, где читатель ждёт вердикт.
+    print("── поля неверного типа не роняют проверку")
+    for label, mutate in (("policy_hash числом", lambda d: d.__setitem__("policy_hash", 5)),
+                          ("heartbeat массивом", None)):
+        d = json.loads(json.dumps(rec))
+        try:
+            if mutate:
+                mutate(d); check(payload, att, d, hb, "notional_over_cap", "n0")
+            else:
+                check(payload, att, d, {"heartbeat": [1, 2]}, "notional_over_cap", "n0")
+            print("  ok    %s — вердикт, а не трейсбек" % label)
+        except Exception as e:                                    # noqa: BLE001
+            print("  FAIL  %s уронило проверку: %s" % (label, type(e).__name__)); fails += 1
+
+    # ── Файл, содержащий JSON `null`, — это НЕ «аргумент не передан».
+    print("── файл с JSON null отличается от отсутствия файла")
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        fh.write("null"); null_path = fh.name
+    code = None
+    try:
+        _load_obj(null_path, "attestation")
+    except SystemExit as e:
+        code = e.code
+    if code == 2 and _load_obj("", "heartbeat") is None:
+        print("  ok    null даёт код 2, а пустой путь по-прежнему значит «не передан»")
+    else:
+        print("  FAIL  null и отсутствие файла не различаются (код %r)" % code); fails += 1
+
+    print("── структурные сторожа цепочки, каждый со своим дефектом")
+    fails += with_own_root("истёкший сертификат ловится окном годности",
+                           "inside its validity window", valid=False)
+    fails += with_own_root("не-CA сертификат выше листа ловится basicConstraints",
+                           "above the leaf is a CA", ca=False)
+    fails += with_own_root("порванная связка issuer↔subject ловится отдельно от подписи",
+                           "names its parent as issuer", break_binding=True)
+
     print("── the same forged document, with the attacker's own root pinned")
     real_root = AWS_NITRO_ROOT_SHA256
     AWS_NITRO_ROOT_SHA256 = hashlib.sha256(forged_cert).hexdigest()
@@ -1119,11 +1441,17 @@ def _load_obj(path: str, what: str):
     attest, or reads `the gateway refused` and concludes something about the gateway.
     Neither happened. Nothing was checked at all.
     """
+    # 🔴 `_load` возвращает `None` в ДВУХ разных случаях: путь не передан и файл содержит
+    #    JSON `null`. Слить их значит пустить `None` дальше, где `att.get(...)` даёт
+    #    трейсбек — ровно то, что этот docstring обещает не допускать. Путь проверяется
+    #    ПЕРВЫМ, до чтения: тогда `null` остаётся значением файла, а не отсутствием файла.
+    if not path:
+        return None
     v = _load(path, what)
-    if v is None or isinstance(v, dict):
+    if isinstance(v, dict):
         return v
     print("NOT CHECKED: %s (%s) is a JSON %s, not an object — this is about the file you"
-          % (what, path, type(v).__name__))
+          % (what, path, "null" if v is None else type(v).__name__))
     print("passed, not about the %s itself. Nothing was verified." % what)
     sys.exit(2)
 
