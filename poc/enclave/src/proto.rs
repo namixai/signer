@@ -169,6 +169,12 @@ pub struct SignRequest {
     #[serde(default)]
     pub x402: Option<X402Request>,
 
+    /// Permit2 `PermitSingle` parameters. Present only for
+    /// `action == "sign_permit2_permit_single"`. Public allowance fields only —
+    /// nothing here is a secret, the private key never leaves the enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permit2: Option<Permit2Request>,
+
     /// Structured perp-order params (for `sign_<venue>_order` actions). The
     /// canonical string the venue HMAC commits to is built **inside the
     /// enclave** from these fields — the gateway is NEVER trusted with a
@@ -344,6 +350,31 @@ pub struct X402Request {
     pub valid_after: u64,
     pub valid_before: u64,
     pub nonce: String,
+}
+
+/// Permit2 `PermitSingle` signing parameters.
+///
+/// `amount` (uint160) and `sig_deadline` (uint256) do not fit a native integer,
+/// so both travel as decimal strings and are parsed in the enclave — the same
+/// shape `X402Request` uses for `value`. `expiration` and `nonce` are uint48 and
+/// do fit.
+///
+/// `verifying_contract` is caller-supplied rather than baked. Permit2 sits at the
+/// same address on every chain today, but a signature is only meaningful against
+/// the contract that will check it, and a value we hardcode is a value nobody
+/// re-reads. The policy pins it (see `Permit2Policy`), so the caller cannot move
+/// it on their own.
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Permit2Request {
+    pub chain_id: u64,
+    pub verifying_contract: String,
+    pub token: String,
+    pub amount: String,
+    pub expiration: u64,
+    pub nonce: u64,
+    pub spender: String,
+    pub sig_deadline: String,
 }
 
 impl fmt::Debug for SignRequest {
@@ -1166,6 +1197,14 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x402: Option<X402Policy>,
 
+    /// Permit2 allowance clause. **MANDATORY + fail-closed**, for the same reason
+    /// as `x402` and then some: `PermitSingle` grants an ALLOWANCE, and an
+    /// allowance is not one payment — the spender may pull up to `amount`
+    /// repeatedly until `expiration`. An absent clause, or an absent field inside
+    /// it, is `policy_required`, never "no limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permit2: Option<Permit2Policy>,
+
     /// Per-asset / per-signature order caps. A `sign_<venue>_order` request
     /// must (1) target a symbol that appears in this list, and (2) have
     /// `qty` ≤ the entry's `max_qty`. **Per-period rate caps (`max_orders_per_hour`
@@ -1289,6 +1328,48 @@ pub struct X402Policy {
     /// cumulative/per-period cap is the real fix (deferred with stateful UPL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_recipients: Option<Vec<String>>,
+}
+
+/// Permit2 allowance clause (see `Policy.permit2`).
+///
+/// Why every field is mandatory. `PermitSingle` authorises a `spender` to move up
+/// to `amount` of `token` until `expiration` — a standing withdrawal right, not a
+/// single payment. A cap without a token pin is meaningless (`amount` is in raw
+/// token units); a token pin without a spender allow-list authorises anyone; and
+/// a chain/contract pin is what makes the signature belong to the contract that
+/// will honour it. Absent field ⇒ `policy_required`.
+///
+/// 🔴 AND AN INFINITE ALLOWANCE IS REFUSED REGARDLESS OF `max_amount`.
+/// `uint160::MAX` is the value wallets use for "unlimited", and it is refused
+/// unconditionally — not merely capped. If it were only capped, an owner who set
+/// a high ceiling would silently lose the guarantee, so the protection would
+/// evaporate exactly for the accounts with the most at stake. That is backwards.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Permit2Policy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifying_contract: Option<String>,
+    /// Allow-list of tokens whose allowance may be signed. EVM addresses,
+    /// compared after parsing to `[u8;20]` (case-insensitive, no checksum
+    /// dependence). Absent or empty ⇒ sign nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tokens: Option<Vec<String>>,
+    /// Allow-list of spenders that may receive an allowance. This is the control
+    /// that turns a leaked token into "can only approve the routers we chose".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_spenders: Option<Vec<String>>,
+    /// Per-signature ceiling on `amount`, decimal uint160 string.
+    ///
+    /// CAVEAT, stated in the same breath as the cap: this is PER SIGNATURE, and
+    /// the enclave tracks neither Permit2 nonces nor cumulative approvals. N
+    /// fresh nonces x `max_amount` is unbounded total authority — but only ever
+    /// to a spender in the list above. Pin `allowed_spenders` to contracts that
+    /// cannot forward, and set `max_amount` to a realistic single-approval
+    /// ceiling. A cumulative cap is the real fix and is not this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_amount: Option<String>,
 }
 
 /// One entry in a policy's `order_caps` allow-list. The enclave rejects any

@@ -196,6 +196,7 @@ fn venue_for_action(action: &str) -> Option<&'static str> {
         }
         "sign_asterdex" => Some("asterdex"),
         "sign_x402_eip3009" => Some("x402"),
+        "sign_permit2_permit_single" => Some("permit2"),
         // Attested-signed-data (P2). The data-signing key is a service-owned
         // secp256k1 key, NOT a tenant venue key. Its sealed KMS context is the
         // fixed `{customer_id:"attested-data", venue_id:"data-signing"}` — so the
@@ -1550,6 +1551,7 @@ pub fn handle(req: SignRequest) -> SignResponse {
         "sign_asterdex" => handle_sign_asterdex(req, identity),
         "sign_data" => handle_sign_data(req, identity),
         "sign_x402_eip3009" => handle_sign_x402_eip3009(req, identity),
+        "sign_permit2_permit_single" => handle_sign_permit2_permit_single(req, identity),
         "sign_binance_order" => handle_sign_binance_order(req, identity),
         "sign_binance_cancel" => handle_sign_binance_cancel(req, identity),
         "sign_okx_order" => handle_sign_okx_order(req, identity),
@@ -5106,6 +5108,227 @@ fn handle_sign_x402_eip3009(
     // secret, pk all zeroize on Drop.
 }
 
+/// Permit2 `PermitSingle` — подпись РАЗРЕШЕНИЯ, а не платежа.
+///
+/// 🔴 Отличие от x402, из-за которого правила здесь строже, а не такие же.
+/// `transferWithAuthorization` двигает сумму один раз. `PermitSingle` выдаёт
+/// `spender` право списывать до `amount` **многократно, до `expiration`** — это
+/// стоячее право вывода. Поэтому пункт политики обязателен и fail-closed по тем
+/// же основаниям, что у x402, плюс безусловный отказ бесконечному разрешению.
+///
+/// Режимы тенанта трогать не понадобилось: `tenant_mode_gate` — список
+/// РАЗРЕШЁННОГО, и всё, чего в нём нет, отказывается. Значит это действие уже
+/// отказано и в `halted`, и в `cancel_only` по построению. Тест это утверждает,
+/// чтобы свойство не исчезло вместе с чьей-нибудь будущей правкой списка.
+fn handle_sign_permit2_permit_single(
+    req: SignRequest,
+    identity: &crate::registry::ResolvedIdentity,
+) -> SignResponse {
+    let Some(p2) = req.permit2.as_ref() else {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    };
+
+    // Ширина типов проверяется ДО расшифровки ключа: `expiration` и `nonce` —
+    // uint48, и значение шире просто не существует в подписываемом типе.
+    // Дешёвая проверка перед дорогой операцией, как у x402 с пустым окном.
+    const UINT48_MAX: u64 = (1u64 << 48) - 1;
+    if p2.expiration > UINT48_MAX || p2.nonce > UINT48_MAX {
+        return SignResponse::err(err_code::BAD_REQUEST);
+    }
+
+    let (policy, secret_json) = match load_and_parse_blob(&req, identity) {
+        Ok(t) => t,
+        Err(LoadSecretError::BadRequest) => return SignResponse::err(err_code::BAD_REQUEST),
+        Err(LoadSecretError::KmsDenied) => return SignResponse::err(err_code::KMS_DECRYPT_DENIED),
+        Err(LoadSecretError::Internal) => return SignResponse::err(err_code::INTERNAL_ERROR),
+        Err(LoadSecretError::PolicyRequired) => {
+            return SignResponse::err(err_code::POLICY_REQUIRED)
+        }
+    };
+
+    let policy_hash = match enforce_policy(policy.as_ref(), &req) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+
+    let verifying_contract = match crate::signer::parse_evm_address(&p2.verifying_contract) {
+        Ok(a) => a,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    let token = match crate::signer::parse_evm_address(&p2.token) {
+        Ok(a) => a,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    let spender = match crate::signer::parse_evm_address(&p2.spender) {
+        Ok(a) => a,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    let amount = match crate::signer::parse_u256_be_decimal(&p2.amount) {
+        Ok(v) => v,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    let sig_deadline = match crate::signer::parse_u256_be_decimal(&p2.sig_deadline) {
+        Ok(v) => v,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+
+    if let Err(resp) = enforce_permit2_allowance(
+        policy.as_ref(),
+        p2.chain_id,
+        &verifying_contract,
+        &token,
+        &spender,
+        &amount,
+    ) {
+        return resp.with_policy_hash(policy_hash.clone());
+    }
+
+    let secret: AsterdexSecret = match secret_json.deserialize_into() {
+        Ok(s) => s,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    if !secret.is_complete() {
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
+    }
+    let pk = match crate::signer::parse_evm_private_key(&secret.private_key) {
+        Ok(k) => k,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    let derived = match crate::signer::derive_address_from_private_key(&pk) {
+        Ok(a) => a,
+        Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
+    };
+
+    match crate::signer::sign_permit2_permit_single(
+        &pk,
+        p2.chain_id,
+        &verifying_contract,
+        &token,
+        &amount,
+        p2.expiration,
+        p2.nonce,
+        &spender,
+        &sig_deadline,
+    ) {
+        Ok(signature) => {
+            // Тот же конверт, что у x402: подпись и адрес подписавшего. Адрес
+            // отдаётся затем, что вызывающему нужно знать, ЧЕЙ ключ подписал, —
+            // иначе он не сможет сверить владельца разрешения.
+            let mut headers = std::collections::BTreeMap::new();
+            headers.insert("signature".to_owned(), signature);
+            headers.insert("owner".to_owned(), format!("0x{}", hex::encode(derived)));
+            SignResponse::ok_headers(headers).with_policy_hash(policy_hash)
+        }
+        Err(_) => deny_under(&policy_hash, err_code::INTERNAL_ERROR),
+    }
+    // secret, pk all zeroize on Drop.
+}
+
+/// Пункт `permit2` — ОБЯЗАТЕЛЕН и fail-closed. «Нет пункта» и «нет поля» никогда
+/// не значат «нет предела» на примитиве, выдающем право вывода.
+#[allow(clippy::result_large_err)]
+fn enforce_permit2_allowance(
+    policy: Option<&Policy>,
+    req_chain_id: u64,
+    verifying_contract: &[u8; 20],
+    token: &[u8; 20],
+    spender: &[u8; 20],
+    amount: &[u8; 32],
+) -> Result<(), SignResponse> {
+    let Some(p) = policy else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_policy");
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+    let Some(c) = p.permit2.as_ref() else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_clause");
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+
+    // 🔴 БЕСКОНЕЧНОЕ РАЗРЕШЕНИЕ ОТКАЗЫВАЕТСЯ БЕЗУСЛОВНО, до и независимо от
+    // потолка. `uint160::MAX` — это значение, которым кошельки обозначают
+    // «без ограничений». Если бы оно просто резалось потолком, владелец,
+    // выставивший высокий потолок, тихо терял бы гарантию — то есть защита
+    // исчезала бы ровно у тех, у кого на кону больше всего. Это наоборот.
+    let infinite = amount[..12].iter().all(|b| *b == 0) && amount[12..].iter().all(|b| *b == 0xff);
+    if infinite {
+        tracing::warn!(event = "permit2_policy_denied", reason = "infinite_allowance");
+        return Err(SignResponse::err(err_code::POLICY_DENIED));
+    }
+
+    let Some(want_chain) = c.chain_id else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_chain_id");
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+    if want_chain != req_chain_id {
+        tracing::warn!(event = "permit2_policy_denied", reason = "chain_id");
+        return Err(SignResponse::err(err_code::POLICY_DENIED));
+    }
+
+    let Some(want_contract) = c.verifying_contract.as_deref() else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_verifying_contract");
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+    match crate::signer::parse_evm_address(want_contract) {
+        Ok(a) if a == *verifying_contract => {}
+        Ok(_) => {
+            tracing::warn!(event = "permit2_policy_denied", reason = "verifying_contract");
+            return Err(SignResponse::err(err_code::POLICY_DENIED));
+        }
+        Err(_) => {
+            tracing::warn!(event = "permit2_policy_required", reason = "bad_verifying_contract");
+            return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+        }
+    }
+
+    permit2_allow_list(c.allowed_tokens.as_deref(), token, "tokens")?;
+    permit2_allow_list(c.allowed_spenders.as_deref(), spender, "spenders")?;
+
+    let Some(max) = c.max_amount.as_deref() else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_max_amount");
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+    let max_word = match crate::signer::parse_u256_be_decimal(max) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(event = "permit2_policy_required", reason = "bad_max_amount");
+            return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+        }
+    };
+    if amount.as_slice() > max_word.as_slice() {
+        tracing::warn!(event = "permit2_policy_denied", reason = "amount_over_cap");
+        return Err(SignResponse::err(err_code::POLICY_DENIED));
+    }
+    Ok(())
+}
+
+/// Список разрешённого: отсутствует или пуст ⇒ «не подписывать ничего», а не
+/// «кому угодно». Отсутствие пункта и отказ по нему — разные исходы, и оператор
+/// идёт чинить только первый.
+#[allow(clippy::result_large_err)]
+fn permit2_allow_list(
+    list: Option<&[String]>,
+    needle: &[u8; 20],
+    what: &'static str,
+) -> Result<(), SignResponse> {
+    let Some(items) = list else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_allow_list", list = what);
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+    if items.is_empty() {
+        tracing::warn!(event = "permit2_policy_required", reason = "empty_allow_list", list = what);
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    }
+    for it in items {
+        if let Ok(a) = crate::signer::parse_evm_address(it) {
+            if a == *needle {
+                return Ok(());
+            }
+        }
+    }
+    tracing::warn!(event = "permit2_policy_denied", reason = "not_in_allow_list", list = what);
+    Err(SignResponse::err(err_code::POLICY_DENIED))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5365,6 +5588,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+        permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -5464,6 +5688,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+        permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -9057,6 +9282,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+        permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -9437,6 +9663,7 @@ mod tests {
             nonce: Some(1700000000000),
             vault_address: None,
             x402: None,
+        permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -9651,6 +9878,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+        permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -12203,4 +12431,143 @@ mod tests {
             );
         }
     }
+
+    // ── Permit2: пункт политики ОБЯЗАТЕЛЕН и fail-closed ──────────────────
+    //
+    // Проверяется не «отказал», а КАКИМ КОДОМ. `policy_required` и `policy_denied`
+    // это разные положения: первое означает «правил ещё нет» и оператор идёт их
+    // писать, второе — «правила сказали нет». Слить их значит отправить человека
+    // чинить не то.
+    fn p2_policy() -> Policy {
+        Policy {
+            permit2: Some(crate::proto::Permit2Policy {
+                chain_id: Some(1),
+                verifying_contract: Some(
+                    "0x000000000022d473030f116ddee9f6b43ac78ba3".to_owned(),
+                ),
+                allowed_tokens: Some(vec![
+                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".to_owned(),
+                ]),
+                allowed_spenders: Some(vec![
+                    "0x111111125421ca6dc452d289314280a0f8842a65".to_owned(),
+                ]),
+                max_amount: Some("1000000000000000000".to_owned()),
+            }),
+            ..Default::default()
+        }
+    }
+    fn p2_addr(h: &str) -> [u8; 20] {
+        crate::signer::parse_evm_address(h).unwrap()
+    }
+    fn p2_word(dec: &str) -> [u8; 32] {
+        crate::signer::parse_u256_be_decimal(dec).unwrap()
+    }
+    const P2_CONTRACT: &str = "0x000000000022d473030f116ddee9f6b43ac78ba3";
+    const P2_TOKEN: &str = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+    const P2_SPENDER: &str = "0x111111125421ca6dc452d289314280a0f8842a65";
+
+    fn p2_check(pol: Option<&Policy>, chain: u64, token: &str, spender: &str, amount: &str)
+        -> Option<String>
+    {
+        enforce_permit2_allowance(
+            pol,
+            chain,
+            &p2_addr(P2_CONTRACT),
+            &p2_addr(token),
+            &p2_addr(spender),
+            &p2_word(amount),
+        )
+        .err()
+        .and_then(|r| r.error.clone())
+    }
+
+    #[test]
+    fn permit2_allows_a_request_inside_the_clause() {
+        let pol = p2_policy();
+        assert_eq!(
+            p2_check(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1000000000000000000"),
+            None
+        );
+    }
+
+    #[test]
+    fn permit2_without_a_clause_is_policy_required_not_denied() {
+        assert_eq!(
+            p2_check(None, 1, P2_TOKEN, P2_SPENDER, "1"),
+            Some(err_code::POLICY_REQUIRED.to_owned())
+        );
+        let empty = Policy::default();
+        assert_eq!(
+            p2_check(Some(&empty), 1, P2_TOKEN, P2_SPENDER, "1"),
+            Some(err_code::POLICY_REQUIRED.to_owned())
+        );
+    }
+
+    /// 🔴 Бесконечное разрешение отказывается ДАЖЕ при потолке, поднятом до
+    /// самого верха. Если бы оно резалось потолком, владелец с высоким потолком
+    /// тихо терял бы гарантию — защита исчезала бы у тех, у кого больше на кону.
+    #[test]
+    fn permit2_refuses_an_infinite_allowance_whatever_the_cap() {
+        let uint160_max = "1461501637330902918203684832716283019655932542975";
+        let mut pol = p2_policy();
+        pol.permit2.as_mut().unwrap().max_amount = Some(uint160_max.to_owned());
+        assert_eq!(
+            p2_check(Some(&pol), 1, P2_TOKEN, P2_SPENDER, uint160_max),
+            Some(err_code::POLICY_DENIED.to_owned()),
+            "бесконечное разрешение прошло, потому что потолок подняли — это и есть дефект"
+        );
+        // На единицу меньше — уже обычное значение, и оно проходит.
+        let one_less = "1461501637330902918203684832716283019655932542974";
+        assert_eq!(p2_check(Some(&pol), 1, P2_TOKEN, P2_SPENDER, one_less), None);
+    }
+
+    #[test]
+    fn permit2_pins_chain_token_spender_and_contract() {
+        let pol = p2_policy();
+        let denied = Some(err_code::POLICY_DENIED.to_owned());
+        assert_eq!(p2_check(Some(&pol), 8453, P2_TOKEN, P2_SPENDER, "1"), denied, "чужая цепь");
+        assert_eq!(
+            p2_check(Some(&pol), 1, "0x000000000000000000000000000000000000dEaD", P2_SPENDER, "1"),
+            denied, "токен вне списка"
+        );
+        assert_eq!(
+            p2_check(Some(&pol), 1, P2_TOKEN, "0x000000000000000000000000000000000000dEaD", "1"),
+            denied, "spender вне списка"
+        );
+        let mut other = p2_policy();
+        other.permit2.as_mut().unwrap().verifying_contract =
+            Some("0x000000000000000000000000000000000000dEaD".to_owned());
+        assert_eq!(p2_check(Some(&other), 1, P2_TOKEN, P2_SPENDER, "1"), denied, "чужой контракт");
+    }
+
+    #[test]
+    fn permit2_missing_or_empty_fields_are_required_not_denied() {
+        for mutate in [
+            (|c: &mut crate::proto::Permit2Policy| c.chain_id = None) as fn(&mut _),
+            |c: &mut crate::proto::Permit2Policy| c.verifying_contract = None,
+            |c: &mut crate::proto::Permit2Policy| c.allowed_tokens = None,
+            |c: &mut crate::proto::Permit2Policy| c.allowed_spenders = None,
+            |c: &mut crate::proto::Permit2Policy| c.max_amount = None,
+            |c: &mut crate::proto::Permit2Policy| c.allowed_tokens = Some(vec![]),
+            |c: &mut crate::proto::Permit2Policy| c.allowed_spenders = Some(vec![]),
+        ] {
+            let mut pol = p2_policy();
+            mutate(pol.permit2.as_mut().unwrap());
+            assert_eq!(
+                p2_check(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1"),
+                Some(err_code::POLICY_REQUIRED.to_owned()),
+                "пустое/отсутствующее поле обязано читаться как «правил нет», а не «правила сказали нет»"
+            );
+        }
+    }
+
+    #[test]
+    fn permit2_amount_over_the_cap_is_denied() {
+        let pol = p2_policy();
+        assert_eq!(
+            p2_check(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1000000000000000001"),
+            Some(err_code::POLICY_DENIED.to_owned())
+        );
+    }
+
 }
