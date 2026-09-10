@@ -247,6 +247,16 @@ async fn main() -> Result<()> {
         // x402 / EIP-3009 signing endpoint (PR #74 primitive). Same auth +
         // dos-hardening as /sign — it produces a payment authorization.
         .route("/sign-x402", post(handlers::post_sign_x402))
+        // Permit2 `PermitSingle` — sign a STANDING allowance. Same auth +
+        // dos-hardening as /sign and /sign-x402, and deliberately on the same
+        // bearer-gated router: the enclave has signed this since #92, and the
+        // only thing missing was a way to reach it. Every allowance rule is
+        // enforced inside the enclave under attestation; the route relays the
+        // verdict without re-deciding it.
+        .route(
+            "/sign/permit2-permit-single",
+            post(handlers::post_sign_permit2),
+        )
         // NOTE: `/attestation` is intentionally NOT here — it is a PUBLIC,
         // no-bearer route (see `public_router` below). It used to live on this
         // bearer-gated router, which made the signer-mcp proof tool return 401.
@@ -709,6 +719,7 @@ async fn run_data_signing_probe(state: &AppState, max_attempts: u32) -> ProbeOut
             nonce: None,
             vault_address: None,
             x402: None,
+            permit2: None,
             order: None,
             cancel: None,
             data: Some(SIGN_PROBE_PAYLOAD.to_owned()),

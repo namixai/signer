@@ -409,6 +409,7 @@ pub async fn post_sign(
         nonce: req.nonce,
         vault_address: req.vault_address.clone(),
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         data: None,
@@ -639,6 +640,7 @@ pub async fn get_healthz(State(state): State<AppState>) -> Response {
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         data: None,
@@ -778,6 +780,7 @@ pub async fn post_verify_blob(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         data: None,
@@ -981,6 +984,7 @@ pub async fn post_sign_data(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         // Forwarded VERBATIM (raw JSON text) — the enclave parses + canonicalizes.
@@ -1178,6 +1182,7 @@ pub async fn post_sign_x402(
         nonce: None,
         vault_address: None,
         x402: Some(x402_value),
+        permit2: None,
         order: None,
         cancel: None,
         data: None,
@@ -1270,6 +1275,219 @@ pub async fn post_sign_x402(
                 ok: true,
                 signature,
                 from,
+                receipt,
+            }),
+        )
+            .into_response(),
+        started,
+        true,
+        None,
+    )
+}
+
+/// `POST /sign/permit2-permit-single` — sign a Permit2 `PermitSingle`.
+///
+/// The enclave has been able to sign this since #92; there was no way to reach
+/// it from outside, which is what this route fixes. The gateway is deliberately
+/// thin here: it resolves the blob, forwards the params opaquely, and relays the
+/// enclave's verdict. Every allowance rule — the mandatory `permit2` policy
+/// clause, the infinite-allowance refusal, the token/spender allow-lists, the
+/// amount and expiration caps — lives in the enclave and is enforced under
+/// attestation. A check duplicated here would be a check that can disagree.
+///
+/// 🔴 The three refusals stay distinguishable on the wire, which is the whole
+/// point of the route: `policy_required` means the CONFIGURATION is incomplete
+/// (no clause, no cap, an unparsable allow-list entry) and the operator has to
+/// fix it; `policy_denied` means the REQUEST lost against a rule that is present
+/// and working (infinite allowance, a spender that is not on the list, an amount
+/// or expiration over the cap) and the caller has to change what they asked for;
+/// `bad_request` means the request never had a valid shape (a value wider than
+/// the type it would be signed into). Collapsing these into one answer would
+/// send whoever reads it to fix the wrong thing — both codes are already on the
+/// gateway's wire allow-list, so they pass through named.
+pub async fn post_sign_permit2(
+    State(state): State<AppState>,
+    Extension(ResolvedCustomer(customer)): Extension<ResolvedCustomer>,
+    Extension(RawToken(raw_token)): Extension<RawToken>,
+    Json(req): Json<crate::proto::SignPermit2Request>,
+) -> Response {
+    let started = Instant::now();
+    let key_for_log = req.key_id.clone();
+    info!(
+        event = "sign_permit2_received",
+        key_id = %key_for_log,
+        "POST /sign/permit2-permit-single"
+    );
+
+    // Same F1 constraint as every other blob-selecting route: the caller-supplied
+    // key_id becomes half a blob key and an enclave-side namespace label.
+    if !is_safe_key_id(&req.key_id) {
+        warn!(event = "sign_permit2_bad_key_id", key_id = %key_for_log);
+        return finish_log(
+            error_response(err_code::BAD_REQUEST),
+            started,
+            false,
+            Some(err_code::BAD_REQUEST),
+        );
+    }
+    let scope = blob_key(&customer, &req.key_id);
+
+    // 1. The provisioned owner-key blob for this (customer, key_id). Permit2 keys
+    //    are not trading venues, so they are not gated by ALLOWED_EXCHANGES —
+    //    parity with the x402 payer key.
+    let blob = match state.blobs.get(&scope) {
+        Some(b) => b,
+        None => {
+            warn!(event = "sign_permit2_no_blob", key_id = %key_for_log);
+            return finish_log(
+                error_response(err_code::BAD_REQUEST),
+                started,
+                false,
+                Some(err_code::BAD_REQUEST),
+            );
+        }
+    };
+
+    // 2. Fresh AWS creds (same path as /sign, /sign-x402).
+    let creds = match state.creds.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(event = "sign_permit2_creds_failed", detail = %e);
+            return finish_log(
+                error_response(err_code::INTERNAL_ERROR),
+                started,
+                false,
+                Some(err_code::INTERNAL_ERROR),
+            );
+        }
+    };
+
+    // 3. Forward the allowance params verbatim as an opaque object — the enclave
+    //    re-deserializes into its typed, deny_unknown_fields `Permit2Request`.
+    let permit2_value = match serde_json::to_value(&req.permit2) {
+        Ok(v) => v,
+        Err(_) => {
+            return finish_log(
+                error_response(err_code::INTERNAL_ERROR),
+                started,
+                false,
+                Some(err_code::INTERNAL_ERROR),
+            )
+        }
+    };
+
+    let vsock_req = VsockRequest {
+        action: "sign_permit2_permit_single".to_owned(),
+        method: None,
+        path: None,
+        body: None,
+        timestamp_ms: Some(now_ms()),
+        aws_credentials: Some(AwsCredentials {
+            access_key_id: creds.access_key_id.clone(),
+            secret_access_key: creds.secret_access_key.clone(),
+            session_token: creds.session_token.clone(),
+        }),
+        ciphertext_blob_base64: Some(B64.encode(blob.ciphertext.as_slice())),
+        proto_version: 1,
+        op: None,
+        payload: None,
+        opaque_token: Some(raw_token.to_owned()),
+        key_blob_s3_key: Some(format!("secrets/{}.enc", req.key_id)),
+        query: None,
+        hl_action: None,
+        nonce: None,
+        vault_address: None,
+        x402: None,
+        permit2: Some(permit2_value),
+        order: None,
+        cancel: None,
+        data: None,
+        intent_signature: None,
+        intent_nonce: None,
+        client_nonce: None,
+        attestation_nonce: None,
+        attestation_user_data: None,
+    };
+
+    // 3b. Adaptive backoff — parity with /sign and /sign-x402, so this route gets
+    //     the same KMS-throttle protection.
+    if !state.backoff.allow(&scope) {
+        warn!(event = "sign_permit2_backoff_rejected", key_id = %key_for_log);
+        return finish_log(
+            error_response(err_code::RATE_LIMITED),
+            started,
+            false,
+            Some(err_code::RATE_LIMITED),
+        );
+    }
+
+    // 4. Round-trip to the enclave.
+    let vsock_started = Instant::now();
+    let resp = vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await;
+    let vsock_latency_ms = vsock_started.elapsed().as_millis() as u64;
+
+    let mut resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(event = "sign_permit2_vsock_failed", latency_ms = vsock_latency_ms, detail = %e);
+            return finish_log(
+                error_response(err_code::ENCLAVE_UNREACHABLE),
+                started,
+                false,
+                Some(err_code::ENCLAVE_UNREACHABLE),
+            );
+        }
+    };
+
+    // 5. Errors → allow-listed wire surface. `policy_required` and `policy_denied`
+    //    are both on that list, so they reach the caller as themselves.
+    let receipt = take_receipt(&mut resp, &customer);
+    if let Some(code) = resp.error.as_deref() {
+        let mapped = crate::proto::safe_wire_code(code);
+        if mapped == err_code::RATE_LIMITED {
+            state.backoff.report_rate_limited(&scope);
+        }
+        warn!(
+            event = "sign_permit2_enclave_error",
+            key_id = %key_for_log,
+            internal_code = code,
+            wire_code = mapped,
+            vsock_latency_ms,
+        );
+        return finish_log(
+            enclave_error_response(mapped, receipt),
+            started,
+            false,
+            Some(mapped),
+        );
+    }
+
+    // 6. Success: the enclave returns signature + owner address via headers.
+    let mut headers = resp.headers.take().unwrap_or_default();
+    let signature = headers.remove("signature");
+    let owner = headers.remove("owner");
+    for v in headers.values_mut() {
+        zeroize::Zeroize::zeroize(v);
+    }
+    let (Some(signature), Some(owner)) = (signature, owner) else {
+        warn!(event = "sign_permit2_missing_signature", key_id = %key_for_log);
+        return finish_log(
+            error_response(err_code::INTERNAL_ERROR),
+            started,
+            false,
+            Some(err_code::INTERNAL_ERROR),
+        );
+    };
+
+    state.backoff.report_success(&scope);
+    info!(event = "sign_permit2_ok", key_id = %key_for_log, vsock_latency_ms);
+    finish_log(
+        (
+            StatusCode::OK,
+            Json(crate::proto::SignPermit2Response {
+                ok: true,
+                signature,
+                owner,
                 receipt,
             }),
         )
@@ -1441,6 +1659,7 @@ pub(crate) async fn sign_structured_request(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: order_field,
         cancel: cancel_field,
         data: None,
@@ -1804,6 +2023,7 @@ pub async fn post_sign_binance_request(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         data: None,
@@ -2498,6 +2718,7 @@ pub async fn post_receipt_heartbeat(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         attestation_nonce: None,
@@ -2634,6 +2855,7 @@ pub async fn get_attestation(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         attestation_nonce: nonce_hex.clone(),
@@ -2952,6 +3174,7 @@ pub(crate) async fn sign_account_read(
         nonce: None,
         vault_address: None,
         x402: None,
+        permit2: None,
         order: None,
         cancel: None,
         data: None,
@@ -3843,6 +4066,135 @@ fn finish_log(
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
 #[cfg(test)]
 mod tests {
+
+    // ── Permit2 route ────────────────────────────────────────────────────────
+    //
+    // The enclave has signed `PermitSingle` since #92; what was missing was a
+    // way to reach it. These four tests pin the parts of that reach which can
+    // break WITHOUT breaking the build — a route silently unregistered, an
+    // action string quietly mistyped, a denial code collapsed into another.
+
+    /// 🔴 The three refusals must reach the caller AS THEMSELVES.
+    ///
+    /// `policy_required` says the configuration is incomplete — the operator has
+    /// to add a clause or a cap. `policy_denied` says the request lost against a
+    /// rule that is present and working — the caller has to ask for less.
+    /// `bad_request` says the request never had a valid shape. Collapse any two
+    /// and whoever reads the answer goes to fix the wrong thing: an operator
+    /// hunting a broken policy that is fine, or a caller lowering an amount that
+    /// was never the problem.
+    ///
+    /// This is exactly what `safe_wire_code` can silently undo: dropping a code
+    /// from the wire allow-list turns it into `internal_error` — a denial that
+    /// reads as our outage.
+    #[test]
+    fn permit2_denials_stay_distinguishable_on_the_wire() {
+        use crate::proto::{denial_meta, err_code, safe_wire_code};
+
+        // Each survives the allow-list as itself.
+        assert_eq!(
+            safe_wire_code(err_code::POLICY_REQUIRED),
+            err_code::POLICY_REQUIRED,
+            "policy_required collapsed — an operator-fixable misconfiguration \
+             would read as a signer outage"
+        );
+        assert_eq!(
+            safe_wire_code(err_code::POLICY_DENIED),
+            err_code::POLICY_DENIED,
+            "policy_denied collapsed — a working refusal would read as a signer outage"
+        );
+        assert_eq!(
+            safe_wire_code(err_code::BAD_REQUEST),
+            err_code::BAD_REQUEST,
+            "bad_request collapsed — the caller's own malformed input would read as ours"
+        );
+
+        // And they stay three DIFFERENT answers, not one.
+        let three = [
+            safe_wire_code(err_code::POLICY_REQUIRED),
+            safe_wire_code(err_code::POLICY_DENIED),
+            safe_wire_code(err_code::BAD_REQUEST),
+        ];
+        let mut uniq: Vec<&str> = three.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "two Permit2 refusals answer identically: {three:?}");
+
+        // The split that matters to the reader: a refusal is a refusal
+        // (`denied: true`), a malformed request is not.
+        assert!(denial_meta(err_code::POLICY_REQUIRED).0, "policy_required must read as denied");
+        assert!(denial_meta(err_code::POLICY_DENIED).0, "policy_denied must read as denied");
+        assert!(
+            !denial_meta(err_code::BAD_REQUEST).0,
+            "bad_request must NOT read as a policy denial — it is the caller's shape error"
+        );
+    }
+
+    /// The route exists, spelled as the clients were told.
+    ///
+    /// Read from the source rather than asserted against a constant: a constant
+    /// would move together with the registration and pass while the endpoint is
+    /// gone. The neighbouring `every_route_path_is_valid_for_the_linked_axum`
+    /// proves paths BUILD; this one proves THIS path is still among them.
+    #[test]
+    fn permit2_route_is_registered() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("\"/sign/permit2-permit-single\""),
+            "the Permit2 route is not registered in main.rs — the enclave can sign \
+             PermitSingle and nothing outside can ask it to, which is the exact gap \
+             this route was added to close"
+        );
+        assert!(
+            src.contains("post(handlers::post_sign_permit2)"),
+            "the Permit2 path is registered without its handler"
+        );
+    }
+
+    /// The action string must be the one the enclave dispatches on.
+    ///
+    /// A typo here compiles, deploys, and fails only at runtime as an opaque
+    /// rejection from the enclave — the gateway would look healthy while the
+    /// route never worked. The enclave matches `"sign_permit2_permit_single"`
+    /// in `handler.rs`; nothing but an exact match reaches the signer.
+    #[test]
+    fn permit2_action_string_matches_the_enclave() {
+        let src = include_str!("handlers.rs");
+        assert!(
+            src.contains("action: \"sign_permit2_permit_single\".to_owned()"),
+            "the Permit2 handler no longer sends the action the enclave dispatches on"
+        );
+    }
+
+    /// Unknown fields in the allowance are refused at the edge.
+    ///
+    /// The enclave is the authority — its `Permit2Request` is
+    /// `deny_unknown_fields` too — but a body that can never be signed should
+    /// not consume a KMS decrypt and an enclave round-trip to find that out.
+    /// The mirror only earns its place if it actually mirrors.
+    #[test]
+    fn permit2_params_reject_unknown_fields() {
+        let good = serde_json::json!({
+            "chain_id": 1u64,
+            "verifying_contract": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+            "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "amount": "1000000",
+            "expiration": 1789000000u64,
+            "nonce": 0u64,
+            "spender": "0x1111111111111111111111111111111111111111",
+            "sig_deadline": "1789000000"
+        });
+        serde_json::from_value::<crate::proto::Permit2Params>(good.clone())
+            .expect("the documented allowance shape must deserialize");
+
+        let mut sneaky = good;
+        sneaky["surprise"] = serde_json::json!("extra");
+        assert!(
+            serde_json::from_value::<crate::proto::Permit2Params>(sneaky).is_err(),
+            "an unknown field was accepted — a caller could believe they sent a \
+             constraint that nothing reads"
+        );
+    }
 
     /// The nonce is what stops the GATEWAY from choosing the freshness value
     /// the enclave signs, so each way of loosening it is pinned by name.

@@ -127,6 +127,13 @@ pub struct VsockRequest {
     #[zeroize(skip)]
     pub x402: Option<serde_json::Value>,
 
+    /// Permit2 `PermitSingle` params (opaque pass-through; the enclave
+    /// deserializes into its typed `Permit2Request`). Public allowance fields
+    /// only — no key material — so `zeroize` is skipped, same as `x402`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub permit2: Option<serde_json::Value>,
+
     /// Structured order params (opaque pass-through; enclave deserializes into
     /// its typed `OrderRequest`). Public order shape — no key material.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +421,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+            permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -516,6 +524,7 @@ mod tests {
             nonce: Some(42),
             vault_address: Some("0xdead".to_owned()),
             x402: None,
+            permit2: None,
             order: None,
             cancel: None,
             data: None,

@@ -414,6 +414,76 @@ pub struct X402Params {
     pub nonce: String,
 }
 
+/// Permit2 `PermitSingle` params — mirror of the enclave's `Permit2Request`.
+///
+/// The gateway does NOT interpret these: it forwards them opaquely and the
+/// enclave re-deserializes into its own typed, `deny_unknown_fields` struct,
+/// which is the only place the shape is enforced. Declaring the same fields
+/// here (rather than accepting a free `Value`) buys one thing only — a
+/// malformed body fails as `bad_request` at the edge instead of travelling to
+/// the enclave to be rejected there.
+///
+/// `amount` (uint160) and `sig_deadline` (uint256) do not fit a native integer,
+/// so both travel as decimal strings, exactly as `X402Params::value` does.
+/// Public allowance fields only — no key material.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Permit2Params {
+    pub chain_id: u64,
+    pub verifying_contract: String,
+    pub token: String,
+    pub amount: String,
+    pub expiration: u64,
+    pub nonce: u64,
+    pub spender: String,
+    pub sig_deadline: String,
+}
+
+/// Input shape for `POST /sign/permit2-permit-single`. `key_id` selects the
+/// provisioned owner-key blob; the enclave verifies the address derived from
+/// that key matches the one baked into the blob before signing.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SignPermit2Request {
+    pub key_id: String,
+    pub permit2: Permit2Params,
+}
+
+/// Successful response shape for `POST /sign/permit2-permit-single`.
+///
+/// `signature` authorises a STANDING allowance, not a one-off transfer — it is
+/// at least as sensitive as the x402 payment authorization, so it gets the same
+/// treatment: `Zeroize, ZeroizeOnDrop` wipes it after axum serializes, and the
+/// manual `Debug` redacts it so a stray `?resp` cannot leak it.
+///
+/// `owner` is the address the enclave signed as. It is returned because the
+/// caller cannot otherwise tell WHOSE allowance this is, and an allowance
+/// attributed to the wrong owner is the failure this field exists to prevent.
+#[derive(Clone, Serialize, Zeroize, ZeroizeOnDrop)]
+pub struct SignPermit2Response {
+    #[zeroize(skip)]
+    pub ok: bool,
+    /// 0x-prefixed 65-byte r||s||v signature over the `PermitSingle` struct.
+    pub signature: String,
+    /// The owner address the enclave signed as (derived from the key).
+    #[zeroize(skip)]
+    pub owner: String,
+    /// The enclave's signed decision receipt for this allow (receipt.rs);
+    /// absent before the receipt epoch starts on this enclave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub receipt: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for SignPermit2Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignPermit2Response")
+            .field("ok", &self.ok)
+            .field("signature", &"[REDACTED]")
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
 /// Input shape for `POST /sign-x402`. `key_id` selects the provisioned payer
 /// key blob (loaded into the gateway like a venue blob); the enclave verifies
 /// `x402.from` equals that key's address before signing.
