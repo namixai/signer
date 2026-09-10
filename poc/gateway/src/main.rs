@@ -1305,6 +1305,7 @@ mod tests {
             "/sign/binance-spot-order",
             "/sign/okx-cancel",
             "/sign/okx-order",
+            "/sign/permit2-permit-single",
             "/tenant/halt",
             "/user-trades/{venue}",
             "/verify-blob",

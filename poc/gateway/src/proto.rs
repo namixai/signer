@@ -442,7 +442,11 @@ pub struct Permit2Params {
 /// Input shape for `POST /sign/permit2-permit-single`. `key_id` selects the
 /// provisioned owner-key blob; the enclave verifies the address derived from
 /// that key matches the one baked into the blob before signing.
+/// `deny_unknown_fields` here as well as on `Permit2Params`: a caller who
+/// misspells `key_id` must be told, not silently served with whatever the
+/// default resolves to.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignPermit2Request {
     pub key_id: String,
     pub permit2: Permit2Params,

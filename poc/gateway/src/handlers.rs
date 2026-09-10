@@ -1348,7 +1348,22 @@ pub async fn post_sign_permit2(
         }
     };
 
-    // 2. Fresh AWS creds (same path as /sign, /sign-x402).
+    // 2. Adaptive backoff BEFORE the credentials fetch: a request the breaker
+    //    will reject must not drive an IMDS/STS refresh first. `/sign` states
+    //    this rule and `sign_structured_request` follows it; `/sign-x402` has
+    //    the inversion, and copying its order would have carried the defect
+    //    into a new route (CodeRabbit #93).
+    if !state.backoff.allow(&scope) {
+        warn!(event = "sign_permit2_backoff_rejected", key_id = %key_for_log);
+        return finish_log(
+            error_response(err_code::RATE_LIMITED),
+            started,
+            false,
+            Some(err_code::RATE_LIMITED),
+        );
+    }
+
+    // 3. Fresh AWS creds (same path as /sign, /sign-x402).
     let creds = match state.creds.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -1362,7 +1377,7 @@ pub async fn post_sign_permit2(
         }
     };
 
-    // 3. Forward the allowance params verbatim as an opaque object — the enclave
+    // 4. Forward the allowance params verbatim as an opaque object — the enclave
     //    re-deserializes into its typed, deny_unknown_fields `Permit2Request`.
     let permit2_value = match serde_json::to_value(&req.permit2) {
         Ok(v) => v,
@@ -1409,19 +1424,7 @@ pub async fn post_sign_permit2(
         attestation_user_data: None,
     };
 
-    // 3b. Adaptive backoff — parity with /sign and /sign-x402, so this route gets
-    //     the same KMS-throttle protection.
-    if !state.backoff.allow(&scope) {
-        warn!(event = "sign_permit2_backoff_rejected", key_id = %key_for_log);
-        return finish_log(
-            error_response(err_code::RATE_LIMITED),
-            started,
-            false,
-            Some(err_code::RATE_LIMITED),
-        );
-    }
-
-    // 4. Round-trip to the enclave.
+    // 5. Round-trip to the enclave.
     let vsock_started = Instant::now();
     let resp = vsock::round_trip(state.enclave.cid, state.enclave.port, &vsock_req).await;
     let vsock_latency_ms = vsock_started.elapsed().as_millis() as u64;
@@ -1439,7 +1442,7 @@ pub async fn post_sign_permit2(
         }
     };
 
-    // 5. Errors → allow-listed wire surface. `policy_required` and `policy_denied`
+    // 6. Errors → allow-listed wire surface. `policy_required` and `policy_denied`
     //    are both on that list, so they reach the caller as themselves.
     let receipt = take_receipt(&mut resp, &customer);
     if let Some(code) = resp.error.as_deref() {
@@ -1462,14 +1465,27 @@ pub async fn post_sign_permit2(
         );
     }
 
-    // 6. Success: the enclave returns signature + owner address via headers.
+    // 7. Success: the enclave returns signature + owner address via headers.
+    // `resp.headers.take()` moves the map OUT of the response's ZeroizeOnDrop
+    // shell, so this plain BTreeMap will NOT wipe its values on drop. Pull out
+    // the two fields we return, wipe every leftover — and, on the error path,
+    // wipe what we already pulled out. A `let-else` destructure would drop a
+    // successfully extracted `signature` as a plain `String`: no wipe, and this
+    // one authorizes a STANDING allowance (CodeRabbit security-high on #93).
+    // Same shape as `post_sign_binance_request`.
     let mut headers = resp.headers.take().unwrap_or_default();
-    let signature = headers.remove("signature");
-    let owner = headers.remove("owner");
+    let mut signature = headers.remove("signature");
+    let mut owner = headers.remove("owner");
     for v in headers.values_mut() {
         zeroize::Zeroize::zeroize(v);
     }
-    let (Some(signature), Some(owner)) = (signature, owner) else {
+    if signature.is_none() || owner.is_none() {
+        if let Some(s) = signature.as_mut() {
+            zeroize::Zeroize::zeroize(s);
+        }
+        if let Some(o) = owner.as_mut() {
+            zeroize::Zeroize::zeroize(o);
+        }
         warn!(event = "sign_permit2_missing_signature", key_id = %key_for_log);
         return finish_log(
             error_response(err_code::INTERNAL_ERROR),
@@ -1477,7 +1493,10 @@ pub async fn post_sign_permit2(
             false,
             Some(err_code::INTERNAL_ERROR),
         );
-    };
+    }
+    // Both present (checked above).
+    let signature = signature.expect("signature present after None-check");
+    let owner = owner.expect("owner present after None-check");
 
     state.backoff.report_success(&scope);
     info!(event = "sign_permit2_ok", key_id = %key_for_log, vsock_latency_ms);
