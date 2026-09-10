@@ -1370,6 +1370,14 @@ pub struct Permit2Policy {
     /// ceiling. A cumulative cap is the real fix and is not this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Потолок СРОКА разрешения, секунды эпохи (uint48).
+    ///
+    /// Обязателен по той же причине, что и остальные поля: разрешение на малую сумму,
+    /// но бессрочное — это не маленькое разрешение, а вечный доступ. Порядок полей в
+    /// ОБЕИХ декларациях схемы обязан совпадать: подпись авторитета накрывает
+    /// канонические байты, произведённые из порядка объявления.
+    pub max_expiration: Option<u64>,
 }
 
 /// One entry in a policy's `order_caps` allow-list. The enclave rejects any

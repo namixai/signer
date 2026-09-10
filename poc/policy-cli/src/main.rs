@@ -206,6 +206,14 @@ struct Permit2Policy {
     allowed_spenders: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Потолок СРОКА разрешения, секунды эпохи (uint48).
+    ///
+    /// Обязателен по той же причине, что и остальные поля: разрешение на малую сумму,
+    /// но бессрочное — это не маленькое разрешение, а вечный доступ. Порядок полей в
+    /// ОБЕИХ декларациях схемы обязан совпадать: подпись авторитета накрывает
+    /// канонические байты, произведённые из порядка объявления.
+    max_expiration: Option<u64>,
 }
 
 /// Wire shape that gets fed into `aws kms encrypt`. Field order is

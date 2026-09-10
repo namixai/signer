@@ -740,6 +740,14 @@ fn is_money_venue(venue: &str) -> bool {
             | "asterdex"
             | "hyperliquid_main"
             | "hyperliquid_testnet"
+            // 🔴 Permit2 подписывает СТОЯЧЕЕ право вывода, и без этой строки строгая
+            // ветка `load_and_parse_blob` для него не входит: пропускаются
+            // `verify_policy_authority` и отказ некапнутому ключу. Следствие точное —
+            // партнёр, контролирующий шифротекст в потоке Option-1, пинит свой ключ
+            // через TOFU и подаёт СВОЙ пункт `permit2`, а обязательное fail-closed
+            // принуждение честно исполняет ЕГО же лимиты. Пункт был обязателен, но не
+            // привязан к нашему контрольному плану — то есть охранял не нас.
+            | "permit2"
     )
 }
 
@@ -5179,6 +5187,7 @@ fn handle_sign_permit2_permit_single(
         &token,
         &spender,
         &amount,
+        p2.expiration,
     ) {
         return resp.with_policy_hash(policy_hash.clone());
     }
@@ -5198,6 +5207,20 @@ fn handle_sign_permit2_permit_single(
         Ok(a) => a,
         Err(_) => return deny_under(&policy_hash, err_code::INTERNAL_ERROR),
     };
+    // 🔴 БЛОБ ОБЯЗАН БЫТЬ САМОСОГЛАСОВАН, и я это пропустил. Все остальные пути подписи
+    // EVM в этом файле сверяют выведенный адрес с адресом, вшитым в блоб
+    // (`handle_sign_asterdex`, `handle_sign_x402_eip3009`, `load_hyperliquid_request`) —
+    // Permit2 не сверял. Без этого оператор, запечатавший ключ и адрес от разных
+    // владельцев, получает разрешение, подписанное НЕ ТЕМ ключом, а заголовок `owner`
+    // рапортует выведенный адрес — то есть ответ выглядит внутренне согласованным, и
+    // расхождение не видно ни с одной стороны.
+    let claimed = match crate::signer::parse_evm_address(&secret.signer_address) {
+        Ok(a) => a,
+        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
+    };
+    if derived.ct_eq(&claimed).unwrap_u8() == 0 {
+        return deny_under(&policy_hash, err_code::BAD_REQUEST);
+    }
 
     match crate::signer::sign_permit2_permit_single(
         &pk,
@@ -5257,6 +5280,7 @@ fn enforce_permit2_allowance(
     token: &[u8; 20],
     spender: &[u8; 20],
     amount: &[u8; 32],
+    expiration: u64,
 ) -> Result<(), SignResponse> {
     let Some(p) = policy else {
         tracing::warn!(event = "permit2_policy_required", reason = "no_policy");
@@ -5319,6 +5343,20 @@ fn enforce_permit2_allowance(
     };
     if amount.as_slice() > max_word.as_slice() {
         tracing::warn!(event = "permit2_policy_denied", reason = "amount_over_cap");
+        return Err(SignResponse::err(err_code::POLICY_DENIED));
+    }
+
+    // 🔴 РАЗМЕР БЕЗ СРОКА — ЭТО НЕ МАЛЕНЬКОЕ РАЗРЕШЕНИЕ, А ВЕЧНЫЙ ДОСТУП.
+    // Я сам написал, что `PermitSingle` опаснее разового перевода, потому что даёт
+    // право списывать ДО `expiration`, — и ограничил всё, кроме `expiration`. Разрешение
+    // на три доллара с `expiration = uint48::MAX` проходило каждую проверку выше.
+    // Потолок обязателен и fail-closed по той же причине, что и остальные поля.
+    let Some(max_exp) = c.max_expiration else {
+        tracing::warn!(event = "permit2_policy_required", reason = "no_max_expiration");
+        return Err(SignResponse::err(err_code::POLICY_REQUIRED));
+    };
+    if expiration > max_exp {
+        tracing::warn!(event = "permit2_policy_denied", reason = "expiration_over_cap");
         return Err(SignResponse::err(err_code::POLICY_DENIED));
     }
     Ok(())
@@ -12494,6 +12532,7 @@ mod tests {
                     "0x111111125421ca6dc452d289314280a0f8842a65".to_owned(),
                 ]),
                 max_amount: Some("1000000000000000000".to_owned()),
+                max_expiration: Some(2_000_000_000),
             }),
             ..Default::default()
         }
@@ -12511,6 +12550,12 @@ mod tests {
     fn p2_check(pol: Option<&Policy>, chain: u64, token: &str, spender: &str, amount: &str)
         -> Option<String>
     {
+        p2_check_exp(pol, chain, token, spender, amount, 2_000_000_000)
+    }
+
+    fn p2_check_exp(pol: Option<&Policy>, chain: u64, token: &str, spender: &str,
+                    amount: &str, expiration: u64) -> Option<String>
+    {
         enforce_permit2_allowance(
             pol,
             chain,
@@ -12518,6 +12563,7 @@ mod tests {
             &p2_addr(token),
             &p2_addr(spender),
             &p2_word(amount),
+            expiration,
         )
         .err()
         .and_then(|r| r.error.clone())
@@ -12685,6 +12731,99 @@ mod tests {
                 .is_ok(),
             "самое широкое ДОПУСТИМОЕ значение обязано проходить, иначе проверка режет живое"
         );
+    }
+
+    /// 🔴 Размер без срока — это не маленькое разрешение, а вечный доступ.
+    /// Разрешение на копейку с `expiration = uint48::MAX` проходило ВСЕ проверки.
+    #[test]
+    fn permit2_bounds_the_lifetime_not_only_the_size() {
+        let pol = p2_policy();
+        const UINT48_MAX: u64 = (1u64 << 48) - 1;
+        assert_eq!(
+            p2_check_exp(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1", UINT48_MAX),
+            Some(err_code::POLICY_DENIED.to_owned()),
+            "бессрочное разрешение прошло, потому что сумма мала — это и есть дефект"
+        );
+        // На потолке — проходит; на секунду выше — нет.
+        assert_eq!(p2_check_exp(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1", 2_000_000_000), None);
+        assert_eq!(
+            p2_check_exp(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1", 2_000_000_001),
+            Some(err_code::POLICY_DENIED.to_owned())
+        );
+        // Отсутствие потолка — «правил нет», а не «правила разрешили».
+        let mut no_cap = p2_policy();
+        no_cap.permit2.as_mut().unwrap().max_expiration = None;
+        assert_eq!(
+            p2_check_exp(Some(&no_cap), 1, P2_TOKEN, P2_SPENDER, "1", 1),
+            Some(err_code::POLICY_REQUIRED.to_owned())
+        );
+    }
+
+    /// 🔴 Permit2 — денежная площадка, иначе строгая ветка загрузки блоба для него не
+    /// входит и его обязательный пункт политики не требует подписи НАШЕЙ властью:
+    /// партнёр подаёт свой пункт, и принуждение честно исполняет его же лимиты.
+    /// 🔴 ВТОРАЯ ЛИНИЯ, И Я НАЗЫВАЮ ЕЁ ВТОРОЙ ЛИНИЕЙ. Поведенческого теста на сверку
+    /// выведенного адреса с адресом из блоба нет НИ У ОДНОГО из четырёх EVM-путей —
+    /// фикстуры EVM-блоба в дереве не существует, и `seed_test_tenant` даёт KuCoin.
+    /// Написать здесь тест через обработчик значило бы получить `bad_request` из формы
+    /// блоба и принять его за свой (ровно та ловушка, в которую я уже попал сегодня).
+    ///
+    /// Поэтому растяжка на ИСХОДНИК: сверка обязана присутствовать в теле обработчика.
+    /// Это не доказывает, что она срабатывает, — это доказывает, что её не удалили.
+    #[test]
+    fn permit2_handler_compares_derived_owner_to_the_blob() {
+        let src = include_str!("handler.rs");
+        let start = src
+            .find("fn handle_sign_permit2_permit_single")
+            .expect("обработчик не найден — тест смотрит не туда");
+        let body = &src[start..start + 6000];
+        assert!(
+            body.contains("secret.signer_address"),
+            "обработчик не читает адрес из блоба"
+        );
+        assert!(
+            body.contains("derived.ct_eq(&claimed)"),
+            "выведенный адрес не сверяется с блобом постоянным временем — так подпись \
+             уйдёт под ключом, которого оператор не имел в виду, а заголовок owner \
+             отрапортует выведенный адрес, и расхождение не будет видно ни с одной стороны"
+        );
+    }
+
+    #[test]
+    fn permit2_is_a_money_venue() {
+        assert_eq!(venue_for_action("sign_permit2_permit_single"), Some("permit2"));
+        assert!(
+            is_money_venue("permit2"),
+            "permit2 вне денежных площадок — обязательный пункт политики не привязан \
+             к нашему контрольному плану, то есть охраняет не нас"
+        );
+    }
+
+    /// Свойство, которое я РАНЬШЕ ЗАЯВИЛ закреплённым, не закрепив: `tenant_mode_gate` —
+    /// список разрешённого, поэтому новое действие отказано и в `halted`, и в
+    /// `cancel_only` по построению. Утверждение было в комментарии и в отчёте, а теста
+    /// не существовало. Теперь существует.
+    #[test]
+    fn permit2_is_refused_in_halted_and_cancel_only() {
+        use crate::registry::TenantMode;
+        for mode in [TenantMode::Halted, TenantMode::CancelOnly] {
+            let resp = handle_with_mode(
+                "tok-modes",
+                "cust-modes",
+                mode,
+                SignRequest {
+                    action: "sign_permit2_permit_single".to_owned(),
+                    method: Some("POST".to_owned()),
+                    ..req_template()
+                },
+            );
+            let code = resp.error.as_deref();
+            assert!(
+                code == Some(err_code::MODE_HALTED) || code == Some(err_code::MODE_CANCEL_ONLY),
+                "режим {mode:?}: ждали отказ по режиму, получили {code:?} — список \
+                 разрешённого однажды перепишут, и свойство обязано покраснеть здесь"
+            );
+        }
     }
 
     #[test]
