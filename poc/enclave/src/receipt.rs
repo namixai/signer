@@ -212,6 +212,13 @@ pub fn request_digest_v1(req: &SignRequest) -> [u8; 32] {
     push_json(&mut h, &req.order);
     push_json(&mut h, &req.cancel);
     push_json(&mut h, &req.x402);
+    // 🔴 Поле обязано входить в хэш запроса: иначе квитанция не связана с ТЕМ
+    // САМЫМ разрешением — какой токен, какому spender, на сколько. Побочное
+    // следствие названо вслух: новое поле сдвигает request_hash у ВСЕХ действий
+    // этого образа. Снаружи его никто не пересчитывает (проверяльщик квитанции
+    // читает поле, а не воспроизводит), а не покрыть подпись разрешения хэшем
+    // было бы ровно той дырой, которую мы ищем у других.
+    push_json(&mut h, &req.permit2);
     push_str(&mut h, req.data.as_deref());
     h.finalize().into()
 }
@@ -575,6 +582,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+        permit2: None,
             order: None,
             cancel: None,
             data: None,

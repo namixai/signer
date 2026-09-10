@@ -53,6 +53,7 @@
 //!   - label:                    Option<String>  (max 128 chars)
 //!   - allowed_asterdex_endpoints: Option<Vec<String>>
 //!   - x402:                     Option<X402Policy>   (EIP-3009 spend cap)
+//!   - permit2:                  Option<Permit2Policy> (allowance clause)
 //!   - order_caps:               Option<Vec<OrderAssetCap>> (per-asset qty cap)
 //!   - allowed_vaults:           Option<Vec<String>>        (CR053 HL vault allow-list, ZN-202)
 //!   - hl_order_caps:            Option<Vec<HlOrderCap>>    (CR053 HL per-asset-index size cap)
@@ -109,6 +110,8 @@ struct Policy {
     allowed_asterdex_endpoints: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     x402: Option<X402Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permit2: Option<Permit2Policy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     order_caps: Option<Vec<OrderAssetCap>>,
     // CR053: HL vault allow-list (ZN-202) + per-asset HL size caps. Order
@@ -182,6 +185,35 @@ struct X402Policy {
     max_value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     allowed_recipients: Option<Vec<String>>,
+}
+
+/// Permit2 allowance clause. Mirrors enclave `proto::Permit2Policy` (incl. its
+/// `deny_unknown_fields`). The enclave requires ALL of `chain_id`,
+/// `verifying_contract`, non-empty `allowed_tokens`, non-empty
+/// `allowed_spenders` and `max_amount` at sign time, else `policy_required` —
+/// and refuses `uint160::MAX` unconditionally, cap or no cap, because that is
+/// the value wallets use for "unlimited".
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Permit2Policy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verifying_contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowed_tokens: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allowed_spenders: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Потолок СРОКА разрешения, секунды эпохи (uint48).
+    ///
+    /// Обязателен по той же причине, что и остальные поля: разрешение на малую сумму,
+    /// но бессрочное — это не маленькое разрешение, а вечный доступ. Порядок полей в
+    /// ОБЕИХ декларациях схемы обязан совпадать: подпись авторитета накрывает
+    /// канонические байты, произведённые из порядка объявления.
+    max_expiration: Option<u64>,
 }
 
 /// Wire shape that gets fed into `aws kms encrypt`. Field order is

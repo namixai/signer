@@ -1693,9 +1693,226 @@ pub fn sign_x402_eip3009(
     Ok(format!("0x{}{}{:02x}", r_clean, s_clean, sig.v))
 }
 
+/// Permit2 (Uniswap) — `PermitSingle` с вложенным `PermitDetails`.
+///
+/// 🔴 ДОМЕН PERMIT2 — ТРИ ПОЛЯ, БЕЗ `version`. Не описка и не экономия: скопировать сюда
+/// обычный четырёхполный домен значит получить подпись, которая выглядит правильной и
+/// которую контракт отвергает, а отвергает он её как `InvalidSigner` — то есть текстом
+/// «не тот ключ», а не «не тот домен». Отладка уйдёт не туда.
+///
+/// Значение прибито к ЗАДЕПЛОЕННОМУ контракту, а не к нашей арифметике: `DOMAIN_SEPARATOR()`
+/// у `0x000000000022d473030f116ddee9f6b43ac78ba3` в mainnet отдаёт
+/// `0x866a5aba…903e3f28`, и тест ниже сверяется именно с ним.
+pub fn permit2_domain_separator(chain_id: u64, verifying_contract: &[u8; 20]) -> [u8; 32] {
+    let type_hash =
+        eip712_type_hash("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
+    let name_hash = keccak256(b"Permit2");
+
+    let mut buf = Vec::with_capacity(4 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&abi_word_from_u64(chain_id));
+    buf.extend_from_slice(&abi_word_from_address(verifying_contract));
+    keccak256(&buf)
+}
+
+/// `hashStruct(PermitDetails)`.
+///
+/// `amount` — uint160, и приходит сюда уже 32-байтовым ABI-словом: в EIP-712 каждое поле
+/// занимает слово независимо от объявленной ширины, поэтому «уложить uint160 в 20 байт»
+/// было бы ошибкой. Ширина при этом проверяется — верхние 12 байт обязаны быть нулями,
+/// иначе подписывается значение, которого в типе не существует.
+pub fn permit2_permit_details_struct_hash(
+    token: &[u8; 20],
+    amount: &[u8; 32],
+    expiration: u64,
+    nonce: u64,
+) -> Result<[u8; 32]> {
+    if amount[..12].iter().any(|b| *b != 0) {
+        return Err(anyhow::anyhow!("permit2: amount does not fit in uint160"));
+    }
+    // Ширина `expiration` и `nonce` проверяется и здесь, хотя вызывающий это уже сделал:
+    // функция публичная и переживёт своего вызывающего. Значение шире uint48 не
+    // существует в подписываемом типе, и подписать его значит выдать подпись под тем,
+    // чего в структуре нет.
+    const UINT48_MAX: u64 = (1u64 << 48) - 1;
+    if expiration > UINT48_MAX || nonce > UINT48_MAX {
+        return Err(anyhow::anyhow!("permit2: expiration/nonce do not fit in uint48"));
+    }
+    let type_hash = eip712_type_hash(
+        "PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)",
+    );
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&abi_word_from_address(token));
+    buf.extend_from_slice(amount);
+    buf.extend_from_slice(&abi_word_from_u64(expiration));
+    buf.extend_from_slice(&abi_word_from_u64(nonce));
+    Ok(keccak256(&buf))
+}
+
+/// `hashStruct(PermitSingle)`.
+///
+/// 🔴 ВЛОЖЕННАЯ СТРУКТУРА ВХОДИТ СВОИМ ХЭШЕМ, А НЕ ПОЛЯМИ. И в строке типа ссылочный тип
+/// дописывается следом, по алфавиту, — это требование EIP-712, и ровно здесь ошибка в один
+/// байт даёт подпись, которая проверяется собственным кодом и не проверяется ничем чужим.
+pub fn permit2_permit_single_struct_hash(
+    details_hash: &[u8; 32],
+    spender: &[u8; 20],
+    sig_deadline: &[u8; 32],
+) -> [u8; 32] {
+    let type_hash = eip712_type_hash(concat!(
+        "PermitSingle(PermitDetails details,address spender,uint256 sigDeadline)",
+        "PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)",
+    ));
+    let mut buf = Vec::with_capacity(4 * 32);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(details_hash);
+    buf.extend_from_slice(&abi_word_from_address(spender));
+    buf.extend_from_slice(sig_deadline);
+    keccak256(&buf)
+}
+
+/// Дайджест `PermitSingle`, готовый к подписи. Чистая композиция примитивов выше.
+#[allow(clippy::too_many_arguments)]
+pub fn permit2_permit_single_digest(
+    chain_id: u64,
+    verifying_contract: &[u8; 20],
+    token: &[u8; 20],
+    amount: &[u8; 32],
+    expiration: u64,
+    nonce: u64,
+    spender: &[u8; 20],
+    sig_deadline: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let domain = permit2_domain_separator(chain_id, verifying_contract);
+    let details = permit2_permit_details_struct_hash(token, amount, expiration, nonce)?;
+    let single = permit2_permit_single_struct_hash(&details, spender, sig_deadline);
+    Ok(eip712_digest(&domain, &single))
+}
+
+/// Подпись `PermitSingle` в форме `0x` || r(32) || s(32) || v(1), `v ∈ {27,28}` — та же
+/// форма, что уже отдаётся для x402. Новой криптографии здесь нет.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_permit2_permit_single(
+    private_key_bytes: &[u8; 32],
+    chain_id: u64,
+    verifying_contract: &[u8; 20],
+    token: &[u8; 20],
+    amount: &[u8; 32],
+    expiration: u64,
+    nonce: u64,
+    spender: &[u8; 20],
+    sig_deadline: &[u8; 32],
+) -> Result<String> {
+    let digest = permit2_permit_single_digest(
+        chain_id,
+        verifying_contract,
+        token,
+        amount,
+        expiration,
+        nonce,
+        spender,
+        sig_deadline,
+    )?;
+    let sig = sign_eip712_digest(private_key_bytes, &digest)?;
+    let r_clean = sig.r.strip_prefix("0x").unwrap_or(&sig.r);
+    let s_clean = sig.s.strip_prefix("0x").unwrap_or(&sig.s);
+    Ok(format!("0x{}{}{:02x}", r_clean, s_clean, sig.v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Permit2 `PermitSingle` — эталонные значения, которых МЫ НЕ ПРОИЗВОДИЛИ.
+    ///
+    /// 🔴 Почему это условие, а не педантизм. Вложенная структура — ровно то место, где
+    /// ошибка в один байт даёт подпись, сходящуюся с собственным вычислением и ни с чем
+    /// больше: тест, который сам собирает прообраз и сам же его проверяет, зелёный при
+    /// любой ошибке в прообразе. Поэтому обе опоры ниже — чужие.
+    ///
+    /// ОТКУДА ЧИСЛА:
+    ///   `DOMAIN` — ответ ЗАДЕПЛОЕННОГО контракта Permit2 на `DOMAIN_SEPARATOR()`
+    ///   (`0x0000…78ba3`, mainnet, селектор `0x3644e515`). Снято 2026-09-11 с двух
+    ///   независимых публичных узлов, оба дали одно значение.
+    ///   `DIGEST` — посчитан `viem.hashTypedData` по тем же типам и тому же сообщению.
+    ///   Это ОБОБЩЁННАЯ сторонняя реализация EIP-712: она сама раскрывает вложенную
+    ///   структуру из объявления типов, а не повторяет нашу сборку.
+    ///
+    /// Заказ из спеки: WETH, 1e18, expiration 2000000000, nonce 0,
+    /// spender = 1inch AggregationRouterV6, sigDeadline 2000000000.
+    #[test]
+    fn permit2_matches_values_we_did_not_produce() {
+        const PERMIT2: [u8; 20] = hex_20("000000000022d473030f116ddee9f6b43ac78ba3");
+        const WETH: [u8; 20] = hex_20("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        const SPENDER: [u8; 20] = hex_20("111111125421ca6dc452d289314280a0f8842a65");
+        const DOMAIN: &str = "866a5aba21966af95d6c7ab78eb2b2fc913915c28be3b9aa07cc04ff903e3f28";
+        const HASH_DETAILS: &str =
+            "665449c71b4a0866197bdf385920f206dbc3e9b2de768e8579a480105bb5d16a";
+        const HASH_SINGLE: &str =
+            "5c95ac3857991257e81acf69af4cd1911a4adf071f8496a6ad320dc666ecf746";
+        const DIGEST: &str = "1ef7d06d76cfa91f98a4ced55bacca4066b5fc35c0f507fdd8437dadaad18eea";
+
+        let mut amount = [0u8; 32];
+        amount[16..].copy_from_slice(&1_000_000_000_000_000_000u128.to_be_bytes());
+        let mut deadline = [0u8; 32];
+        deadline[24..].copy_from_slice(&2_000_000_000u64.to_be_bytes());
+
+        let dom = permit2_domain_separator(1, &PERMIT2);
+        assert_eq!(hex::encode(dom), DOMAIN, "домен разошёлся с ЗАДЕПЛОЕННЫМ контрактом");
+
+        let details =
+            permit2_permit_details_struct_hash(&WETH, &amount, 2_000_000_000, 0).unwrap();
+        assert_eq!(hex::encode(details), HASH_DETAILS, "hashStruct(PermitDetails) разошёлся");
+
+        let single = permit2_permit_single_struct_hash(&details, &SPENDER, &deadline);
+        assert_eq!(hex::encode(single), HASH_SINGLE, "вложенная структура собрана неверно");
+
+        let digest = permit2_permit_single_digest(
+            1, &PERMIT2, &WETH, &amount, 2_000_000_000, 0, &SPENDER, &deadline,
+        )
+        .unwrap();
+        assert_eq!(hex::encode(digest), DIGEST, "дайджест разошёлся со сторонней реализацией");
+    }
+
+    /// Домен Permit2 обязан отличаться от четырёхполного. Если однажды кто-то «поправит»
+    /// его по образцу соседей, этот тест обязан покраснеть раньше, чем контракт ответит
+    /// `InvalidSigner`.
+    #[test]
+    fn permit2_domain_is_not_the_four_field_one() {
+        const PERMIT2: [u8; 20] = hex_20("000000000022d473030f116ddee9f6b43ac78ba3");
+        let three = permit2_domain_separator(1, &PERMIT2);
+        let four = x402_domain_separator("Permit2", "1", 1, &PERMIT2);
+        assert_ne!(three, four, "домен из трёх полей совпал с четырёхполным — так не бывает");
+    }
+
+    /// uint160 — это ширина, а не пожелание.
+    #[test]
+    fn permit2_refuses_an_amount_wider_than_uint160() {
+        const WETH: [u8; 20] = hex_20("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let mut too_wide = [0u8; 32];
+        too_wide[11] = 1;
+        assert!(permit2_permit_details_struct_hash(&WETH, &too_wide, 1, 1).is_err());
+        let mut widest_ok = [0u8; 32];
+        widest_ok[12..].fill(0xff);
+        assert!(permit2_permit_details_struct_hash(&WETH, &widest_ok, 1, 1).is_ok());
+    }
+
+    const fn hex_20(s: &str) -> [u8; 20] {
+        let b = s.as_bytes();
+        let mut out = [0u8; 20];
+        let mut i = 0;
+        while i < 20 {
+            out[i] = hex_nib(b[i * 2]) * 16 + hex_nib(b[i * 2 + 1]);
+            i += 1;
+        }
+        out
+    }
+
+    const fn hex_nib(c: u8) -> u8 {
+        if c >= b'a' { c - b'a' + 10 } else { c - b'0' }
+    }
 
     /// x402 / EIP-3009 golden vector. Reference signature produced INDEPENDENTLY
     /// by `cast wallet sign --data` (foundry) over the EIP-712 typed-data
