@@ -1731,6 +1731,14 @@ pub fn permit2_permit_details_struct_hash(
     if amount[..12].iter().any(|b| *b != 0) {
         return Err(anyhow::anyhow!("permit2: amount does not fit in uint160"));
     }
+    // Ширина `expiration` и `nonce` проверяется и здесь, хотя вызывающий это уже сделал:
+    // функция публичная и переживёт своего вызывающего. Значение шире uint48 не
+    // существует в подписываемом типе, и подписать его значит выдать подпись под тем,
+    // чего в структуре нет.
+    const UINT48_MAX: u64 = (1u64 << 48) - 1;
+    if expiration > UINT48_MAX || nonce > UINT48_MAX {
+        return Err(anyhow::anyhow!("permit2: expiration/nonce do not fit in uint48"));
+    }
     let type_hash = eip712_type_hash(
         "PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)",
     );

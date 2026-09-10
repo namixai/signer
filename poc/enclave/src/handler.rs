@@ -5128,13 +5128,17 @@ fn handle_sign_permit2_permit_single(
         return SignResponse::err(err_code::BAD_REQUEST);
     };
 
-    // Ширина типов проверяется ДО расшифровки ключа: `expiration` и `nonce` —
-    // uint48, и значение шире просто не существует в подписываемом типе.
-    // Дешёвая проверка перед дорогой операцией, как у x402 с пустым окном.
-    const UINT48_MAX: u64 = (1u64 << 48) - 1;
-    if p2.expiration > UINT48_MAX || p2.nonce > UINT48_MAX {
-        return SignResponse::err(err_code::BAD_REQUEST);
-    }
+    // 🔴 ВСЯ ФОРМА ЗАПРОСА — ОДНОЙ ФУНКЦИЕЙ И ДО РАСШИФРОВКИ КЛЮЧА.
+    // Так дешёвая проверка стоит перед дорогой (как у x402 с пустым окном), и — что
+    // важнее — она становится ПРОВЕРЯЕМОЙ отдельно. Пока ширина `amount` проверялась
+    // ниже по течению, тест на неё зеленел от `bad_request`, который приходил совсем из
+    // другого места (форма блоба тестового тенанта): зонд показал, что ЗАКОННЫЙ запрос
+    // на той же фикстуре даёт тот же код. Проверка, чей отказ неотличим от чужого, не
+    // проверена — она продемонстрирована.
+    let amount = match permit2_request_shape(p2) {
+        Ok(w) => w,
+        Err(_) => return SignResponse::err(err_code::BAD_REQUEST),
+    };
 
     let (policy, secret_json) = match load_and_parse_blob(&req, identity) {
         Ok(t) => t,
@@ -5161,10 +5165,6 @@ fn handle_sign_permit2_permit_single(
     };
     let spender = match crate::signer::parse_evm_address(&p2.spender) {
         Ok(a) => a,
-        Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
-    };
-    let amount = match crate::signer::parse_u256_be_decimal(&p2.amount) {
-        Ok(v) => v,
         Err(_) => return deny_under(&policy_hash, err_code::BAD_REQUEST),
     };
     let sig_deadline = match crate::signer::parse_u256_be_decimal(&p2.sig_deadline) {
@@ -5226,6 +5226,29 @@ fn handle_sign_permit2_permit_single(
 
 /// Пункт `permit2` — ОБЯЗАТЕЛЕН и fail-closed. «Нет пункта» и «нет поля» никогда
 /// не значат «нет предела» на примитиве, выдающем право вывода.
+/// Форма запроса Permit2: всё, что решается по САМОМУ ЗАПРОСУ, без ключа и без политики.
+///
+/// Возвращает 32-байтовое ABI-слово `amount`. Ошибка здесь — это ошибка ВВОДА клиента, и
+/// вызывающий обязан отдать `bad_request`: чужая опечатка не смеет выглядеть нашей
+/// поломкой. Раньше ширина `amount` ловилась в глубине подписи и приходила наружу как
+/// `INTERNAL_ERROR` — оператор шёл искать сломанный энклав вместо кривого запроса.
+///
+/// Ширины — не педантизм: `amount` объявлен uint160, `expiration` и `nonce` — uint48.
+/// Значение шире в подписываемом типе НЕ СУЩЕСТВУЕТ, и подписать его значит выдать
+/// подпись под тем, чего в структуре нет.
+fn permit2_request_shape(p2: &crate::proto::Permit2Request) -> Result<[u8; 32], ()> {
+    const UINT48_MAX: u64 = (1u64 << 48) - 1;
+    if p2.expiration > UINT48_MAX || p2.nonce > UINT48_MAX {
+        return Err(());
+    }
+    let amount = crate::signer::parse_u256_be_decimal(&p2.amount).map_err(|_| ())?;
+    if amount[..12].iter().any(|b| *b != 0) {
+        return Err(());          // шире uint160
+    }
+    crate::signer::parse_u256_be_decimal(&p2.sig_deadline).map_err(|_| ())?;
+    Ok(amount)
+}
+
 #[allow(clippy::result_large_err)]
 fn enforce_permit2_allowance(
     policy: Option<&Policy>,
@@ -5318,12 +5341,31 @@ fn permit2_allow_list(
         tracing::warn!(event = "permit2_policy_required", reason = "empty_allow_list", list = what);
         return Err(SignResponse::err(err_code::POLICY_REQUIRED));
     }
+    // 🔴 Неразбираемая запись в СПИСКЕ — это сломанная конфигурация, а не отказ клиенту.
+    // Раньше такая запись молча пропускалась, и если совпадений не находилось, клиент
+    // получал `POLICY_DENIED` — «твой токен не разрешён». А разрешён он был: опечатался
+    // оператор. Отказ обязан называть СВОЮ причину, иначе чинить пойдут не то.
+    // Тот же выбор, что уже сделан для `verifying_contract` и `max_amount`.
+    let mut found = false;
     for it in items {
-        if let Ok(a) = crate::signer::parse_evm_address(it) {
-            if a == *needle {
-                return Ok(());
+        match crate::signer::parse_evm_address(it) {
+            Ok(a) => {
+                if a == *needle {
+                    found = true;
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "permit2_policy_required",
+                    reason = "unparsable_entry_in_allow_list",
+                    list = what
+                );
+                return Err(SignResponse::err(err_code::POLICY_REQUIRED));
             }
         }
+    }
+    if found {
+        return Ok(());
     }
     tracing::warn!(event = "permit2_policy_denied", reason = "not_in_allow_list", list = what);
     Err(SignResponse::err(err_code::POLICY_DENIED))
@@ -12559,6 +12601,90 @@ mod tests {
                 "пустое/отсутствующее поле обязано читаться как «правил нет», а не «правила сказали нет»"
             );
         }
+    }
+
+    /// Слишком широкая сумма — ошибка ВВОДА клиента, а не наша поломка. Раньше отказ
+    /// поднимался из глубины подписи и приходил как `INTERNAL_ERROR`: чужая опечатка
+    /// выглядела как сломанный энклав, и чинить шли не то.
+    #[test]
+    fn permit2_too_wide_amount_is_bad_request_not_internal_error() {
+        // 🔴 Проверяется РЕШЕНИЕ, а не код на общей фикстуре. Первая редакция звала
+        // обработчик и ждала `bad_request` — а зонд показал, что тот же `bad_request`
+        // даёт и ЗАКОННЫЙ запрос: код приходил из формы блоба тестового тенанта.
+        // Проверка, чей отказ неотличим от чужого, ничего не проверяет.
+        let ok = crate::proto::Permit2Request {
+            chain_id: 1,
+            verifying_contract: P2_CONTRACT.to_owned(),
+            token: P2_TOKEN.to_owned(),
+            amount: "1000000000000000000".to_owned(),
+            expiration: 2_000_000_000,
+            nonce: 0,
+            spender: P2_SPENDER.to_owned(),
+            sig_deadline: "2000000000".to_owned(),
+        };
+        assert!(permit2_request_shape(&ok).is_ok(), "законный запрос обязан проходить");
+
+        // 2^160 — на единицу шире типа.
+        let mut wide = ok.clone();
+        wide.amount = "1461501637330902918203684832716283019655932542976".to_owned();
+        assert!(permit2_request_shape(&wide).is_err(), "amount шире uint160 не пойман");
+
+        // Самое широкое ДОПУСТИМОЕ — обязано проходить, иначе проверка режет живое.
+        let mut widest = ok.clone();
+        widest.amount = "1461501637330902918203684832716283019655932542975".to_owned();
+        assert!(permit2_request_shape(&widest).is_ok(), "проверка режет допустимое значение");
+
+        for mutate in [
+            (|r: &mut crate::proto::Permit2Request| r.expiration = 1u64 << 48) as fn(&mut _),
+            |r: &mut crate::proto::Permit2Request| r.nonce = 1u64 << 48,
+            |r: &mut crate::proto::Permit2Request| r.amount = "не число".to_owned(),
+            |r: &mut crate::proto::Permit2Request| r.sig_deadline = "".to_owned(),
+        ] {
+            let mut bad = ok.clone();
+            mutate(&mut bad);
+            assert!(permit2_request_shape(&bad).is_err());
+        }
+    }
+
+    /// Неразбираемая запись в СПИСКЕ политики — сломанная конфигурация, а не отказ
+    /// клиенту. `POLICY_DENIED` здесь сказал бы «твой токен не разрешён», хотя он
+    /// разрешён, а опечатался оператор.
+    #[test]
+    fn permit2_unparsable_allow_list_entry_is_required_not_denied() {
+        for (label, mutate) in [
+            ("токены", (|c: &mut crate::proto::Permit2Policy| {
+                c.allowed_tokens = Some(vec!["0xНЕ-АДРЕС".to_owned(), P2_TOKEN.to_owned()])
+            }) as fn(&mut _)),
+            ("spender", |c: &mut crate::proto::Permit2Policy| {
+                c.allowed_spenders = Some(vec!["мусор".to_owned(), P2_SPENDER.to_owned()])
+            }),
+        ] {
+            let mut pol = p2_policy();
+            mutate(pol.permit2.as_mut().unwrap());
+            assert_eq!(
+                p2_check(Some(&pol), 1, P2_TOKEN, P2_SPENDER, "1"),
+                Some(err_code::POLICY_REQUIRED.to_owned()),
+                "{label}: кривая запись в списке обязана читаться как «правила сломаны», \
+                 а не «правила сказали нет» — даже когда нужный адрес в списке ЕСТЬ"
+            );
+        }
+    }
+
+    /// uint48 проверяется и в самой функции подписи: она публичная и переживёт своего
+    /// вызывающего. Защита в глубину, а не дубль ради дубля.
+    #[test]
+    fn permit2_uint48_width_is_checked_in_depth_too() {
+        const TOO_WIDE: u64 = 1u64 << 48;
+        let mut amount = [0u8; 32];
+        amount[31] = 1;
+        let t = p2_addr(P2_TOKEN);
+        assert!(crate::signer::permit2_permit_details_struct_hash(&t, &amount, TOO_WIDE, 0).is_err());
+        assert!(crate::signer::permit2_permit_details_struct_hash(&t, &amount, 0, TOO_WIDE).is_err());
+        assert!(
+            crate::signer::permit2_permit_details_struct_hash(&t, &amount, TOO_WIDE - 1, TOO_WIDE - 1)
+                .is_ok(),
+            "самое широкое ДОПУСТИМОЕ значение обязано проходить, иначе проверка режет живое"
+        );
     }
 
     #[test]
