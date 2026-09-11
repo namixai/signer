@@ -1250,13 +1250,26 @@ pub async fn post_sign_x402(
     //    `take()` so the ZeroizeOnDrop response wipes its shell on drop; then
     //    MOVE the values out via `remove` (not clone) and zeroize any leftover
     //    header values we moved into this plain map (Gemini #75 HIGH).
+    // `resp.headers.take()` выносит карту из ZeroizeOnDrop-оболочки ответа, и
+    // дальше это обычные String, которые при дропе буфер не обнуляют.
+    //
+    // 🔴 `let-else` здесь ронял успешно извлечённую `signature`, когда `from`
+    // отсутствовал: платёжная авторизация оставалась в куче шлюза. Форма была
+    // СКОПИРОВАНА отсюда в маршрут Permit2, там её починили по ревью, а предок
+    // остался — живой боевой эндпоинт.
     let mut headers = resp.headers.take().unwrap_or_default();
-    let signature = headers.remove("signature");
-    let from = headers.remove("from");
+    let mut signature = headers.remove("signature");
+    let mut from = headers.remove("from");
     for v in headers.values_mut() {
         zeroize::Zeroize::zeroize(v);
     }
-    let (Some(signature), Some(from)) = (signature, from) else {
+    if signature.is_none() || from.is_none() {
+        if let Some(s) = signature.as_mut() {
+            zeroize::Zeroize::zeroize(s);
+        }
+        if let Some(f) = from.as_mut() {
+            zeroize::Zeroize::zeroize(f);
+        }
         warn!(event = "sign_x402_missing_signature", key_id = %key_for_log);
         return finish_log(
             error_response(err_code::INTERNAL_ERROR),
@@ -1264,7 +1277,9 @@ pub async fn post_sign_x402(
             false,
             Some(err_code::INTERNAL_ERROR),
         );
-    };
+    }
+    let signature = signature.expect("signature present after None-check");
+    let from = from.expect("from present after None-check");
 
     state.backoff.report_success(&scope);
     info!(event = "sign_x402_ok", key_id = %key_for_log, vsock_latency_ms);
@@ -1736,8 +1751,25 @@ pub(crate) fn build_binance_signed_qs(
     canonical: &str,
     headers: &mut std::collections::BTreeMap<String, String>,
 ) -> Result<String, &'static str> {
-    let signature = headers.remove("signature").ok_or("missing signature")?;
-    let timestamp = headers.remove("timestamp").ok_or("missing timestamp")?;
+    // 🔴 `?` на отсутствующем timestamp вернул бы Err, уронив уже извлечённую
+    // подпись Binance без обнуления. Вынимаем оба, затем решаем.
+    let mut signature = headers.remove("signature");
+    let mut timestamp = headers.remove("timestamp");
+    if signature.is_none() || timestamp.is_none() {
+        if let Some(s) = signature.as_mut() {
+            zeroize::Zeroize::zeroize(s);
+        }
+        if let Some(t) = timestamp.as_mut() {
+            zeroize::Zeroize::zeroize(t);
+        }
+        return Err(if signature.is_none() {
+            "missing signature"
+        } else {
+            "missing timestamp"
+        });
+    }
+    let signature = signature.expect("signature present after None-check");
+    let timestamp = timestamp.expect("timestamp present after None-check");
     let recv_window = headers
         .remove("recvWindow")
         .unwrap_or_else(|| "5000".to_owned());
@@ -3303,30 +3335,32 @@ async fn get_account_binance_inner(
         Err(resp) => return finish_log(resp, started, false, None),
     };
 
-    let signature = match headers.remove("signature") {
-        Some(s) => s,
-        None => {
+    // 🔴 Оба заголовка вынимаются ДО первой проверки: раздельные `match` роняли
+    // извлечённую подпись, если отсутствовал timestamp. Тот же класс, что в
+    // post_sign_x402.
+    let mut signature = headers.remove("signature");
+    let mut timestamp = headers.remove("timestamp");
+    if signature.is_none() || timestamp.is_none() {
+        if let Some(s) = signature.as_mut() {
+            zeroize::Zeroize::zeroize(s);
+        }
+        if let Some(t) = timestamp.as_mut() {
+            zeroize::Zeroize::zeroize(t);
+        }
+        if signature.is_none() {
             warn!(event = "account_missing_signature", venue = "binance");
-            return finish_log(
-                error_response(err_code::INTERNAL_ERROR),
-                started,
-                false,
-                Some(err_code::INTERNAL_ERROR),
-            );
-        }
-    };
-    let timestamp = match headers.remove("timestamp") {
-        Some(t) => t,
-        None => {
+        } else {
             warn!(event = "account_missing_timestamp", venue = "binance");
-            return finish_log(
-                error_response(err_code::INTERNAL_ERROR),
-                started,
-                false,
-                Some(err_code::INTERNAL_ERROR),
-            );
         }
-    };
+        return finish_log(
+            error_response(err_code::INTERNAL_ERROR),
+            started,
+            false,
+            Some(err_code::INTERNAL_ERROR),
+        );
+    }
+    let signature = signature.expect("signature present after None-check");
+    let timestamp = timestamp.expect("timestamp present after None-check");
     let recv_window = headers
         .remove("recvWindow")
         .unwrap_or_else(|| "5000".to_owned());
@@ -4085,6 +4119,51 @@ fn finish_log(
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 Извлечённый секрет не должен уходить в дроп ни на одном пути ошибки.
+    ///
+    /// `resp.headers.take()` выносит карту из ZeroizeOnDrop-оболочки, и дальше
+    /// значения — обычные `String`: при дропе буфер не обнуляется. Если из пары
+    /// заголовков извлёкся один, а второго нет, ранний возврат уничтожает
+    /// извлечённый молча, и подпись остаётся в куче шлюза.
+    ///
+    /// Форма жила в `post_sign_x402` и была СКОПИРОВАНА оттуда в новый маршрут
+    /// Permit2. Потомка починили по ревью, предок остался — живой боевой
+    /// эндпоинт, выдающий платёжную авторизацию. Та же дыра нашлась ещё в двух
+    /// местах Binance: `?` в `build_binance_signed_qs` и раздельные `match` в
+    /// `get_account` роняли подпись при отсутствующем `timestamp`.
+    ///
+    /// Проверка структурная: обнуление памяти из теста не наблюдаемо, а вернуть
+    /// ранний возврат можно одной строкой.
+    #[test]
+    fn every_extracted_signature_is_wiped_on_the_error_path() {
+        let src = include_str!("handlers.rs");
+
+        // Литералы собираются из кусков: `include_str!` втягивает и ЭТОТ файл,
+        // поэтому написанный целиком образец нашёл бы сам себя и тест падал бы
+        // на собственном тексте. Тот же приём, что у `route_paths` в main.rs.
+        let let_else = concat!("let (Some(", "signature)");
+        let extract = concat!("headers.remove(", "\"signature\")");
+        let wipe = concat!("if let Some(s) = ", "signature.as_mut()");
+
+        assert!(
+            !src.contains(let_else),
+            "подпись снова разбирается через let-else: при отсутствии парного \
+             заголовка извлечённая подпись уйдёт в дроп без зачистки"
+        );
+
+        // Каждое место, где подпись вынимается из карты, обязано иметь рядом
+        // ветку, которая затирает её перед ранним возвратом.
+        // Вычитаем по единице: собственные объявления образцов выше тоже
+        // попадают в текст файла.
+        let extracted = src.matches(extract).count() - 1;
+        let wiped = src.matches(wipe).count() - 1;
+        assert_eq!(
+            extracted, wiped,
+            "подпись вынимают в {extracted} местах, а затирают на пути ошибки в \
+             {wiped} — значит где-то извлечённая подпись уходит в дроп молча"
+        );
+    }
 
     // ── Permit2 route ────────────────────────────────────────────────────────
     //
