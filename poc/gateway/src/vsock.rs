@@ -127,6 +127,13 @@ pub struct VsockRequest {
     #[zeroize(skip)]
     pub x402: Option<serde_json::Value>,
 
+    /// Permit2 `PermitSingle` params (opaque pass-through; the enclave
+    /// deserializes into its typed `Permit2Request`). Public allowance fields
+    /// only — no key material — so `zeroize` is skipped, same as `x402`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub permit2: Option<serde_json::Value>,
+
     /// Structured order params (opaque pass-through; enclave deserializes into
     /// its typed `OrderRequest`). Public order shape — no key material.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +421,7 @@ mod tests {
             nonce: None,
             vault_address: None,
             x402: None,
+            permit2: None,
             order: None,
             cancel: None,
             data: None,
@@ -492,6 +500,12 @@ mod tests {
             nonce: Option<u64>,
             #[serde(default)]
             vault_address: Option<String>,
+            /// Mirrors the enclave's `SignRequest.permit2`. Present here so the
+            /// drift test actually exercises it: the enclave deserializes with
+            /// `deny_unknown_fields`, so a rename on either side must fail HERE
+            /// rather than in production as an opaque rejection.
+            #[serde(default)]
+            permit2: Option<serde_json::Value>,
         }
 
         let req = VsockRequest {
@@ -516,6 +530,16 @@ mod tests {
             nonce: Some(42),
             vault_address: Some("0xdead".to_owned()),
             x402: None,
+            permit2: Some(serde_json::json!({
+                "chain_id": 1,
+                "verifying_contract": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+                "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                "amount": "1000000",
+                "expiration": 1789000000u64,
+                "nonce": 0,
+                "spender": "0x1111111111111111111111111111111111111111",
+                "sig_deadline": "1789000000"
+            })),
             order: None,
             cancel: None,
             data: None,
@@ -548,6 +572,13 @@ mod tests {
         // enclave allow-lists + HMACs the exact client payload.
         assert_eq!(enc.op.as_deref(), Some("account"));
         assert_eq!(enc.payload.as_deref(), Some("timestamp=1716000000000"));
+        // The allowance params must survive the round-trip under the SAME wire
+        // name the enclave expects. A rename on either side turns into an opaque
+        // enclave rejection in production; here it is a failing test.
+        let p2 = enc.permit2.as_ref().expect("permit2 must survive the round-trip");
+        assert_eq!(p2["verifying_contract"], "0x000000000022D473030F116dDEE9F6B43aC78BA3");
+        assert_eq!(p2["amount"], "1000000");
+        assert_eq!(p2["spender"], "0x1111111111111111111111111111111111111111");
     }
 
     /// Manual `Debug` impl on `AwsCredentials` keeps secret + token redacted.
