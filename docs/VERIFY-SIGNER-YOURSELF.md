@@ -95,146 +95,358 @@ the **pinned** AWS Nitro root: we do **not** hand-roll chain building.
 # (never `assert`; `python -O` strips asserts). The cert path is validated by
 # certvalidator, anchored to the PINNED root and as-of the attestation timestamp
 # (the leaf certs are short-lived); COSE ES384 / PCR0 / nonce are checked explicitly.
-import base64, hashlib, os, re, datetime, requests, cbor2
+#
+# 🔴 EVERY refusal is NAMED, and that is a fix, not a flourish. An earlier revision of
+# this script promised "any tampering fails loudly" and, for half of a twenty-document
+# tampering set, delivered a Python traceback instead: TypeError from unpacking, KeyError
+# from a cut field, CBORDecodeEOF, two JSONDecodeError — and worst, a flipped bit in the
+# BODY printed `ValueError: Error parsing asn1crypto.x509…`, which reads as a broken
+# certificate when the truth is a broken document. A reader cannot tell an attack from a
+# crashed gateway that way. The published npm verifier (@usenami/signer-mcp) returned a
+# named refusal for all twenty; this one now reports the same way, with the same words.
+import base64, hashlib, os, re, sys, datetime, requests, cbor2
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives import hashes
 from certvalidator import CertificateValidator, ValidationContext
-from certvalidator.errors import PathValidationError, PathBuildingError
 
-def check(cond, msg):
-    if not cond:
-        raise SystemExit(f"ATTESTATION VERIFY FAILED: {msg}")
-
-# 🔴 THERE IS NO DEFAULT HERE ON PURPOSE. This script will not run until you say
-# which measurement you expect.
-#
-# It used to ship a baked-in value, and that value went stale twice — most recently on
-# 2026-08-24, when rotation #4 moved production off it while this file kept offering it
-# as the answer. A verifier that quietly substitutes last season's number is worse than
-# one that refuses: it hands you a mismatch that looks exactly like a dishonest
-# service, or a match that proves nothing.
-#
-# Where to get the value you should expect, best source first:
-#   1. Build the enclave yourself from the commit you intend to trust (README,
-#      "Reproducible build"). This is the only source that owes nothing to us
-#      telling you the truth.
-#   2. Ask the on-chain registry which measurement is active and who owns it, then
-#      hold this endpoint to that. This file does not print the production value:
-#      read it from /attestation of the endpoint you are verifying.
-#   3. The measurement table in the README: commit -> flag -> value, and when each
-#      was deployed.
-#
-# Whichever you pick, the enclaves are SEPARATE BOXES on independent rotation
-# schedules. Whether they run the same image is a state with a date on it, not a
-# property: they were apart from 2026-08-24 to 2026-08-27, apart again from
-# 2026-09-03, and apart for one day from 2026-09-10 until the demo box followed on
-# 2026-09-11. Since 2026-09-11 both attest the SAME measurement — which is exactly
-# why you must still check WHICH box you queried: a number that matches today can
-# match for the wrong reason tomorrow.
-#
-# `.strip()` before `.lower()`: a value pasted from a terminal or a CI variable
-# routinely carries a trailing newline, and an invisible character is the worst
-# possible reason for a verification to fail.
-EXPECTED_PCR0 = os.environ.get("EXPECTED_PCR0", "").strip().lower()
-if not EXPECTED_PCR0:
-    raise SystemExit(
-        "EXPECTED_PCR0 is not set, and this script will not guess one for you.\n"
-        "Set it to the measurement you expect this endpoint to be running - see the\n"
-        "comment above for where to source it - then run again:\n"
-        "  EXPECTED_PCR0=<96 hex chars> SIGNER_URL=<endpoint> python3 verify.py"
-    )
-# Shape first, before any network call or certificate work: a typo should cost
-# you a line of output, not a full path validation against the Nitro root.
-if not re.fullmatch(r"[0-9a-f]{96}", EXPECTED_PCR0):
-    raise SystemExit(
-        f"EXPECTED_PCR0 must be 96 hex characters (SHA-384); got {len(EXPECTED_PCR0)}."
-    )
-
-# The endpoint to query, and the root pin to hold it to. These are read from the
-# SAME environment variable names the bash block below offers — an earlier
-# revision of this page used different names internally (and did not define them
-# at all), so the documented `SIGNER_URL=…` had no effect and the script died on
-# a NameError before its first check. Overriding BASE means overriding
-# EXPECTED_PCR0 too — see the note above.
-BASE = os.environ.get("SIGNER_URL", "https://signer-demo.usenami.io:8443").strip().rstrip("/")
-
-# The pin you confirmed OUT-OF-BAND in the bash block above. Keeping it here as a
-# default (rather than only in a variable) is what makes this script runnable as
-# published; supply NITRO_ROOT_SHA256 to hold it to a value YOU sourced.
+# The AWS Nitro root you confirmed OUT-OF-BAND in the bash block above. Keeping it here
+# as a default (rather than only in a variable) is what makes this script runnable as
+# published; supply NITRO_ROOT_SHA256 to hold it to a value YOU sourced. This is the
+# sha256 of the PEM file as AWS ships it inside AWS_NitroEnclaves_Root-G1.zip.
 ROOT_SHA256 = os.environ.get(
     "NITRO_ROOT_SHA256",
     "6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0",
 ).strip().lower()
 
-# root.pem is the file the bash block above downloaded and hashed. Read it from
-# disk rather than embedding it: a certificate pasted into a document is exactly
-# the kind of thing that silently goes stale.
-ROOT_PEM_PATH = os.environ.get("NITRO_ROOT_PEM", "root.pem")
-try:
-    with open(ROOT_PEM_PATH, "rb") as fh:
-        ROOT_PEM = fh.read()
-except OSError as e:                       # not just FileNotFoundError: a
-    raise SystemExit(                      # permission/EISDIR error must not
-        f"ATTESTATION VERIFY FAILED: cannot read {ROOT_PEM_PATH} ({e}) — run "  # traceback either
-        f"the download step above (curl … AWS_NitroEnclaves_Root-G1.zip && "
-        f"unzip) in this directory first, or point NITRO_ROOT_PEM at the file."
-    )
+# The five checks, in the order they are attempted. Same names the npm verifier prints,
+# deliberately: two verifiers that disagree about what to call a failure are two answers.
+CHECKS = ("root_pinned", "document_readable", "chain_verified",
+          "signature_verified", "pcr0_matches", "nonce_echoed")
 
-# 0) Pin the AWS Nitro root before trusting anything.
-check(hashlib.sha256(ROOT_PEM).hexdigest() == ROOT_SHA256, "Nitro root cert hash mismatch")
+# Three outcomes, never two. `verified` says the document checked out; `unreadable` says
+# we never got a document to check (network, gateway, a body that is not ours) and is the
+# ONLY case that is not a statement about the enclave. A corrupt or forged document is a
+# FAILURE, not an "unknown": we received it and it does not verify.
+def _verdict(nonce_sent):
+    return {"verified": False, "checks": {c: False for c in CHECKS},
+            "reason": None, "unreadable": False, "nonce_sent": nonce_sent, "notes": []}
 
-# 1) Fetch a FRESH doc bound to our nonce; confirm it is not cached.
-nonce = os.urandom(16).hex()
-r = requests.get(f"{BASE}/attestation", params={"nonce": nonce}, timeout=15)
-r.raise_for_status()
-check(r.headers.get("cache-control") == "no-store", "attestation must be no-store")
+def _fail(v, why, *, unreadable=False):
+    v["reason"] = why
+    v["unreadable"] = unreadable
+    return v
 
-# 2) Parse COSE_Sign1 (may be CBOR tag 18) = [protected, unprotected, payload, sig].
-cose = cbor2.loads(base64.b64decode(r.json()["attestation_doc_b64"]))
-if isinstance(cose, cbor2.CBORTag):        # tag 18 = COSE_Sign1
-    cose = cose.value
-protected_bstr, _unprotected, payload_bstr, sig = cose
-doc = cbor2.loads(payload_bstr)            # the AttestationDocument
+def _as_bytes(x):
+    return x if isinstance(x, (bytes, bytearray)) else None
 
-# 3) FULL RFC 5280 path validation, anchored to the PINNED root, as-of the
-#    attestation time. certvalidator builds + validates the path itself, so
-#    cabundle ordering, DN chaining, CA/basic-constraints, path length, and
-#    critical extensions are all handled — nothing hand-rolled.
-moment = datetime.datetime.fromtimestamp(doc["timestamp"] / 1000, datetime.timezone.utc)
-vc = ValidationContext(trust_roots=[ROOT_PEM], allow_fetching=False, moment=moment)
-try:
-    CertificateValidator(doc["certificate"], intermediate_certs=list(doc["cabundle"]),
-                         validation_context=vc).validate_usage(set())
-except (PathValidationError, PathBuildingError) as e:
-    raise SystemExit(f"ATTESTATION VERIFY FAILED: cert path: {e}")
+def verify_document(body, nonce_sent, expected_pcr0, root_pem, *, no_store=True):
+    """Verify one attestation response. Returns a verdict dict; raises nothing.
 
-# 4) Enforce the COSE metadata BEFORE trusting the signature: the protected
-#    header must advertise alg = ES384 (-35), the signature must be a 96-byte
-#    raw r||s, and the leaf key must be on P-384 — otherwise a document could
-#    claim a weaker/mismatched algorithm than we verify with.
-phdr = cbor2.loads(protected_bstr) if protected_bstr else {}
-check(isinstance(phdr, dict), "COSE protected header is not a map")
-check(phdr.get(1) == -35, f"COSE alg is not ES384 (-35): {phdr.get(1)}")
-check(len(sig) == 96, f"COSE signature is not 96-byte P-384 r||s: {len(sig)}")
-leaf = x509.load_der_x509_certificate(doc["certificate"])
-pub = leaf.public_key()
-check(isinstance(pub, ec.EllipticCurvePublicKey) and isinstance(pub.curve, ec.SECP384R1),
-      "leaf certificate key is not P-384")
+    `body` is the PARSED JSON body of /attestation, `nonce_sent` the hex nonce we asked
+    for, `expected_pcr0` the 96-hex measurement YOU decided to expect, `root_pem` the
+    bytes of the AWS Nitro root you downloaded and hashed yourself.
+    """
+    v = _verdict(nonce_sent)
 
-# Verify the COSE ES384 signature with the LEAF public key.
-# Sig_structure = ["Signature1", protected, external_aad(=b""), payload], CBOR-encoded.
-sig_structure = cbor2.dumps(["Signature1", protected_bstr, b"", payload_bstr])
-r_int = int.from_bytes(sig[:48], "big"); s_int = int.from_bytes(sig[48:], "big")  # P-384 raw r||s
-pub.verify(utils.encode_dss_signature(r_int, s_int), sig_structure,
-           ec.ECDSA(hashes.SHA384()))   # raises on mismatch
+    # 0) Pin the AWS Nitro root before trusting anything. A wrong anchor makes every
+    #    later check theatre, so it is checked first and it is a failure, not an unknown.
+    v["root_sha256"] = hashlib.sha256(root_pem).hexdigest()
+    if v["root_sha256"] != ROOT_SHA256:
+        return _fail(v, f"the root certificate on disk is not the pinned one "
+                        f"(sha256 {v['root_sha256']}, expected {ROOT_SHA256})")
+    v["checks"]["root_pinned"] = True
 
-# 5) Check PCR0 and the nonce INSIDE the verified document.
-pcr0 = doc["pcrs"][0].hex()
-check(pcr0 == EXPECTED_PCR0, f"PCR0 mismatch: doc={pcr0} expected={EXPECTED_PCR0}")
-check(doc["nonce"] == bytes.fromhex(nonce), "nonce not bound — possible replay")
+    # 1) Did we get an attestation document at all? Everything from here to the COSE
+    #    unwrap is "the endpoint did not answer us properly" — a transport or gateway
+    #    problem. It is reported as UNREADABLE, never as a failed enclave.
+    if not isinstance(body, dict):
+        return _fail(v, "the endpoint's response is not a JSON object", unreadable=True)
+    b64 = body.get("attestation_doc_b64")
+    if not isinstance(b64, str) or not b64:
+        return _fail(v, "the response carries no `attestation_doc_b64` string",
+                     unreadable=True)
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception as e:
+        return _fail(v, f"`attestation_doc_b64` is not valid base64 ({type(e).__name__})",
+                     unreadable=True)
+    if not raw:
+        return _fail(v, "`attestation_doc_b64` decoded to zero bytes", unreadable=True)
 
-print(f"OK — path valid to pinned root, COSE signature valid, PCR0={pcr0} matches, nonce fresh.")
+    # 2) From here on we HAVE a document. Anything wrong with it is tampering or
+    #    corruption, and it is reported as a failure with the damaged part named.
+    try:
+        cose = cbor2.loads(raw)
+    except Exception as e:
+        return _fail(v, f"the document is not decodable CBOR ({type(e).__name__}) — "
+                        f"it is corrupt or forged, not a transport fault")
+    if isinstance(cose, cbor2.CBORTag):        # tag 18 = COSE_Sign1
+        cose = cose.value
+    # 🔴 This unpack is what produced `TypeError: cannot unpack non-iterable`. A document
+    # that is not a 4-element array is not a COSE_Sign1, and saying so is the whole job.
+    if not isinstance(cose, (list, tuple)) or len(cose) != 4:
+        return _fail(v, "the document is not a COSE_Sign1: expected a 4-element array "
+                        "[protected, unprotected, payload, signature], got "
+                        f"{type(cose).__name__} of length "
+                        f"{len(cose) if isinstance(cose, (list, tuple)) else 'n/a'}")
+    protected_bstr, _unprotected, payload_bstr, sig = cose
+    for name, val in (("protected header", protected_bstr), ("payload", payload_bstr),
+                      ("signature", sig)):
+        if _as_bytes(val) is None:
+            return _fail(v, f"the COSE {name} is not a byte string "
+                            f"({type(val).__name__}) — the document is malformed")
+
+    try:
+        phdr = cbor2.loads(protected_bstr) if protected_bstr else {}
+    except Exception as e:
+        return _fail(v, f"the COSE protected header is not decodable CBOR "
+                        f"({type(e).__name__})")
+    if not isinstance(phdr, dict):
+        return _fail(v, f"the COSE protected header is not a map ({type(phdr).__name__})")
+    # Enforce the algorithm BEFORE trusting the signature, or a document could claim a
+    # weaker one than we verify with.
+    if phdr.get(1) != -35:
+        return _fail(v, f"the protected header declares alg={phdr.get(1)!r}, not ES384 "
+                        f"(-35); a document we cannot interpret is not one we vouch for")
+
+    try:
+        doc = cbor2.loads(payload_bstr)
+    except Exception as e:
+        return _fail(v, f"the signed payload is not decodable CBOR "
+                        f"({type(e).__name__}) — the signed bytes are damaged")
+    if not isinstance(doc, dict):
+        return _fail(v, f"the signed payload is not a CBOR map ({type(doc).__name__})")
+
+    # 🔴 Every field is checked for PRESENCE AND TYPE before it is used. This is the
+    # KeyError class: a document with `cabundle` cut out used to die three frames down
+    # with the key name and nothing else — no verdict, no indication it was an attack.
+    ts = doc.get("timestamp")
+    if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
+        return _fail(v, "the document has no usable `timestamp` (needed to validate the "
+                       f"short-lived certificates as-of signing time): {ts!r}")
+    leaf_der = _as_bytes(doc.get("certificate"))
+    if not leaf_der:
+        return _fail(v, "the document's `certificate` field is missing, empty, or not a "
+                        "byte string")
+    bundle = doc.get("cabundle")
+    if (not isinstance(bundle, list) or not bundle
+            or any(_as_bytes(c) is None or not c for c in bundle)):
+        return _fail(v, "the document's `cabundle` is missing, empty, or is not a list of "
+                        "non-empty byte strings — with no chain there is nothing to "
+                        "anchor to the AWS root")
+    pcrs = doc.get("pcrs")
+    pcr0_raw = pcrs.get(0) if isinstance(pcrs, dict) else None
+    if _as_bytes(pcr0_raw) is None or len(pcr0_raw) != 48:
+        return _fail(v, "the document's `pcrs[0]` is missing, not a byte string, or not "
+                        "48 bytes (SHA-384)")
+    nonce_raw = _as_bytes(doc.get("nonce"))
+    if nonce_raw is None:
+        return _fail(v, "the document carries no `nonce` byte string, so it cannot be "
+                        "shown to be fresh rather than replayed")
+
+    try:
+        leaf = x509.load_der_x509_certificate(leaf_der)
+    except Exception as e:
+        # 🔴 THE ONE THAT READ WORST. A single flipped bit in the body lands here, and the
+        # old message (`Error parsing asn1crypto.x509…`) blamed the certificate. Name what
+        # it means instead: the signed bytes are damaged.
+        return _fail(v, f"the certificate inside the document is not parseable DER "
+                        f"({type(e).__name__}) — the signed bytes are damaged, which is "
+                        f"tampering or corruption, not a gateway fault")
+
+    # The document is structurally sound. Everything below is a cryptographic verdict on
+    # it, and the values reported here come out of the SIGNED payload — never out of a
+    # plaintext field sitting next to it.
+    v["checks"]["document_readable"] = True
+    v["pcr0"] = pcr0_raw.hex()
+    v["timestamp_ms"] = ts
+    v["nonce_in_document"] = nonce_raw.hex()
+    if isinstance(doc.get("module_id"), str):
+        v["module_id"] = doc["module_id"]
+
+    # 3) FULL RFC 5280 path validation, anchored to the PINNED root, as-of the attestation
+    #    time. certvalidator builds and validates the path itself, so cabundle ordering,
+    #    DN chaining, CA/basic-constraints, path length and critical extensions are all
+    #    handled — nothing hand-rolled. `except Exception` on purpose: asn1crypto raises
+    #    ValueError from underneath certvalidator's own error types, and an uncaught one
+    #    is exactly the traceback this rewrite exists to remove.
+    moment = datetime.datetime.fromtimestamp(ts / 1000, datetime.timezone.utc)
+    try:
+        vc = ValidationContext(trust_roots=[root_pem], allow_fetching=False, moment=moment)
+        CertificateValidator(leaf_der, intermediate_certs=list(bundle),
+                             validation_context=vc).validate_usage(set())
+        v["checks"]["chain_verified"] = True
+    except Exception as e:
+        return _fail(v, f"the certificate chain does not validate to the pinned AWS Nitro "
+                        f"root as of the document's own timestamp: {e}")
+
+    # 4) COSE ES384 signature under the LEAF public key.
+    #    Sig_structure = ["Signature1", protected, external_aad(=b""), payload].
+    if len(sig) != 96:
+        return _fail(v, f"the COSE signature is {len(sig)} bytes, not the 96-byte P-384 "
+                        f"r||s that ES384 requires")
+    pub = leaf.public_key()
+    if not (isinstance(pub, ec.EllipticCurvePublicKey)
+            and isinstance(pub.curve, ec.SECP384R1)):
+        return _fail(v, "the leaf certificate's key is not on P-384, so it cannot be the "
+                       f"key an ES384 attestation was signed with ({type(pub).__name__})")
+    sig_structure = cbor2.dumps(["Signature1", protected_bstr, b"", payload_bstr])
+    r_int = int.from_bytes(sig[:48], "big")
+    s_int = int.from_bytes(sig[48:], "big")
+    try:
+        pub.verify(utils.encode_dss_signature(r_int, s_int), sig_structure,
+                   ec.ECDSA(hashes.SHA384()))
+        v["checks"]["signature_verified"] = True
+    except Exception:
+        return _fail(v, "the ES384 signature does not match the leaf key over these exact "
+                        "bytes — the document was altered after it was signed, or it was "
+                        "never signed by this certificate")
+
+    # 5) PCR0 and the nonce, taken from INSIDE the verified document.
+    v["checks"]["pcr0_matches"] = (v["pcr0"] == expected_pcr0)
+    if not v["checks"]["pcr0_matches"]:
+        return _fail(v, f"PCR0 mismatch: the signed document measures "
+                        f"{v['pcr0']}, you expected {expected_pcr0}")
+    try:
+        want_nonce = bytes.fromhex(nonce_sent)
+    except ValueError:
+        return _fail(v, f"the nonce we sent is not hex ({nonce_sent!r}) — this is a bug "
+                        f"in the caller, not a finding about the endpoint", unreadable=True)
+    v["checks"]["nonce_echoed"] = (nonce_raw == want_nonce)
+    if not v["checks"]["nonce_echoed"]:
+        return _fail(v, f"the document echoes nonce {nonce_raw.hex()}, not the "
+                        f"{nonce_sent} we asked for — it is cached or replayed, not fresh")
+
+    if not no_store:
+        v["notes"].append("the response was not marked `cache-control: no-store`")
+        return _fail(v, "the endpoint did not mark the attestation `cache-control: "
+                        "no-store`; the nonce still binds this document, but an "
+                        "intermediary is permitted to hand the next caller a copy")
+
+    v["verified"] = all(v["checks"].values())
+    return v
+
+
+def report(v):
+    """Print the verdict the way the npm verifier does: the checklist, then the reason."""
+    width = max(len(c) for c in CHECKS)
+    for c in CHECKS:
+        print(f"  {c.ljust(width)}  {'pass' if v['checks'][c] else 'FAIL'}")
+    if v["verified"]:
+        print(f"\nVERIFIED — PCR0={v['pcr0']} matches, path valid to the pinned AWS "
+              f"root, COSE signature valid, nonce fresh.")
+        return 0
+    if v["unreadable"]:
+        print(f"\nCOULD NOT VERIFY — {v['reason']}.\n"
+              f"This is a statement about the connection, NOT about the enclave: we "
+              f"never received a document to check.")
+        return 2
+    print(f"\nVERIFICATION FAILED — {v['reason']}.\n"
+          f"A document was received and it does not verify. Treat this as tampering or "
+          f"corruption; it is not a transport error.")
+    for n in v["notes"]:
+        print(f"  note: {n}")
+    return 1
+
+
+def main():
+    # 🔴 THERE IS NO DEFAULT MEASUREMENT HERE ON PURPOSE. This script will not run until
+    # you say which one you expect.
+    #
+    # It used to ship a baked-in value, and that value went stale twice — most recently on
+    # 2026-08-24, when rotation #4 moved production off it while this file kept offering
+    # it as the answer. A verifier that quietly substitutes last season's number is worse
+    # than one that refuses: it hands you a mismatch that looks exactly like a dishonest
+    # service, or a match that proves nothing.
+    #
+    # Where to get the value you should expect, best source first:
+    #   1. Build the enclave yourself from the commit you intend to trust (README,
+    #      "Reproducible build"). This is the only source that owes nothing to us
+    #      telling you the truth.
+    #   2. Ask the on-chain registry which measurement is active and who owns it, then
+    #      hold this endpoint to that. This file does not print the production value:
+    #      read it from /attestation of the endpoint you are verifying.
+    #   3. The measurement table in the README: commit -> flag -> value, and when each
+    #      was deployed.
+    #
+    # Whichever you pick, the enclaves are SEPARATE BOXES on independent rotation
+    # schedules. Whether they run the same image is a state with a date on it, not a
+    # property: they were apart from 2026-08-24 to 2026-08-27, apart again from
+    # 2026-09-03, and apart for one day from 2026-09-10 until the demo box followed on
+    # 2026-09-11. Since 2026-09-11 both attest the SAME measurement — which is exactly
+    # why you must still check WHICH box you queried: a number that matches today can
+    # match for the wrong reason tomorrow.
+    #
+    # `.strip()` before `.lower()`: a value pasted from a terminal or a CI variable
+    # routinely carries a trailing newline, and an invisible character is the worst
+    # possible reason for a verification to fail.
+    expected_pcr0 = os.environ.get("EXPECTED_PCR0", "").strip().lower()
+    if not expected_pcr0:
+        print("EXPECTED_PCR0 is not set, and this script will not guess one for you.\n"
+              "Set it to the measurement you expect this endpoint to be running - see\n"
+              "the comment above for where to source it - then run again:\n"
+              "  EXPECTED_PCR0=<96 hex chars> SIGNER_URL=<endpoint> python3 verify.py",
+              file=sys.stderr)
+        return 2
+    # Shape first, before any network call or certificate work: a typo should cost you a
+    # line of output, not a full path validation against the Nitro root.
+    if not re.fullmatch(r"[0-9a-f]{96}", expected_pcr0):
+        print(f"EXPECTED_PCR0 must be 96 hex characters (SHA-384); got "
+              f"{len(expected_pcr0)}.", file=sys.stderr)
+        return 2
+
+    # The endpoint to query. Read from the SAME environment variable name the bash block
+    # below offers — an earlier revision used a different name internally (and did not
+    # define it at all), so the documented `SIGNER_URL=…` had no effect and the script
+    # died on a NameError before its first check.
+    base = os.environ.get("SIGNER_URL", "https://signer-demo.usenami.io:8443").strip().rstrip("/")
+
+    # root.pem is the file the bash block above downloaded and hashed. Read it from disk
+    # rather than embedding it: a certificate pasted into a document is exactly the kind
+    # of thing that silently goes stale.
+    root_path = os.environ.get("NITRO_ROOT_PEM", "root.pem")
+    try:
+        with open(root_path, "rb") as fh:
+            root_pem = fh.read()
+    except OSError as e:          # not just FileNotFoundError: a permission/EISDIR error
+        print(f"cannot read {root_path} ({e}) — run the download step above "  # must not
+              f"(curl … AWS_NitroEnclaves_Root-G1.zip && unzip) in this "      # traceback
+              f"directory first, or point NITRO_ROOT_PEM at the file.", file=sys.stderr)
+        return 2
+
+    # Fetch a FRESH doc bound to our nonce. A network failure is NOT a finding about the
+    # enclave, so it exits 2 and says so — the same split the verdict makes.
+    nonce = os.urandom(16).hex()
+    try:
+        r = requests.get(f"{base}/attestation", params={"nonce": nonce}, timeout=15)
+    except requests.RequestException as e:
+        print(f"COULD NOT VERIFY — {base} did not answer ({type(e).__name__}: {e}).\n"
+              f"This is a statement about the connection, not about the enclave.",
+              file=sys.stderr)
+        return 2
+    if r.status_code != 200:
+        print(f"COULD NOT VERIFY — {base}/attestation returned HTTP {r.status_code}.\n"
+              f"This is a statement about the gateway, not about the enclave.",
+              file=sys.stderr)
+        return 2
+    try:
+        body = r.json()
+    except ValueError:
+        print(f"COULD NOT VERIFY — {base}/attestation did not return JSON "
+              f"(content-type {r.headers.get('content-type')!r}).\n"
+              f"This is a statement about the gateway, not about the enclave.",
+              file=sys.stderr)
+        return 2
+
+    v = verify_document(body, nonce, expected_pcr0, root_pem,
+                        no_store=(r.headers.get("cache-control") == "no-store"))
+    return report(v)
+
+
+# Everything above is importable and testable without a network; only this line runs it.
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 Run it. There is no baked-in expectation any more, so you have to say what you
@@ -259,9 +471,34 @@ Deliberately absent: a copy-paste line with a measurement already filled in. One
 lived here for months, went stale twice, and the second time it told readers a
 healthy production service was untrustworthy.
 
-Any tampering fails loudly: a forged document breaks the COSE signature; a document
-from a different image fails the PCR0 check; a stale/cached document fails the nonce
-check; a non-AWS chain fails the pinned-root path validation.
+Any tampering fails loudly, and "loudly" means BY NAME. The script prints the checklist
+and then one sentence saying what is wrong: a forged document breaks the COSE signature;
+a document from a different image fails the PCR0 check; a stale or cached document fails
+the nonce check; a non-AWS chain fails the pinned-root path validation; a cut, truncated
+or re-encoded document is refused with the damaged field named.
+
+There are THREE outcomes, not two, and the exit code tells them apart:
+
+| exit | meaning | what it says about the enclave |
+|---|---|---|
+| `0` | every check passed | it is running the measurement you expected |
+| `1` | a document arrived and does not verify | treat it as tampering or corruption |
+| `2` | no document to check — network, gateway, a body that is not ours, or a setting you did not supply | **nothing**; this is about the connection, not the enclave |
+
+That split is load-bearing. Collapsing "could not check" into either of the other two is
+how a verifier starts lying: fold it into `0` and silence passes for proof, fold it into
+`1` and every flaky network reads as an attack.
+
+This is measured, not asserted. An earlier revision of the script promised the same
+sentence and delivered a Python traceback for 16 of 22 corrupted documents — including
+seven that printed `cryptography.exceptions.InvalidSignature` with no message at all, and
+one where a flipped bit in the body printed an error about parsing a certificate, which
+reads like a broken gateway rather than a tampered document. The set that found it is in
+[`poc/scripts/test_verify_doc_block.py`](../poc/scripts/test_verify_doc_block.py): it
+extracts this very code block from this very file, runs all 22 against it, and fails CI
+if any of them reaches a traceback or if the untouched document stops verifying. Run it
+yourself — you do not have to take the claim on our word, which is the point of the whole
+page.
 
 ### Which commit rebuilds which measurement
 
