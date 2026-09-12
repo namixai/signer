@@ -4102,57 +4102,71 @@ fn finish_log(
 #[cfg(test)]
 mod tests {
 
-    /// 🔴 Чувствительный заголовок обязан быть ОБЁРНУТ, а не затёрт вручную.
+    /// 🔴 Каждое извлечение обязано быть обёрнуто СВОЕЙ обёрткой.
     ///
     /// `resp.headers.take()` выносит карту из ZeroizeOnDrop-оболочки, и дальше
     /// значения — обычные `String`, которые при дропе буфер не обнуляют. Ручная
-    /// зачистка закрывает ровно те пути возврата, о которых автор вспомнил:
-    /// сначала пропустили отсутствие парного заголовка, потом — отказ проверки
-    /// на безопасные символы, которая стоит ПОСЛЕ извлечения. Каждый раз
-    /// чинилось по списку, и каждый раз оставался следующий путь.
+    /// зачистка закрывает те пути возврата, о которых вспомнил автор: сначала
+    /// пропустили отсутствие парного заголовка, потом — отказ проверки на
+    /// безопасные символы, которая стоит ПОСЛЕ извлечения. `Zeroizing` закрывает
+    /// класс: затирание при дропе, то есть на ЛЮБОМ возврате.
     ///
-    /// `Zeroizing` закрывает класс: затирание происходит при дропе, то есть на
-    /// ЛЮБОМ возврате — включая `?`, ранний `return` и раскрутку паники.
-    /// Образец уже был в этом файле (`binance_signed_url`) и применён в одном
-    /// месте из шести; здесь он распространён на все.
+    /// 🔴 Первая версия этой проверки смотрела на СОСЕДНИЕ строки и потому
+    /// принимала чужую обёртку: снимаешь `Zeroizing` со второй строки пары —
+    /// `from`, `owner`, `timestamp`, `api_key` — и тест остаётся зелёным, потому
+    /// что обёртка есть строкой выше, у `signature`. Проверка охраняла
+    /// соседство, а не извлечение. Теперь каждое `remove` разбирается внутри
+    /// СВОЕЙ инструкции `let … ;`, и чужая обёртка не засчитывается.
     ///
-    /// Проверка структурная: обнуление памяти из теста не наблюдаемо. Но она
-    /// смотрит на ФОРМУ ВЫЗОВА, а не на имя переменной — переименованием её не
-    /// обойти, в отличие от поиска конкретного литерала.
+    /// Проверка структурная: обнуление памяти из теста не наблюдаемо, а снять
+    /// обёртку можно одной правкой.
     #[test]
-    fn every_sensitive_header_is_extracted_into_a_zeroizing_wrapper() {
+    fn every_sensitive_header_is_extracted_into_its_own_zeroizing_wrapper() {
         let src = include_str!("handlers.rs");
-        // Собрано из кусков: include_str! втягивает и этот файл, иначе образец
-        // нашёл бы сам себя (тот же приём, что у route_paths в main.rs).
-        let remove = concat!("headers", "\n            .remove(\"");
-        let inline = concat!("headers.remove(", "\"");
-
-        // Все строки, где из карты достают именованный заголовок.
+        let needle = concat!(".remove(", "\"");
         let sensitive = ["signature", "api_key", "from", "owner", "timestamp", "recvWindow"];
+
+        // Режем файл на инструкции `let … ;`: извлечение и его обёртка обязаны
+        // жить в ОДНОЙ инструкции, иначе обёртка чужая.
         let mut unwrapped = Vec::new();
-        for (i, line) in src.lines().enumerate() {
-            let hit = sensitive.iter().any(|k| {
-                line.contains(&format!("{inline}{k}\")")) || line.contains(&format!("\"{k}\")"))
-                    && line.contains(".remove(")
-            });
-            if !hit {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if !lines[i].trim_start().starts_with("let ") {
+                i += 1;
                 continue;
             }
-            // Обёртка может стоять на этой же строке или на предыдущих двух
-            // (форма `Zeroizing::new(\n  headers\n    .remove(...))`).
-            let ctx_start = i.saturating_sub(3);
-            let ctx: String = src.lines().skip(ctx_start).take(i - ctx_start + 1).collect::<Vec<_>>().join("\n");
-            if !ctx.contains("Zeroizing") {
-                unwrapped.push(format!("строка {}: {}", i + 1, line.trim()));
+            let start_line = i;
+            let mut stmt = String::new();
+            while i < lines.len() {
+                stmt.push_str(lines[i]);
+                stmt.push('\n');
+                if lines[i].trim_end().ends_with(';') {
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+
+            let extracts = sensitive
+                .iter()
+                .any(|k| stmt.contains(&format!("{needle}{k}\")")));
+            if extracts && !stmt.contains("Zeroizing") {
+                unwrapped.push(format!(
+                    "строка {}: {}",
+                    start_line + 1,
+                    lines[start_line].trim()
+                ));
             }
         }
+
         assert!(
             unwrapped.is_empty(),
-            "чувствительный заголовок извлекается без обёртки Zeroizing — значит \
-             найдётся путь возврата, на котором он уйдёт в дроп незатёртым:\n{}",
+            "извлечение чувствительного заголовка не обёрнуто СВОЕЙ Zeroizing — \
+             значит найдётся путь возврата, на котором оно уйдёт в дроп \
+             незатёртым:\n{}",
             unwrapped.join("\n")
         );
-        let _ = remove;
     }
 
     // ── Permit2 route ────────────────────────────────────────────────────────
