@@ -117,3 +117,46 @@ class SnapshotRoundTrip(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TagNameMatching(unittest.TestCase):
+    """Имя тега сравнивается ЦЕЛИКОМ, а не ищется подстрокой.
+
+    🔴 Эта дыра закрывалась дважды и оба раза неполно, поэтому она здесь.
+
+    Первая версия искала кусок имени: `pcr0-abc` находился внутри чего угодно,
+    где встретится `abc`. Вторая искала с границами из букв, цифр и дефиса — и
+    тоже дырявила, потому что git разрешает в именах тегов точку, подчёркивание
+    и косую черту: тег `pcr0-abc` «находился» внутри упоминания `pcr0-abc.old`,
+    ведь символ после него не входил в класс, то есть граница «была».
+
+    Лечится не расширением класса символов — следующий забытый знак снова дыра, —
+    а разбором имён по правилам git и сравнением строк.
+
+    Проверка, способная сказать «сходится» на неполном совпадении, — ровно тот
+    дефект, ради которого этот сторож и живёт.
+    """
+
+    def test_tag_is_not_matched_inside_a_longer_tag_name(self):
+        header = [
+            "#   strict PCR0s   : deadbeef",
+            "#                    (tag pcr0-abc.old, commit 111, retired)",
+        ]
+        # В репозитории есть тег pcr0-abc; в заголовке упомянут ДРУГОЙ тег.
+        missing = ecc.tags_missing_from_header(["pcr0-abc"], header)
+        self.assertEqual(missing, ["pcr0-abc"])
+
+    def test_prefix_of_a_longer_measurement_tag_is_not_accepted(self):
+        header = ["#   strict PCR0s   : (tag pcr0-fbaad62f, commit 865f4182)"]
+        missing = ecc.tags_missing_from_header(["pcr0-fbaad62"], header)
+        self.assertEqual(missing, ["pcr0-fbaad62"])
+
+    def test_exact_name_is_accepted(self):
+        header = ["#   strict PCR0s   : (tag pcr0-fbaad62f, commit 865f4182)"]
+        self.assertEqual(ecc.tags_missing_from_header(["pcr0-fbaad62f"], header), [])
+
+    def test_every_tag_must_be_named_not_just_one(self):
+        header = ["#   (tag pcr0-aaa)"]
+        self.assertEqual(
+            ecc.tags_missing_from_header(["pcr0-aaa", "pcr0-bbb"], header), ["pcr0-bbb"]
+        )
