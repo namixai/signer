@@ -108,23 +108,25 @@ sdk/
 
 > ## What the registry says, and how to hold a live box to it
 >
-> The two production-lane rows were re-measured against Base on **2026-09-06**; the
-> retired rows on **2026-08-27**. The `cast` call below is what re-measures them:
+> Every row below was re-measured against Base on **2026-09-12**, block `51206490`.
+> The `cast` call below is what re-measures them:
 >
 > | PCR0 | what it is | `isPCR0Active` → `(active, owner)` |
 > |---|---|---|
-> | `60036cd3…` | **production**, since the cutover on 2026-09-03 | **`(true, 0x21538eBF…)`** |
-> | `103ccd79…` | production 2026-08-24 → 2026-09-03; the demo box runs it today | `(false, 0x0000…0000)` — deregistered |
+> | `fbaad62f…` | **production and public demo** — production since 2026-09-10, demo since 2026-09-11 | **`(true, 0x21538eBF…)`** |
+> | `60036cd3…` | production 2026-09-03 → 2026-09-10 | `(false, 0x0000…0000)` — deregistered |
+> | `103ccd79…` | production 2026-08-24 → 2026-09-03, then the demo box until 2026-09-11 | `(false, 0x0000…0000)` — deregistered |
 > | `32d25d8c…` | production 2026-08-10 → 08-24, then the demo box alone until 2026-08-27 | `(false, 0x0000…0000)` |
 > | `7c9e8b26…` | registered 2026-06-23, auto-deprecated | `(false, 0x0000…0000)` |
 > | `ff53e1fe…` | retired 2026-08-10 | `(false, 0x0000…0000)` |
 >
 > 🔴 **The two boxes rotate on separate schedules, so they are not always on the same
-> measurement.** From 2026-08-24 to 2026-08-27 the demo box ran the pre-rotation image while
-> production had moved on, and the registry answered `false` for what the demo attested. We
-> printed that rather than leave you to trip over it. The demo was rotated on 2026-08-27 and
-> both boxes now attest the same measurement — but that is a state with a date on it, not a
-> property, and the next window will separate them again. Whether they agree when you read
+> measurement.** It has happened twice: from 2026-08-24 to 2026-08-27, and again from
+> 2026-09-10 to 2026-09-11, when production moved to `fbaad62f…` and the demo box stayed a
+> day behind on `103ccd79…`. In both windows the registry answered `false` for what the demo
+> attested. We print that rather than leave you to trip over it. Since 2026-09-11 both boxes
+> attest the same measurement — but that is a state with a date on it, not a property, and
+> the next window will separate them again. Whether they agree when you read
 > this, only the boxes can say. The command below asks them instead of guessing.
 >
 > **Why this notice stays.** Between the 2026-08-10 rotation and the re-registration,
@@ -144,7 +146,7 @@ actually guarantees before leaning on it:
 
 - **Contract**: [`0x38b42eED740b0fDeb211bBDf773F2238cAEec240`](https://basescan.org/address/0x38b42eED740b0fDeb211bBDf773F2238cAEec240) (source verified)
 - **Canonical owner address**: `0x21538eBF6598e5866BA496A954dE8E39097bFB59`
-- **Active on-chain, production lane**: `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — `isPCR0Active` re-read 2026-09-06;
+- **Active on-chain**: `fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f` — both boxes run it; `isPCR0Active` re-read 2026-09-12 at block `51206490`;
   registered in Base block `50817711` (2026-09-03 08:39 UTC), owned by the owner
   above. That is what the registry says. What a box is *running* is a separate fact from
   a separate source: that box's `/attestation`. This file used to print one number for
@@ -308,7 +310,7 @@ branch: dependency bumps on `main` change the enclave binary and therefore PCR0.
 
 ```bash
 git clone https://github.com/namixai/signer.git && cd signer
-git checkout pcr0-60036cd3              # a measurement TAG (pcr0-<prefix>); pick the one you intend to trust
+git checkout pcr0-fbaad62f              # a measurement TAG (pcr0-<prefix>); pick the one you intend to trust
 cd poc
 SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 # → prints that tag's PCR0. Compare it against the /attestation of the endpoint you are
@@ -317,8 +319,15 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 ```
 
 > **Measured, not asserted — and here is the measurement record.**
-> Last re-runs: **2026-09-02** (tag `pcr0-60036cd3`, clean anonymous clone by `poc/scripts/reproducibility-from-public-clone.sh`,
-> which refuses to build anything but a tag) and **2026-08-23** (tag `pcr0-103ccd79`); both `env -i`, x86_64 EC2 build host, **`nitro-cli 1.4.4`**.
+> Last re-runs: **2026-09-10** (tag `pcr0-fbaad62f`, TWO independent clean anonymous clones;
+> the second through `poc/scripts/reproducibility-from-public-clone.sh`, which refuses to
+> build anything but a tag — verdict `REPRODUCIBLE`, exit 0), **2026-09-02** (tag
+> `pcr0-60036cd3`) and **2026-08-23** (tag `pcr0-103ccd79`); all `env -i`, x86_64 EC2 build
+> host, **`nitro-cli 1.4.4`**.
+>
+> Stated plainly about the newest run: that script removes its own clone afterwards, so no
+> artifact of the second build remains on disk. The evidence is the gate's output, not a
+> file you can inspect later.
 > PCR0 also depends on the `nitro-cli` release (it bundles the enclave kernel and
 > init), so use the same version or expect a different number for that reason alone.
 > A build needs ~30 GB of free disk for the Docker layers; `build-eif.sh` prunes
@@ -329,7 +338,8 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > | commit `db68182` (2026-08-11) | `SIGNER_REQUIRE_POLICY=1` | `32d25d8c…` — previous production (2026-08-10 → 2026-08-24) |
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
 > | tag `pcr0-103ccd79` = commit `96cd4e46` (2026-08-23, merge of #55) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured 2026-08-23/26; **previously** deployed to production 2026-08-24 → 2026-09-03, deregistered since |
-> | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; **production since 2026-09-03**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
+> | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; production 2026-09-03 → 2026-09-10, **deregistered since** |
+> | tag `pcr0-fbaad62f` = commit `865f4182` (2026-09-10) | `SIGNER_REQUIRE_POLICY=1` | `fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f` — adds the Permit2 `PermitSingle` action; measured 2026-09-10 from two separate clean public clones at the tag; **production since 2026-09-10, demo since 2026-09-11**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
 > | commit `1207d37` (2026-08-19, on the `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | a previous measurement that **belongs to no lane — never deployed, never registered**: `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9`. HEAD no longer reproduces it: `anyhow` and `thiserror` were bumped after it was taken |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the

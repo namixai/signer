@@ -54,8 +54,13 @@ is attesting right now":
 
 | tag | commit | lane it was cut for |
 |---|---|---|
-| `pcr0-60036cd3` | `3bf4f62c99be` | production |
-| `pcr0-103ccd79` | `96cd4e468d2e` | public demo |
+| `pcr0-fbaad62f` | `865f4182aa2e` | **production and public demo** (both boxes, since 2026-09-11) |
+| `pcr0-60036cd3` | `3bf4f62c99be` | production until 2026-09-10 — retired |
+| `pcr0-103ccd79` | `96cd4e468d2e` | public demo until 2026-09-11 — retired |
+
+Both lanes currently run the same measurement, so one row covers them. That is a
+state, not a rule: the lanes rotate independently and have been apart before. The
+attestation document you fetch from the box you are checking is what decides.
 
 Build at the tag for the lane you are checking, take the measurement out of that lane's
 own attestation document, and compare the two.
