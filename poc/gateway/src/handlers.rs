@@ -1250,13 +1250,20 @@ pub async fn post_sign_x402(
     //    `take()` so the ZeroizeOnDrop response wipes its shell on drop; then
     //    MOVE the values out via `remove` (not clone) and zeroize any leftover
     //    header values we moved into this plain map (Gemini #75 HIGH).
+    // `resp.headers.take()` выносит карту из ZeroizeOnDrop-оболочки ответа, и
+    // дальше это обычные String, которые при дропе буфер не обнуляют.
+    //
+    // 🔴 `let-else` здесь ронял успешно извлечённую `signature`, когда `from`
+    // отсутствовал: платёжная авторизация оставалась в куче шлюза. Форма была
+    // СКОПИРОВАНА отсюда в маршрут Permit2, там её починили по ревью, а предок
+    // остался — живой боевой эндпоинт.
     let mut headers = resp.headers.take().unwrap_or_default();
-    let signature = headers.remove("signature");
-    let from = headers.remove("from");
+    let signature = headers.remove("signature").map(zeroize::Zeroizing::new);
+    let from = headers.remove("from").map(zeroize::Zeroizing::new);
     for v in headers.values_mut() {
         zeroize::Zeroize::zeroize(v);
     }
-    let (Some(signature), Some(from)) = (signature, from) else {
+    if signature.is_none() || from.is_none() {
         warn!(event = "sign_x402_missing_signature", key_id = %key_for_log);
         return finish_log(
             error_response(err_code::INTERNAL_ERROR),
@@ -1264,7 +1271,9 @@ pub async fn post_sign_x402(
             false,
             Some(err_code::INTERNAL_ERROR),
         );
-    };
+    }
+    let signature = signature.expect("signature present after None-check");
+    let from = from.expect("from present after None-check");
 
     state.backoff.report_success(&scope);
     info!(event = "sign_x402_ok", key_id = %key_for_log, vsock_latency_ms);
@@ -1273,8 +1282,10 @@ pub async fn post_sign_x402(
             StatusCode::OK,
             Json(crate::proto::SignX402Response {
                 ok: true,
-                signature,
-                from,
+                // Копия уходит в ответ, который сам ZeroizeOnDrop; оригинал
+                // остаётся в Zeroizing и затирается при выходе из функции.
+                signature: signature.to_string(),
+                from: from.to_string(),
                 receipt,
             }),
         )
@@ -1474,18 +1485,12 @@ pub async fn post_sign_permit2(
     // one authorizes a STANDING allowance (CodeRabbit security-high on #93).
     // Same shape as `post_sign_binance_request`.
     let mut headers = resp.headers.take().unwrap_or_default();
-    let mut signature = headers.remove("signature");
-    let mut owner = headers.remove("owner");
+    let signature = headers.remove("signature").map(zeroize::Zeroizing::new);
+    let owner = headers.remove("owner").map(zeroize::Zeroizing::new);
     for v in headers.values_mut() {
         zeroize::Zeroize::zeroize(v);
     }
     if signature.is_none() || owner.is_none() {
-        if let Some(s) = signature.as_mut() {
-            zeroize::Zeroize::zeroize(s);
-        }
-        if let Some(o) = owner.as_mut() {
-            zeroize::Zeroize::zeroize(o);
-        }
         warn!(event = "sign_permit2_missing_signature", key_id = %key_for_log);
         return finish_log(
             error_response(err_code::INTERNAL_ERROR),
@@ -1505,8 +1510,8 @@ pub async fn post_sign_permit2(
             StatusCode::OK,
             Json(crate::proto::SignPermit2Response {
                 ok: true,
-                signature,
-                owner,
+                signature: signature.to_string(),
+                owner: owner.to_string(),
                 receipt,
             }),
         )
@@ -1736,11 +1741,24 @@ pub(crate) fn build_binance_signed_qs(
     canonical: &str,
     headers: &mut std::collections::BTreeMap<String, String>,
 ) -> Result<String, &'static str> {
-    let signature = headers.remove("signature").ok_or("missing signature")?;
-    let timestamp = headers.remove("timestamp").ok_or("missing timestamp")?;
-    let recv_window = headers
-        .remove("recvWindow")
-        .unwrap_or_else(|| "5000".to_owned());
+    // 🔴 `?` на отсутствующем timestamp вернул бы Err, уронив уже извлечённую
+    // подпись Binance без обнуления. Вынимаем оба, затем решаем.
+    let signature = headers.remove("signature").map(zeroize::Zeroizing::new);
+    let timestamp = headers.remove("timestamp").map(zeroize::Zeroizing::new);
+    if signature.is_none() || timestamp.is_none() {
+        return Err(if signature.is_none() {
+            "missing signature"
+        } else {
+            "missing timestamp"
+        });
+    }
+    let signature = signature.expect("signature present after None-check");
+    let timestamp = timestamp.expect("timestamp present after None-check");
+    let recv_window = zeroize::Zeroizing::new(
+        headers
+            .remove("recvWindow")
+            .unwrap_or_else(|| "5000".to_owned()),
+    );
     // Defense in depth: anything the enclave returns should be safe to embed,
     // but if a future change widens the alphabet we want to fail loud.
     // Gemini #78 (wave-2): `signature` (hex), `timestamp` + `recvWindow` (digits)
@@ -1762,7 +1780,10 @@ pub(crate) fn build_binance_signed_qs(
         return Err("unsafe character in canonical querystring");
     }
     Ok(format!(
-        "{canonical}&timestamp={timestamp}&recvWindow={recv_window}&signature={signature}"
+        "{canonical}&timestamp={timestamp}&recvWindow={recv_window}&signature={signature}",
+        timestamp = timestamp.as_str(),
+        recv_window = recv_window.as_str(),
+        signature = signature.as_str(),
     ))
 }
 
@@ -2092,18 +2113,12 @@ pub async fn post_sign_binance_request(
     // lingers in gateway heap (CodeRabbit Major + Gemini HIGH #219). The two
     // extracted values then go into the Drop-wiped response on success, or are
     // wiped on the error path below.
-    let mut signature = headers.remove("signature");
-    let mut api_key = headers.remove("api_key");
+    let signature = headers.remove("signature").map(zeroize::Zeroizing::new);
+    let api_key = headers.remove("api_key").map(zeroize::Zeroizing::new);
     for v in headers.values_mut() {
         zeroize::Zeroize::zeroize(v);
     }
     if signature.is_none() || api_key.is_none() {
-        if let Some(s) = signature.as_mut() {
-            zeroize::Zeroize::zeroize(s);
-        }
-        if let Some(k) = api_key.as_mut() {
-            zeroize::Zeroize::zeroize(k);
-        }
         warn!(event = "binance_request_missing_fields", key_id = %key_for_log);
         return finish_log(
             error_response(err_code::INTERNAL_ERROR),
@@ -2122,8 +2137,8 @@ pub async fn post_sign_binance_request(
         (
             StatusCode::OK,
             Json(crate::proto::SignBinanceRequestResponse {
-                signature,
-                api_key,
+                signature: signature.to_string(),
+                api_key: api_key.to_string(),
                 receipt,
             }),
         )
@@ -3303,33 +3318,31 @@ async fn get_account_binance_inner(
         Err(resp) => return finish_log(resp, started, false, None),
     };
 
-    let signature = match headers.remove("signature") {
-        Some(s) => s,
-        None => {
+    // 🔴 Оба заголовка вынимаются ДО первой проверки: раздельные `match` роняли
+    // извлечённую подпись, если отсутствовал timestamp. Тот же класс, что в
+    // post_sign_x402.
+    let signature = headers.remove("signature").map(zeroize::Zeroizing::new);
+    let timestamp = headers.remove("timestamp").map(zeroize::Zeroizing::new);
+    if signature.is_none() || timestamp.is_none() {
+        if signature.is_none() {
             warn!(event = "account_missing_signature", venue = "binance");
-            return finish_log(
-                error_response(err_code::INTERNAL_ERROR),
-                started,
-                false,
-                Some(err_code::INTERNAL_ERROR),
-            );
-        }
-    };
-    let timestamp = match headers.remove("timestamp") {
-        Some(t) => t,
-        None => {
+        } else {
             warn!(event = "account_missing_timestamp", venue = "binance");
-            return finish_log(
-                error_response(err_code::INTERNAL_ERROR),
-                started,
-                false,
-                Some(err_code::INTERNAL_ERROR),
-            );
         }
-    };
-    let recv_window = headers
-        .remove("recvWindow")
-        .unwrap_or_else(|| "5000".to_owned());
+        return finish_log(
+            error_response(err_code::INTERNAL_ERROR),
+            started,
+            false,
+            Some(err_code::INTERNAL_ERROR),
+        );
+    }
+    let signature = signature.expect("signature present after None-check");
+    let timestamp = timestamp.expect("timestamp present after None-check");
+    let recv_window = zeroize::Zeroizing::new(
+        headers
+            .remove("recvWindow")
+            .unwrap_or_else(|| "5000".to_owned()),
+    );
 
     // Validate the values before embedding in the URL (defense in depth).
     if ![&signature, &timestamp, &recv_window]
@@ -3348,6 +3361,9 @@ async fn get_account_binance_inner(
     let url = format!(
         "{base}/fapi/v2/account?timestamp={timestamp}&recvWindow={recv_window}&signature={signature}",
         base = binance_base_url(),
+        timestamp = timestamp.as_str(),
+        recv_window = recv_window.as_str(),
+        signature = signature.as_str(),
     );
 
     info!(event = "account_ok", venue = "binance");
@@ -4085,6 +4101,73 @@ fn finish_log(
 #[allow(clippy::too_many_arguments)] // request-context threading (PR-B raw_token)
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 Каждое извлечение обязано быть обёрнуто СВОЕЙ обёрткой.
+    ///
+    /// `resp.headers.take()` выносит карту из ZeroizeOnDrop-оболочки, и дальше
+    /// значения — обычные `String`, которые при дропе буфер не обнуляют. Ручная
+    /// зачистка закрывает те пути возврата, о которых вспомнил автор: сначала
+    /// пропустили отсутствие парного заголовка, потом — отказ проверки на
+    /// безопасные символы, которая стоит ПОСЛЕ извлечения. `Zeroizing` закрывает
+    /// класс: затирание при дропе, то есть на ЛЮБОМ возврате.
+    ///
+    /// 🔴 Первая версия этой проверки смотрела на СОСЕДНИЕ строки и потому
+    /// принимала чужую обёртку: снимаешь `Zeroizing` со второй строки пары —
+    /// `from`, `owner`, `timestamp`, `api_key` — и тест остаётся зелёным, потому
+    /// что обёртка есть строкой выше, у `signature`. Проверка охраняла
+    /// соседство, а не извлечение. Теперь каждое `remove` разбирается внутри
+    /// СВОЕЙ инструкции `let … ;`, и чужая обёртка не засчитывается.
+    ///
+    /// Проверка структурная: обнуление памяти из теста не наблюдаемо, а снять
+    /// обёртку можно одной правкой.
+    #[test]
+    fn every_sensitive_header_is_extracted_into_its_own_zeroizing_wrapper() {
+        let src = include_str!("handlers.rs");
+        let needle = concat!(".remove(", "\"");
+        let sensitive = ["signature", "api_key", "from", "owner", "timestamp", "recvWindow"];
+
+        // Режем файл на инструкции `let … ;`: извлечение и его обёртка обязаны
+        // жить в ОДНОЙ инструкции, иначе обёртка чужая.
+        let mut unwrapped = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if !lines[i].trim_start().starts_with("let ") {
+                i += 1;
+                continue;
+            }
+            let start_line = i;
+            let mut stmt = String::new();
+            while i < lines.len() {
+                stmt.push_str(lines[i]);
+                stmt.push('\n');
+                if lines[i].trim_end().ends_with(';') {
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+
+            let extracts = sensitive
+                .iter()
+                .any(|k| stmt.contains(&format!("{needle}{k}\")")));
+            if extracts && !stmt.contains("Zeroizing") {
+                unwrapped.push(format!(
+                    "строка {}: {}",
+                    start_line + 1,
+                    lines[start_line].trim()
+                ));
+            }
+        }
+
+        assert!(
+            unwrapped.is_empty(),
+            "извлечение чувствительного заголовка не обёрнуто СВОЕЙ Zeroizing — \
+             значит найдётся путь возврата, на котором оно уйдёт в дроп \
+             незатёртым:\n{}",
+            unwrapped.join("\n")
+        );
+    }
 
     // ── Permit2 route ────────────────────────────────────────────────────────
     //
