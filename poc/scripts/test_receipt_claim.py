@@ -36,26 +36,62 @@ NOT_A_SIGNING_CALL = {
 }
 
 
-def handlers_with_receipt():
-    """(carries, lacks) — handler names, split by whether a receipt can reach the response.
+def _functions(src_lines):
+    """Every fn in the file, private ones included, mapped to its body.
 
-    Two paths, both load-bearing: a direct `take_receipt`, or `sign_structured_request`,
-    which calls it once on behalf of every structured order/cancel route.
+    🔴 Cut at `mod tests` first. The LAST handler's body otherwise runs to EOF and
+    swallows the test module, which mentions `sign_structured_request` twice — enough to
+    classify `post_cancel_all` as carrying a receipt on the strength of test comments.
+    Measured: its real body (3990–4102) contains neither marker. Raised by review on #100,
+    and the parser was right about that route only by accident.
     """
+    cut = next((i for i, l in enumerate(src_lines) if l.strip().startswith("mod tests")),
+               len(src_lines))
+    code = src_lines[:cut]
+    sig = re.compile(r"^\s*(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)")
+    starts = [(i, m.group(1)) for i, l in enumerate(code) if (m := sig.match(l))]
+    out = {}
+    for n, (i, name) in enumerate(starts):
+        j = starts[n + 1][0] if n + 1 < len(starts) else len(code)
+        out[name] = "\n".join(code[i:j])
+    return out, [name for _, name in starts]
+
+
+def _reaches_receipt(name, fns, seen=None):
+    """Does this function reach `take_receipt`, directly or through what it calls?
+
+    The receipt is reached by three different paths in this file — a direct call, the
+    structured helper, and the account-read helper — and following only the first two is
+    how I mis-reported cancels once already. So this walks the call graph instead of
+    matching two names.
+    """
+    seen = seen or set()
+    if name in seen or name not in fns:
+        return False
+    seen.add(name)
+    body = fns[name]
+    if "take_receipt(" in body:
+        return True
+    for callee in set(re.findall(r"\b([a-z][A-Za-z0-9_]*)\s*\(", body)):
+        if callee != name and callee in fns and _reaches_receipt(callee, fns, seen):
+            return True
+    return False
+
+
+def handlers_with_receipt():
+    """(carries, lacks) — handler names, split by whether a receipt can reach a response."""
     src = HANDLERS.read_text(encoding="utf-8", errors="replace").splitlines()
-    starts = [(i, l) for i, l in enumerate(src) if l.startswith("pub async fn ")]
-    if not starts:
+    fns, order = _functions(src)
+    handlers = [n for n in order if n.startswith(("post_", "get_"))
+                and re.search(rf"pub async fn {re.escape(n)}\b", fns[n])]
+    if not handlers:
         raise AssertionError(f"{HANDLERS}: no `pub async fn` handlers found — the file "
                              f"moved or changed shape, and this guard is checking nothing")
     carries, lacks = set(), set()
-    for n, (i, line) in enumerate(starts):
-        name = line.split("pub async fn ")[1].split("(")[0]
-        end = starts[n + 1][0] if n + 1 < len(starts) else len(src)
-        body = "\n".join(src[i:end])
+    for name in handlers:
         if name in NOT_A_SIGNING_CALL:
             continue
-        (carries if ("take_receipt(" in body or "sign_structured_request(" in body)
-         else lacks).add(name)
+        (carries if _reaches_receipt(name, fns) else lacks).add(name)
     return carries, lacks
 
 

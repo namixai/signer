@@ -330,7 +330,12 @@ Every **order and cancel** — the whole money path, on both the allow and the r
 <!-- Machine-readable on purpose. poc/scripts/test_receipt_claim.py reads THIS line, not
      the prose below it: a guard that greps English near the word "no" is guessing, and a
      guessing guard passes when it should not. Keep the two in step — the prose is for the
-     reader, this line is what CI checks. -->
+     reader, this line is what CI checks.
+     Scope of the machine check, stated so the marker does not promise more than it keeps:
+     it verifies that no signing route reaches NO receipt at all without being listed here.
+     `/cancel-all` DOES reach one — on the refusal branch, through `sign_account_read` —
+     and is listed for the SUCCESS branch, which is a per-branch fact the parser cannot
+     see. That half rests on review, not on CI. -->
 
 🔴 **Two exceptions, named rather than left for you to discover.** `/sign/data` (attested data signing) issues **no** receipt at all, and `/cancel-all` issues one on a refusal but not on success. This line used to read "every signed call", which was wider than the mechanism — `/sign/data` is a signed call. Verified by walking the handlers: the receipt comes from `take_receipt`, reached directly or through `sign_structured_request`, and those two routes reach neither.
 
