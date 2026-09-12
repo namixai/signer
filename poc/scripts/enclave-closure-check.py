@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -113,6 +114,51 @@ def read_snapshot(path: Path) -> tuple[list[str], list[str]]:
     return header, body
 
 
+def measurement_tags(root: Path) -> list[str] | None:
+    """Теги `pcr0-*`, какие есть в репозитории, или None — если спросить не смогли.
+
+    🔴 None и пустой список — РАЗНЫЕ исходы, и это здесь главное. Клон без тегов
+    (`actions/checkout` без `fetch-depth: 0`) вернул бы пустой список, и проверка
+    «все теги названы» прошла бы триумфально, не проверив ничего. Отсутствие не
+    должно голосовать за успех — поэтому невозможность спросить git отделена от
+    ответа «тегов нет».
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "tag", "-l", "pcr0-*"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return [t.strip() for t in out.stdout.splitlines() if t.strip()]
+
+
+def check_header_names_every_tag(header: list[str], root: Path) -> tuple[int, list[str]]:
+    """Заголовок снимка обязан называть КАЖДОЕ измерение, для которого есть тег.
+
+    Зачем это здесь. Замыкание и измерение — разные вещи: ротация R2 добавила
+    действие Permit2 и не притащила ни одной новой зависимости, поэтому PCR0
+    изменился, а снимок нет. Сверка замыкания при этом честно говорила «OK», и
+    выходило, что гейт, который документ называет защитой от расхождения, ничего
+    не знает о работающем образе — заголовок ведётся РУКАМИ и протухал дважды.
+
+    Тег `pcr0-<префикс>` заводится при каждой ротации, то есть это тот сигнал,
+    который появляется сам. Если тег есть, а заголовок его не называет — заголовок
+    отстал, и это красный, а не примечание.
+    """
+    tags = measurement_tags(root)
+    if tags is None:
+        return 2, ["не смог спросить git о тегах — проверка НЕ ВЫПОЛНЕНА, это не «сошлось»"]
+    if not tags:
+        return 2, ["в клоне нет ни одного тега pcr0-* — вероятно, checkout без fetch-depth: 0; "
+                   "проверка НЕ ВЫПОЛНЕНА, это не «сошлось»"]
+    blob = "\n".join(header)
+    missing = [t for t in tags if t.split("pcr0-", 1)[1] not in blob]
+    return (1, missing) if missing else (0, [])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
@@ -144,6 +190,21 @@ def run(lock: Path, snapshot: Path, write: bool) -> int:
         raise OSError(f"snapshot {args.snapshot} missing")
     header, expected = read_snapshot(args.snapshot)
     if current == expected:
+        rc, missing = check_header_names_every_tag(header, ROOT.parent)
+        if rc == 1:
+            print("enclave-closure-check: FAIL — снимок не называет измерение, для которого есть тег.")
+            print("  Замыкание совпадает, и это ЧЕСТНО: разные образы делят одно замыкание.")
+            print("  Но заголовок отстал, а именно его читают как «что сейчас работает»:")
+            for t in missing:
+                print(f"  - тег {t} есть в репозитории, в заголовке снимка его нет")
+            print("  Fix: дописать измерение и тег в заголовок enclave/DEPENDENCY-CLOSURE.lock.")
+            print("  Пересобирать снимок при этом НЕ НУЖНО, если замыкание не менялось.")
+            return 1
+        if rc == 2:
+            print("enclave-closure-check: BLIND — замыкание совпадает, но теги проверить не удалось.")
+            for m in missing:
+                print(f"  - {m}")
+            return 2
         print(f"enclave-closure-check: OK — {len(current)} crates, closure matches the measured snapshot")
         for h in header:
             if h.startswith("#   ") and ":" in h:

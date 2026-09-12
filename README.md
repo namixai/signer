@@ -121,10 +121,13 @@ sdk/
 > | `ff53e1fe…` | retired 2026-08-10 | `(false, 0x0000…0000)` |
 >
 > 🔴 **The two boxes rotate on separate schedules, so they are not always on the same
-> measurement.** It has happened twice: from 2026-08-24 to 2026-08-27, and again from
-> 2026-09-10 to 2026-09-11, when production moved to `fbaad62f…` and the demo box stayed a
-> day behind on `103ccd79…`. In both windows the registry answered `false` for what the demo
-> attested. We print that rather than leave you to trip over it. Since 2026-09-11 both boxes
+> measurement.** It has happened three times:
+>
+> - **2026-08-24 → 2026-08-27** — production moved to `103ccd79…`, the demo box stayed on `32d25d8c…`;
+> - **2026-09-03 → 2026-09-10** — production moved to `60036cd3…`, the demo box stayed on `103ccd79…` for a week;
+> - **2026-09-10 → 2026-09-11** — production moved to `fbaad62f…`, the demo box followed a day later.
+>
+> In every one of those windows the registry answered `false` for what the demo attested. We print that rather than leave you to trip over it. Since 2026-09-11 both boxes
 > attest the same measurement — but that is a state with a date on it, not a property, and
 > the next window will separate them again. Whether they agree when you read
 > this, only the boxes can say. The command below asks them instead of guessing.
