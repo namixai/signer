@@ -51,15 +51,56 @@ def extract_recipe(rel_path: str, anchor: str) -> str:
     would have latched onto the first of those and extracted a different block — a guard
     pointed at the wrong code, which is worse than no guard. Raised by review on #98.
     """
-    text = (ROOT / rel_path).read_text(encoding="utf-8")
-    heading = re.search(rf"^{re.escape(anchor)}\b.*$", text, re.M)
-    if not heading:
+    # 🔴 Разбор ПОСТРОЧНЫЙ, с учётом того, где кончается разметка и начинается код.
+    # Две ловушки, обе найдены замером, а не рассуждением:
+    #  1. поиск фенса «до конца файла» подхватывает первый bash-блок ДАЛЬШЕ по странице,
+    #     если рецепт из секции удалить. Для §1.3 это однострочник `cast call …`, в
+    #     котором `jq` нет вовсе: два контроля из трёх прошли бы вхолостую, против чужой
+    #     команды. Найдено ревью на #98;
+    #  2. а «следующий заголовок» регуляркой `^#{1,3} ` совпал с КОММЕНТАРИЕМ внутри
+    #     самого bash-блока (`# Read-only eth_call …`) и обрезал секцию раньше рецепта.
+    #     Поймал на себе при первой же попытке починить пункт 1.
+    # Поэтому состояние фенса отслеживается явно, и заголовком считается только строка
+    # вне кода.
+    lines = (ROOT / rel_path).read_text(encoding="utf-8").splitlines()
+    try:
+        i = next(n for n, l in enumerate(lines)
+                 if re.match(rf"^{re.escape(anchor)}\b", l))
+    except StopIteration:
         raise AssertionError(f"{rel_path}: heading {anchor!r} is gone — the recipe moved "
-                             f"and this guard is pointed at nothing")
-    block = re.search(r"```bash\n(.*?)\n```", text[heading.start():], re.S)
-    if not block:
-        raise AssertionError(f"{rel_path}: no bash block after {anchor!r}")
-    return block.group(1)
+                             f"and this guard is pointed at nothing") from None
+    in_fence, fence_lang, buf = False, None, None
+    for line in lines[i + 1:]:
+        if line.startswith("```"):
+            if in_fence:
+                # 🔴 И НЕ «ПЕРВЫЙ bash-БЛОК В СЕКЦИИ». В §1.3 их ДВА: сырой eth_call и
+                # вариант через `cast`. Удаление первого подсовывало второй, в котором
+                # нет `jq`, и два контроля из трёх снова проходили вхолостую. Поймал
+                # собственной мутацией уже ПОСЛЕ того, как починил границу секции —
+                # третий слой одной и той же дыры.
+                # Рецепт опознаётся по тому, что он делает: тянет документ с SIGNER_URL
+                # и разбирает его jq. Если он перестанет это делать, здесь будет отказ,
+                # а не тихая подмена на соседний блок.
+                if fence_lang == "bash" and "SIGNER_URL" in "\n".join(buf) \
+                        and "jq" in "\n".join(buf):
+                    return "\n".join(buf)
+                in_fence, fence_lang, buf = False, None, None
+            else:
+                in_fence, fence_lang = True, line[3:].strip().lower()
+                buf = [] if fence_lang == "bash" else None
+            continue
+        if in_fence:
+            if buf is not None:
+                buf.append(line)
+            continue
+        if re.match(r"^#{1,6} ", line):      # настоящий заголовок — секция кончилась
+            break
+    raise AssertionError(
+        f"{rel_path}: the {anchor!r} section has no bash block that fetches from "
+        f"SIGNER_URL and parses it with jq. The recipe was moved, deleted, or rewritten; "
+        f"this guard refuses to fall back on a neighbouring block, because a guard "
+        f"pointed at the wrong command is worse than no guard. If the change is "
+        f"deliberate, retire this file rather than leaving it green against nothing.")
 
 
 def sandbox_bin(tmp: Path, *, with_jq: bool, with_curl_stub: bool) -> Path:
