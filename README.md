@@ -34,7 +34,20 @@ Adversarial-tested: direct KMS decrypt without attestation → AccessDenied. Wro
 
 ## Documentation
 
-For engineers, security reviewers, and recruiters who want to dig deeper:
+For engineers, security reviewers, and recruiters who want to dig deeper.
+
+**Checking us rather than reading us starts with these two**, and they were missing from
+this list — the only pointer to them sat further down inside the registry section, so a
+reviewer scanning the documents for reviewers never reached the procedure written for them:
+
+- **[`docs/VERIFY-SIGNER-YOURSELF.md`](docs/VERIFY-SIGNER-YOURSELF.md)** — verify the live
+  enclave yourself: fetch a nonce-bound attestation, pin the AWS Nitro root, validate the
+  certificate path and the COSE signature, read PCR0 out of the *signed* document, and
+  cross-check it against the on-chain registry. Copy-paste Python that trusts no Usenami
+  code; CI runs that very block against 24 corrupted documents so it cannot rot.
+- **[`docs/REPRODUCIBLE-BUILD.md`](docs/REPRODUCIBLE-BUILD.md)** — rebuild the enclave image
+  from this source and get the same measurement. This is the only step that owes us nothing
+  at all; it also states up front what it costs, and what to do without a Linux host.
 
 - **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — visual data flow, trust boundaries, and component-by-component responsibilities. Mermaid diagrams render natively on GitHub.
 - **[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)** — formal enumeration of attacker classes (host root, supply chain, compromised IAM, network MITM, insider, etc), what each can attempt, and what stops them.
@@ -186,6 +199,17 @@ The PCR0 alone is **not** enough. Three checks must all pass; any one of them is
 # here without that step as unproven, not as proof.
 # Fail closed on the fetch too: an error page or a missing field would otherwise
 # walk an empty value straight into the calldata.
+# 🔴 jq IS REQUIRED HERE, and it used to be undeclared. Without it the two checks
+# below compared an EMPTY string to the nonce and printed "nonce not echoed — document
+# not bound to this request": a missing tool on YOUR machine accused THIS SERVICE of
+# replaying a document at you. That is the worst possible answer to give someone who
+# came to check us. Name the shortage instead, the way the shell's own
+# `cast: command not found` does, and stop before anything is compared.
+command -v jq >/dev/null 2>&1 || {
+  echo "jq is not installed, and nothing below has been checked yet." >&2
+  echo "Install it (apt install jq / brew install jq / dnf install jq) and re-run." >&2
+  exit 127   # the shell's own code for "command not found" — this is about your box
+}
 SIGNER_URL=https://signer-demo.usenami.io:8443   # or your production endpoint
 # Bind the answer to THIS request. Without a nonce an endpoint may hand you a
 # document it prepared earlier — including one measured on an image it no longer

@@ -56,8 +56,16 @@ certificate and read PCR0 out of the *signed* document.
 
 ### 1.2 Copy-paste verifier (Python, trusts no Usenami code)
 
-Dependency-light (`cbor2` + `cryptography` + `requests`) so you can run it in a
-clean venv.
+Five packages in a clean venv, named here as well as in the command so you can decide
+before you install: **`cbor2`** (the attestation document is CBOR), **`cryptography`**
+(the ES384 signature), **`pyhanko-certvalidator`** + **`asn1crypto`** (RFC 5280 path
+validation to the pinned AWS root — this is the pair the chain check rests on, and an
+earlier revision of this line left it out), **`requests`** (the fetch).
+
+The registry check in §1.3 also needs **`jq`**, which is a system package rather than a
+pip one, and its `cast` variant needs **Foundry**. Neither used to be named; a missing
+`jq` produced a message blaming *us* for replaying a document at you, which is fixed
+below but was worth saying out loud.
 
 ```bash
 python3 -m venv v && . v/bin/activate && pip install cbor2 cryptography pyhanko-certvalidator asn1crypto requests
@@ -431,11 +439,23 @@ def main():
     #   1. Build the enclave yourself from the commit you intend to trust (README,
     #      "Reproducible build"). This is the only source that owes nothing to us
     #      telling you the truth.
-    #   2. Ask the on-chain registry which measurement is active and who owns it, then
-    #      hold this endpoint to that. This file does not print the production value:
-    #      read it from /attestation of the endpoint you are verifying.
+    #   2. The on-chain registry — but read what it actually does, because this line
+    #      used to overstate it. `isPCR0Active(bytes)` CONFIRMS a measurement you
+    #      already have: you bring 48 bytes, it answers active/not and names the owner.
+    #      It is NOT a way to learn which measurement to expect — there is no "what is
+    #      active?" call, and the event lookup in §1.3 is keyed by the measurement too.
+    #      So the registry is a cross-check on a number you got elsewhere; if you got
+    #      that number from the endpoint you are testing, the two are not independent
+    #      and a `true` proves only that the value is registered to us, not that this
+    #      box runs it. That is still worth having — it is what catches a stranger's
+    #      registration — but it is not source #1.
     #   3. The measurement table in the README: commit -> flag -> value, and when each
-    #      was deployed.
+    #      was deployed. A file in a repository, so it lags by construction.
+    #
+    # Stated plainly because the arithmetic matters: only (1) is independent of us, and
+    # (1) needs a Linux host with Docker and nitro-cli. On a laptop without one there is
+    # no fully independent source of the expected number — see Part 2, which now says
+    # what that costs and offers the honest half-step.
     #
     # Whichever you pick, the enclaves are SEPARATE BOXES on independent rotation
     # schedules. Whether they run the same image is a state with a date on it, not a
@@ -642,6 +662,19 @@ The `UsenamiAttestationRegistry` is live on **Base mainnet** at
 ([source](../poc/contracts/src/UsenamiAttestationRegistry.sol)). It answers one
 question: *is this measurement currently registered as active, and by whom.*
 
+🔴 **Read that sentence for what it does not say.** The registry CONFIRMS a measurement
+you bring; it is not a way to FIND OUT which one to expect. There is no "what is active?"
+call — `isPCR0Active` takes 48 bytes and returns a verdict on them, and the event lookup
+further down is keyed by the measurement as well. So if you take the number from the
+endpoint you are testing and then ask the registry about it, the two are **not independent
+sources**: a `true` tells you the value is registered to us, not that this box is running
+it. What it does catch, and what it exists for, is a stranger's registration of the same
+bytes — which is why the owner check below is not optional.
+
+The only source of an expected measurement that owes us nothing is **Part 2, your own
+rebuild** — and Part 2 now says plainly what that costs and what to do when you cannot
+pay it.
+
 ```solidity
 function isPCR0Active(bytes calldata pcr0) external view returns (bool active, address owner);
 ```
@@ -666,6 +699,17 @@ is really an encoding mistake. It returns **two** values; decode both.
 # here without that step as unproven, not as proof.
 # Fail closed on the fetch too: an error page or a missing field would otherwise
 # walk an empty value straight into the calldata.
+# 🔴 jq IS REQUIRED HERE, and it used to be undeclared. Without it the two checks
+# below compared an EMPTY string to the nonce and printed "nonce not echoed — document
+# not bound to this request": a missing tool on YOUR machine accused THIS SERVICE of
+# replaying a document at you. That is the worst possible answer to give someone who
+# came to check us. Name the shortage instead, the way the shell's own
+# `cast: command not found` does, and stop before anything is compared.
+command -v jq >/dev/null 2>&1 || {
+  echo "jq is not installed, and nothing below has been checked yet." >&2
+  echo "Install it (apt install jq / brew install jq / dnf install jq) and re-run." >&2
+  exit 127   # the shell's own code for "command not found" — this is about your box
+}
 SIGNER_URL=${SIGNER_URL:-https://signer-demo.usenami.io:8443}
 # Bind the answer to THIS request. Without a nonce an endpoint may hand you a
 # document it prepared earlier — including one measured on an image it no longer
@@ -755,6 +799,28 @@ Part 1 proves *what image is running*. This part proves *that image is what the
 published source builds to*. The enclave image (EIF) is built **deterministically**,
 so anyone can rebuild it from a given source revision and obtain the **same PCR0** —
 no Usenami credentials or access to our box required.
+
+🔴 **What it costs, before you spend an hour on it.** `nitro-cli` is Linux-only, so the
+full rebuild wants **a Linux host with Docker and AWS `nitro-cli`**, plus network egress
+for the pinned sources. An EC2 instance is the practical way to get one; an AWS
+**account is not itself required**, because `nitro-cli` computes the EIF measurement
+offline and no enclave has to run. This page used to send a reviewer on a laptop
+straight into that wall without saying so.
+
+**If you have no Linux host, the honest half-step is
+[`poc/scripts/enclave-closure-check.py`](../poc/scripts/enclave-closure-check.py) —
+Python standard library only, no Docker, no `nitro-cli`** (checked: its only imports are
+`argparse`, `re`, `subprocess`, `sys`, `pathlib`). It recomputes the enclave's dependency
+closure from `Cargo.lock` and compares it against the snapshot the published measurement
+was taken on, so a dependency bump that silently moved the PCR0 inputs comes out as a
+non-zero exit. It does **not** prove the measurement; it proves the inputs to it have not
+moved since the measurement was taken — which is the part that has actually broken on us
+before. Take it for exactly that and no more.
+
+And keep the arithmetic in view: this Part is the **only** source of an expected
+measurement that owes us nothing. §1.3's registry confirms a number you already have; it
+cannot tell you which number to expect. Without a Linux host you are left with our word
+plus a cross-check — better than nothing, and not the same as independent.
 
 ### What makes it deterministic
 

@@ -80,6 +80,18 @@ a failed build on your side.
   Docker build (the pins make WHAT is fetched deterministic).
 - The public source tree at the commit you are verifying.
 
+🔴 **An EC2 instance is the practical way to get that Linux host**, and an AWS **account
+is not itself required** for the measurement — `nitro-cli` computes it offline and no
+enclave has to run. Saying only "a Linux host with Docker and nitro-cli" sends a reviewer
+on a laptop into a wall without telling them what the wall is.
+
+**No Linux host? The honest half-step is
+[`../poc/scripts/enclave-closure-check.py`](../poc/scripts/enclave-closure-check.py) —
+Python standard library only, no Docker, no `nitro-cli`.** It recomputes the enclave's
+dependency closure from `Cargo.lock` and compares it to the snapshot the published
+measurement was taken on. It does not prove the measurement; it proves its inputs have
+not moved since. That is a smaller claim, and it is the true one.
+
 ## Build + capture PCR0
 
 ```bash

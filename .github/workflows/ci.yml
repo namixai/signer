@@ -76,6 +76,18 @@ jobs:
       # шлюза. Блок никто не запускал, поэтому он и уехал. Теперь тест ВЫНИМАЕТ его
       # из самой страницы и гоняет по 24 случаям (23 порчи и нетронутый). Копию рядом держать
       # нельзя: две копии расходятся, и расходится та, в которую не смотрят.
+      # 🔴 Рецепты, которые мы даём судье, проверяются ПОВЕДЕНИЕМ, а не текстом.
+      # До 12.09 блок сверки с реестром пользовался `jq`, нигде его не объявляя, и без
+      # него печатал «nonce not echoed — document not bound to this request»: нехватка
+      # инструмента у проверяющего читалась как обвинение НАС в повторе документа.
+      # Тест снимает jq из PATH и требует, чтобы рецепт назвал нехватку и не обмолвился
+      # про nonce. Обе копии рецепта — README и docs/ — они расходились раньше.
+      - name: Reviewer's shell recipes — a missing tool names itself, never blames us
+        run: |
+          # jq обязан быть на раннере: без него положительный контроль молча
+          # пропустится, а пропущенный сторож — это и есть та тишина, от которой он.
+          command -v jq >/dev/null 2>&1 || { echo "jq отсутствует на раннере — положительный контроль не выполнится" >&2; exit 1; }
+          python3 -m unittest scripts/test_judge_recipes.py
       - name: Reader's verifier — the AWS Nitro root the page tells them to pin
         run: |
           curl -fsSL -o /tmp/root.zip https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
