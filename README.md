@@ -324,7 +324,15 @@ Then ask your agent to place a small limit order. **Point the venue at testnet y
 
 For direct programmatic use, the TypeScript SDK is on npm — `npm i @usenami/signer` (see [`sdk/typescript`](./sdk/typescript)).
 
-Every signed call returns a **Verifiable Policy Proof** — a Nitro attestation receipt proving the enclave signed your specific request under your declared UPL policy.
+Every **order and cancel** — the whole money path, on both the allow and the refuse branch — returns a **Verifiable Policy Proof**: a Nitro attestation receipt proving the enclave decided on your specific request under your declared UPL policy. The generic `/sign`, `/sign/x402` and `/sign/permit2` routes carry one too, so the SDK's calls all have it.
+
+<!-- receipt-exceptions: post_sign_data post_cancel_all -->
+<!-- Machine-readable on purpose. poc/scripts/test_receipt_claim.py reads THIS line, not
+     the prose below it: a guard that greps English near the word "no" is guessing, and a
+     guessing guard passes when it should not. Keep the two in step — the prose is for the
+     reader, this line is what CI checks. -->
+
+🔴 **Two exceptions, named rather than left for you to discover.** `/sign/data` (attested data signing) issues **no** receipt at all, and `/cancel-all` issues one on a refusal but not on success. This line used to read "every signed call", which was wider than the mechanism — `/sign/data` is a signed call. Verified by walking the handlers: the receipt comes from `take_receipt`, reached directly or through `sign_structured_request`, and those two routes reach neither.
 
 ---
 
@@ -454,7 +462,7 @@ A value printed in a README goes stale silently; the one this repository publish
 
 Shipped:
 - **UPL** (Usenami Policy Layer) — JSON policy validated in-enclave on every sign request, including order-size and transfer-recipient enforcement (live)
-- **Verifiable Policy Proof** — Nitro attestation receipt per signed request (live)
+- **Verifiable Policy Proof** — Nitro attestation receipt on every order and cancel decision, allow or refuse, plus the generic `/sign`, `/sign/x402` and `/sign/permit2` routes (live). Not on `/sign/data`, and not on a successful `/cancel-all` — see the exceptions named above.
 - **On-chain attestation registry** on Base — removes the trust-Usenami-website assumption (live)
 - **MCP server** (`@usenami/signer-mcp`) + **Eliza plugin** — sign from any MCP-aware AI agent (shipped)
 
