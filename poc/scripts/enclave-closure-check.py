@@ -154,8 +154,14 @@ def check_header_names_every_tag(header: list[str], root: Path) -> tuple[int, li
     if not tags:
         return 2, ["в клоне нет ни одного тега pcr0-* — вероятно, checkout без fetch-depth: 0; "
                    "проверка НЕ ВЫПОЛНЕНА, это не «сошлось»"]
+    # 🔴 ИМЯ ЦЕЛИКОМ, не подстрокой. Поиск куска давал совпадение по частичному
+    # имени: `pcr0-fbaad62` «нашёлся» бы внутри `pcr0-fbaad62f`, а короткий тег
+    # вроде `pcr0-abc` совпал бы с любым местом, где встретится `abc`. Сторож,
+    # способный сказать «сходится» на неполном совпадении, — ровно тот дефект,
+    # ради которого он и живёт. Границы слова: имя тега не должно оказаться
+    # приклеенным к соседним знакам.
     blob = "\n".join(header)
-    missing = [t for t in tags if t.split("pcr0-", 1)[1] not in blob]
+    missing = [t for t in tags if not re.search(rf"(?<![0-9A-Za-z-]){re.escape(t)}(?![0-9A-Za-z-])", blob)]
     return (1, missing) if missing else (0, [])
 
 
@@ -189,8 +195,24 @@ def run(lock: Path, snapshot: Path, write: bool) -> int:
     if not args.snapshot.exists():
         raise OSError(f"snapshot {args.snapshot} missing")
     header, expected = read_snapshot(args.snapshot)
+    # Проверка тегов относится к снимку РЕПОЗИТОРИЯ. Самотест скрипта гоняет его
+    # на временных файлах без заголовка (`--write` во временный каталог), и
+    # требовать от них знания тегов бессмысленно: они не документ, а фикстура.
+    # Я это уже сломал однажды — новый гейт уронил самотест, который проверяет
+    # сам гейт.
     if current == expected:
-        rc, missing = check_header_names_every_tag(header, ROOT.parent)
+        # Проверка тегов относится к снимку РЕПОЗИТОРИЯ. Самотест гоняет скрипт на
+        # временных файлах без заголовка — они фикстура, а не документ, и требовать
+        # от них знания тегов бессмысленно.
+        #
+        # 🔴 Условие СТОИТ ЗДЕСЬ, а не в строке выше. Сначала я приписал его к
+        # `current == expected` через `and` — и на нештатном снимке управление
+        # уходило в ветку «замыкание изменилось», то есть скрипт врал о причине
+        # отказа. Совпадение замыкания и происхождение снимка — два разных вопроса,
+        # и склеивать их в одно условие нельзя.
+        rc, missing = (0, [])
+        if snapshot.resolve() == SNAPSHOT.resolve():
+            rc, missing = check_header_names_every_tag(header, ROOT.parent)
         if rc == 1:
             print("enclave-closure-check: FAIL — снимок не называет измерение, для которого есть тег.")
             print("  Замыкание совпадает, и это ЧЕСТНО: разные образы делят одно замыкание.")
