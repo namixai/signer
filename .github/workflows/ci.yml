@@ -87,8 +87,11 @@ jobs:
         env:
           NITRO_ROOT_PEM: /tmp/root.pem
         run: |
+          # 🔴 pyhanko-certvalidator, НЕ certvalidator: у того зависимость oscrypto
+          # падает при импорте на OpenSSL 3.x, то есть на этом самом раннере. Ровно
+          # это здесь и всплыло, когда блок впервые начали запускать.
           python3 -m pip install --quiet --disable-pip-version-check \
-            cbor2 certvalidator cryptography requests
+            cbor2 pyhanko-certvalidator asn1crypto cryptography requests
           python3 -m unittest scripts/test_verify_doc_block.py
       - name: Build (locked)
         run: cargo build --workspace --locked

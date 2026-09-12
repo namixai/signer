@@ -60,7 +60,7 @@ Dependency-light (`cbor2` + `cryptography` + `requests`) so you can run it in a
 clean venv.
 
 ```bash
-python3 -m venv v && . v/bin/activate && pip install cbor2 cryptography certvalidator requests
+python3 -m venv v && . v/bin/activate && pip install cbor2 cryptography pyhanko-certvalidator asn1crypto requests
 
 # AWS Nitro Enclaves root — download it, then PIN its hash.
 #
@@ -85,15 +85,27 @@ if command -v sha256sum >/dev/null 2>&1; then sha256sum root.pem; else shasum -a
 ```
 
 This verifier was run against the live demo endpoint as written. Certificate-path
-validation uses **`certvalidator`** (RFC 5280 path validation — issuer/subject
+validation uses **`pyhanko-certvalidator`** (RFC 5280 path validation — issuer/subject
 binding, basic constraints, path length, critical extensions, validity), anchored to
 the **pinned** AWS Nitro root: we do **not** hand-roll chain building.
+
+🔴 The fork, not the original `certvalidator`: that one pulls in `oscrypto`, which
+detects the libcrypto version by parsing a string and **raises at import on OpenSSL 3.x**
+(`LibraryNotFoundError: Error detecting the version of libcrypto`). On a current Ubuntu
+the block below never reached its first check. It worked on macOS, where `oscrypto` uses
+Security.framework instead — exactly the case where "it runs here" means "it does not run
+for you". Found by CI, once the block was finally being run.
+
+`cryptography`'s own `x509.verification` was the obvious alternative and does not fit:
+it requires an `authorityKeyIdentifier` on the leaf, which AWS's attestation certificates
+do not carry. Relaxing a path validator's policy to make our own chain pass is not a
+trade we will make on this page.
 
 ```python
 #!/usr/bin/env python3
 # Reference verifier — trusts no Usenami code. Security checks RAISE explicitly
 # (never `assert`; `python -O` strips asserts). The cert path is validated by
-# certvalidator, anchored to the PINNED root and as-of the attestation timestamp
+# pyhanko-certvalidator, anchored to the PINNED root and as-of the attestation timestamp
 # (the leaf certs are short-lived); COSE ES384 / PCR0 / nonce are checked explicitly.
 #
 # 🔴 EVERY refusal is NAMED, and that is a fix, not a flourish. An earlier revision of
@@ -104,11 +116,20 @@ the **pinned** AWS Nitro root: we do **not** hand-roll chain building.
 # certificate when the truth is a broken document. A reader cannot tell an attack from a
 # crashed gateway that way. The published npm verifier (@usenami/signer-mcp) returned a
 # named refusal for all twenty; this one now reports the same way, with the same words.
-import base64, hashlib, os, re, sys, datetime, requests, cbor2
+import asyncio, base64, hashlib, os, re, sys, datetime, requests, cbor2
+from asn1crypto import pem as asn1_pem, x509 as asn1_x509
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives import hashes
-from certvalidator import CertificateValidator, ValidationContext
+# 🔴 pyhanko-certvalidator, НЕ certvalidator. Тот тянет oscrypto, который определяет
+# версию libcrypto разбором строки и НА OPENSSL 3.x ПАДАЕТ ПРИ ИМПОРТЕ
+# (`LibraryNotFoundError: Error detecting the version of libcrypto`). То есть на обычной
+# современной Ubuntu этот блок не доходил до первой проверки вообще. На маке он работал,
+# потому что oscrypto берёт там Security.framework, — ровно тот случай, когда «у меня
+# запускается» означает «у судьи нет». Поймано CI после того, как блок впервые начали
+# запускать. Форк поддерживается и считает подписи через `cryptography`, без oscrypto;
+# API (CertificateValidator / ValidationContext / validate_usage) тот же.
+from pyhanko_certvalidator import CertificateValidator, ValidationContext
 
 # The AWS Nitro root you confirmed OUT-OF-BAND in the bash block above. Keeping it here
 # as a default (rather than only in a variable) is what makes this script runnable as
@@ -139,6 +160,13 @@ def _fail(v, why, *, unreadable=False):
 
 def _as_bytes(x):
     return x if isinstance(x, (bytes, bytearray)) else None
+
+def _asn1_cert(b):
+    """DER or PEM bytes -> the asn1crypto object the path validator takes."""
+    b = bytes(b)
+    if asn1_pem.detect(b):
+        _, _, b = asn1_pem.unarmor(b)
+    return asn1_x509.Certificate.load(b)
 
 def verify_document(body, nonce_sent, expected_pcr0, root_pem, *, no_store=True):
     """Verify one attestation response. Returns a verdict dict; raises nothing.
@@ -266,16 +294,23 @@ def verify_document(body, nonce_sent, expected_pcr0, root_pem, *, no_store=True)
         v["module_id"] = doc["module_id"]
 
     # 3) FULL RFC 5280 path validation, anchored to the PINNED root, as-of the attestation
-    #    time. certvalidator builds and validates the path itself, so cabundle ordering,
+    #    time. The library builds and validates the path itself, so cabundle ordering,
     #    DN chaining, CA/basic-constraints, path length and critical extensions are all
     #    handled — nothing hand-rolled. `except Exception` on purpose: asn1crypto raises
-    #    ValueError from underneath certvalidator's own error types, and an uncaught one
-    #    is exactly the traceback this rewrite exists to remove.
+    #    ValueError from underneath the library's own error types, and an uncaught one is
+    #    exactly the traceback this rewrite exists to remove.
+    #
+    #    Only the PINNED root goes into trust_roots. The cabundle travels inside the
+    #    document, so trusting anything from it would let a forged chain vouch for itself.
     moment = datetime.datetime.fromtimestamp(ts / 1000, datetime.timezone.utc)
     try:
-        vc = ValidationContext(trust_roots=[root_pem], allow_fetching=False, moment=moment)
-        CertificateValidator(leaf_der, intermediate_certs=list(bundle),
-                             validation_context=vc).validate_usage(set())
+        vc = ValidationContext(trust_roots=[_asn1_cert(root_pem)],
+                               allow_fetching=False, moment=moment)
+        validator = CertificateValidator(
+            _asn1_cert(leaf_der),
+            intermediate_certs=[_asn1_cert(c) for c in bundle],
+            validation_context=vc)
+        asyncio.run(validator.async_validate_usage(set()))
         v["checks"]["chain_verified"] = True
     except Exception as e:
         return _fail(v, f"the certificate chain does not validate to the pinned AWS Nitro "

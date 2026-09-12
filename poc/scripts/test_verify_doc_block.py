@@ -27,7 +27,7 @@ only prove our own assumptions. It is a signed, public document — /attestation
 public endpoint — and carries no secret. Its certificate chain is validated as-of the
 timestamp inside it, so this test does not rot when those short-lived certs expire.
 
-Needs: cbor2, cryptography, certvalidator, requests (the same packages the documented
+Needs: cbor2, cryptography, pyhanko-certvalidator, asn1crypto, requests (the same packages the documented
 block tells the reader to install). They are installed in CI immediately before this
 step. If they are missing this test FAILS rather than skipping — a skipped guard is the
 silence it exists to prevent.
