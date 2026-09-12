@@ -7,11 +7,31 @@
 #   closure commit : 96cd4e468d2e094271d6633e95e9d552001c7860 (2026-08-23, merge of #55); the SAME
 #                    closure is what tag pcr0-60036cd3 (commit 3bf4f62c, 2026-09-02) compiles — the
 #                    lockfile changed between them, the enclave's transitive closure did not.
-#   strict PCR0s   : 103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
+#   strict PCR0s   : fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f
+#                    (tag pcr0-fbaad62f, commit 865f4182, 2026-09-10; SIGNER_REQUIRE_POLICY=1;
+#                    measured from TWO separate clean anonymous clones, the second gated by
+#                    scripts/reproducibility-from-public-clone.sh, verdict REPRODUCIBLE)
+#                    103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
 #                    (tag pcr0-103ccd79; SIGNER_REQUIRE_POLICY=1; measured 2026-08-23 and 2026-08-26)
 #                    60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71
 #                    (tag pcr0-60036cd3; SIGNER_REQUIRE_POLICY=1; measured 2026-09-02 by
 #                    scripts/reproducibility-from-public-clone.sh from a clean public clone)
+#
+#                    🔴 ALL THREE COMPILE FROM THIS SAME CLOSURE. Verified 2026-09-12 by running
+#                    this very check inside a clean anonymous clone at tag pcr0-fbaad62f: 134
+#                    crates, closure matches. Rotation R2 added the Permit2 PermitSingle action
+#                    and pulled in NO new dependency — which is why the measurement changed and
+#                    this file did not. A matching closure is therefore NOT evidence that a given
+#                    image is the one running: several images share it.
+#
+#   what this file  : the transitive dependency closure, and nothing else. It goes red when a
+#   does NOT watch   crate enters or leaves the enclave build — that is real and that is its job.
+#                    It CANNOT go red because production moved to an image nobody recorded here:
+#                    the header above is maintained BY HAND and has been stale twice already.
+#                    Whether the running boxes agree with each other and with the on-chain
+#                    registry is a different question, watched by a different guard:
+#                    _hub/scripts/three-source-drift.py in the platform repo (production, demo,
+#                    chain — one number, divergence goes red).
 #   measured on    : x86_64 EC2 build host, nitro-cli 1.4.4, env -i, clean anonymous clone at the tag
 #   production     : NOT NAMED HERE. Twice this line called a value "production" and twice it went
 #                    stale (2026-08-24..26 said the cutover was in progress after it had finished;

@@ -62,10 +62,18 @@ clean venv.
 ```bash
 python3 -m venv v && . v/bin/activate && pip install cbor2 cryptography certvalidator requests
 
-# AWS Nitro Enclaves root — download it, then PIN its hash. The value at the time of
-# writing is:
-#   6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0
-# Confirm that hash OUT-OF-BAND (AWS documentation / a second channel) — do not trust
+# AWS Nitro Enclaves root — download it, then PIN its hash.
+#
+# 🔴 ENCODING MATTERS, and two of our own documents pin DIFFERENT numbers for the same
+# certificate because of it. Both are correct; they hash different encodings of it:
+#   6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0  sha256 of root.pem
+#                                                                    (the PEM FILE as shipped)
+#   641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c68f79bb5b  sha256 of the DER
+#                                                                    (openssl x509 -outform DER)
+# Re-measured 2026-09-12 from a fresh download. The command below hashes the PEM file, so
+# it is the first value you should expect.
+#
+# Confirm the hash OUT-OF-BAND (AWS documentation / a second channel) — do not trust
 # the download, or this doc, blindly.
 curl -sO https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
 unzip -o AWS_NitroEnclaves_Root-G1.zip     # → root.pem
@@ -117,9 +125,13 @@ def check(cond, msg):
 #   3. The measurement table in the README: commit -> flag -> value, and when each
 #      was deployed.
 #
-# Whichever you pick, the enclaves are SEPARATE and their measurements differ. The
-# demo box and the mainnet box have not run the same image since 2026-08-24. Check
-# WHICH one you queried before concluding anything.
+# Whichever you pick, the enclaves are SEPARATE BOXES on independent rotation
+# schedules. Whether they run the same image is a state with a date on it, not a
+# property: they were apart from 2026-08-24 to 2026-08-27, apart again from
+# 2026-09-03, and apart for one day from 2026-09-10 until the demo box followed on
+# 2026-09-11. Since 2026-09-11 both attest the SAME measurement — which is exactly
+# why you must still check WHICH box you queried: a number that matches today can
+# match for the wrong reason tomorrow.
 #
 # `.strip()` before `.lower()`: a value pasted from a terminal or a CI variable
 # routinely carries a trailing newline, and an invisible character is the worst
@@ -273,7 +285,9 @@ carried a default, which is how it drifted: between 2026-08-10 and 2026-08-24 th
 lanes did run the same image, the file said so, and then rotation #4 moved production
 onto `103ccd79…` while the default kept naming the old value.
 
-The lanes diverged on 2026-08-24. This file no longer averages over that, and it no
+The lanes have diverged and re-converged three times (2026-08-24, 2026-09-03,
+2026-09-10); since 2026-09-11 they agree again. This file no longer averages over
+that, and it no
 longer prints for the demo box a number that a rotation can retire behind its back — it
 names the source instead:
 
