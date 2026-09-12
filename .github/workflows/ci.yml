@@ -44,6 +44,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false # don't leave the token in .git/config for build steps
+          # 🔴 Теги нужны enclave-closure-check: он сверяет, что заголовок снимка
+          # называет КАЖДОЕ измерение, для которого заведён тег pcr0-*. Без тегов
+          # проверка возвращает 2 — «не выполнена», а не «сошлось»: отсутствие не
+          # должно голосовать за успех. Поверхностный клон остаётся, тянутся только
+          # ссылки на теги.
+          fetch-tags: true
       # rustup is preinstalled on ubuntu runners and honours poc/rust-toolchain.toml
       # (channel 1.95.0 + clippy/rustfmt components + the musl target). No toolchain
       # action needed — one fewer third-party dependency to trust.
