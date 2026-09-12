@@ -411,17 +411,25 @@ succeeds:
 
 ```bash
 nitro-cli describe-eif --eif-path signer.eif | jq -r '.Measurements.PCR0'
-# Compare the output to the LIVE /attestation document, not to a number printed
-# in this file and not to the on-chain registry entry — both can lag the running
-# enclave, and as of 2026-08-06 the registry entry does (see Step 4).
-# Expected for the strict build at commit 96cd4e46, which WAS the MAINNET/PRODUCTION
-# enclave from 2026-08-24 to 2026-09-03; production moved to tag pcr0-60036cd3 on
-# 2026-09-03, so read the current one from the registry and that box's /attestation:
-#   103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3
-# The demo endpoint is a SEPARATE box that rotates on its own schedule: it ran the
-# pre-rotation image from 2026-08-24 until 2026-08-27. One number stopped covering both
-# boxes on 2026-08-24, covered both again from 2026-08-27, and stopped once more on
-# 2026-09-03 when production rotated and the demo box did not. Never assume one covers both.
+# Compare the output to the LIVE /attestation document of the box you are checking.
+# Not to a number printed in this file, and not to the on-chain registry entry — both
+# can lag the running enclave.
+#
+# 🔴 NO MEASUREMENT IS PRINTED HERE, and that is the fix rather than an omission. This
+# comment used to end with a 96-hex value, and readers took the printed number because
+# it was printed — the paragraph's own advice lost to it. The value named here went
+# stale on 2026-09-11, when the demo box rotated away from it, and then this file said
+# one thing while the demo box's attestation said another: exactly the contradiction an
+# outside reviewer is entitled to hold against us.
+#
+# Which commit rebuilds which measurement is kept in ONE maintained place — the table in
+# docs/REPRODUCIBLE-BUILD.md, "Which commit rebuilds which measurement". It is keyed by
+# tag, dated, and does not claim any lane is currently running anything.
+#
+# The demo endpoint is a SEPARATE box on its own rotation schedule. One number has stopped
+# covering both boxes three times now: on 2026-08-24, on 2026-09-03, and for one day from
+# 2026-09-10 until the demo box followed on 2026-09-11. Never assume one covers both —
+# build the commit you mean to check and compare against that box's own /attestation.
 # Build the commit you mean to check, and compare against that box's own /attestation.
 ```
 
