@@ -152,6 +152,11 @@ class Tamper:
             ("15 pcr0_short", doc(p(lambda d: d["pcrs"].__setitem__(0, b"\xbb" * 16))), self.nonce, "application/json", 1),
             ("16 nonce_cut", doc(p(lambda d: d.pop("nonce"))), self.nonce, "application/json", 1),
             ("17 timestamp_cut", doc(p(lambda d: d.pop("timestamp"))), self.nonce, "application/json", 1),
+            # 🔴 Вырезать поле и подставить в него абсурд — РАЗНЫЕ порчи, и второй не было.
+            # `fromtimestamp` бросает OverflowError/ValueError на таком значении, мимо всего,
+            # что можно назвать. Найдено ревью CodeRabbit на #97; дыра была в этом наборе.
+            ("17b timestamp_huge", doc(p(lambda d: d.__setitem__("timestamp", 2 ** 64))), self.nonce, "application/json", 1),
+            ("17c timestamp_absurd", doc(p(lambda d: d.__setitem__("timestamp", 10 ** 30))), self.nonce, "application/json", 1),
             # ── replay: a genuine document answering a nonce we never sent ─────────
             ("18 replay_wrong_nonce", doc(self.good_b64), "00" * 16, "application/json", 1),
             # ── never got a document at all: code 2, and it must NOT read as an attack
@@ -162,25 +167,27 @@ class Tamper:
         return out
 
 
-def _response(body, ctype):
+def _response(body, ctype, cache_control="no-store"):
     """A real requests.Response, so r.json() raises exactly what requests raises."""
     r = requests.Response()
     r.status_code = 200
     r._content = body.encode() if isinstance(body, str) else json.dumps(body).encode()
     r.headers["content-type"] = ctype
-    r.headers["cache-control"] = "no-store"
+    if cache_control is not None:
+        r.headers["cache-control"] = cache_control
     r.url = "https://signer-demo.usenami.io:8443/attestation"
     return r
 
 
-def run_block(source: str, body, nonce: str, ctype: str, expected_pcr0: str):
+def run_block(source: str, body, nonce: str, ctype: str, expected_pcr0: str,
+              cache_control: str = "no-store"):
     """Execute the documented block with the network stubbed.
 
     Returns (exit_code, output, traceback_or_None). A traceback here is the defect this
     whole file exists to catch, so it is returned rather than raised.
     """
     real_get, real_urandom = requests.get, os.urandom
-    requests.get = lambda *a, **k: _response(body, ctype)
+    requests.get = lambda *a, **k: _response(body, ctype, cache_control)
     # The block draws its nonce from os.urandom; pin it so the replay case is a real
     # mismatch between what we asked for and what the document echoes.
     os.urandom = lambda n: bytes.fromhex(nonce)[:n]
@@ -221,7 +228,7 @@ class VerifierBlockTest(unittest.TestCase):
         cls.source = extract_block(DOC.read_text(encoding="utf-8"))
         cls.live = json.loads(FIXTURE.read_text(encoding="utf-8"))
         cls.cases = Tamper(cls.live).cases()
-        assert len(cls.cases) == 22, f"expected 22 cases, built {len(cls.cases)}"
+        assert len(cls.cases) == 24, f"expected 24 cases, built {len(cls.cases)}"
 
     def test_untouched_document_verifies(self):
         """A verifier that refuses everything would pass every other test in this file."""
@@ -249,6 +256,30 @@ class VerifierBlockTest(unittest.TestCase):
                 self.assertRegex(
                     out, r"VERIFICATION FAILED|COULD NOT VERIFY",
                     f"{name}: refused without a verdict line\n{out}")
+
+    def test_cache_control_is_parsed_as_a_directive_list(self):
+        """🔴 `Cache-Control` is a LIST (RFC 9111), and it used to be compared as a string.
+
+        `no-store, no-cache` from a proxy meant VERIFICATION FAILED — the script told the
+        reader to treat a header formatting difference as tampering. Our endpoint sends
+        exactly `no-store`, which is why it never fired here; the reader behind a
+        corporate proxy is the one who would have hit it. Found by CodeRabbit on #97.
+        """
+        _name, body, nonce, ctype, _ = self.cases[0]     # the genuine document
+        for header in ["no-store", "no-store, no-cache", "private, no-store",
+                       "No-Store", "max-age=0, no-store"]:
+            with self.subTest(accepted=header):
+                code, out, tb = run_block(self.source, body, nonce, ctype,
+                                          self.live["pcr0_sha384"], cache_control=header)
+                self.assertIsNone(tb, f"{header}: raised\n{tb}")
+                self.assertEqual(code, 0, f"{header!r} contains no-store and must pass\n{out}")
+        # ...and a header that really lacks it still fails, or the check is decoration.
+        for header in ["public", "max-age=600", None]:
+            with self.subTest(refused=header):
+                code, out, tb = run_block(self.source, body, nonce, ctype,
+                                          self.live["pcr0_sha384"], cache_control=header)
+                self.assertIsNone(tb, f"{header}: raised\n{tb}")
+                self.assertEqual(code, 1, f"{header!r} has no no-store and must fail\n{out}")
 
     def test_could_not_check_is_not_reported_as_tampering(self):
         """Code 2 exists so silence never passes for proof, and never for an attack."""

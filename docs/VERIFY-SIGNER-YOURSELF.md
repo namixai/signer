@@ -135,6 +135,12 @@ from pyhanko_certvalidator import CertificateValidator, ValidationContext
 # as a default (rather than only in a variable) is what makes this script runnable as
 # published; supply NITRO_ROOT_SHA256 to hold it to a value YOU sourced. This is the
 # sha256 of the PEM file as AWS ships it inside AWS_NitroEnclaves_Root-G1.zip.
+# Год 9999 в миллисекундах. Платформы расходятся в том, что именно бросит
+# `fromtimestamp` (OverflowError на одной, ValueError на другой), поэтому граница задана
+# здесь, а само преобразование ниже всё равно обёрнуто: своя граница даёт понятное
+# сообщение, обёртка гарантирует свойство на любой платформе.
+MAX_TIMESTAMP_MS = 253402300799000
+
 ROOT_SHA256 = os.environ.get(
     "NITRO_ROOT_SHA256",
     "6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0",
@@ -157,6 +163,22 @@ def _fail(v, why, *, unreadable=False):
     v["reason"] = why
     v["unreadable"] = unreadable
     return v
+
+def has_no_store(header_value):
+    """`Cache-Control` is a LIST of directives (RFC 9111), not a string to compare.
+
+    🔴 Was `== "no-store"`. Anything a proxy or CDN adds — `no-store, no-cache`,
+    `private, no-store` — or a different casing turned a perfectly good response into
+    VERIFICATION FAILED, i.e. told the reader "treat this as tampering" about a header
+    formatting difference. Found by CodeRabbit review on #97. Our endpoint sends exactly
+    `no-store` today, which is why strict equality had never fired; the reader behind a
+    corporate proxy is the one who would have hit it.
+    """
+    if not isinstance(header_value, str):
+        return False
+    parts = (d for chunk in header_value.split(",") for d in chunk.split(";"))
+    return any(d.strip().lower().split("=")[0] == "no-store" for d in parts)
+
 
 def _as_bytes(x):
     return x if isinstance(x, (bytes, bytearray)) else None
@@ -249,8 +271,14 @@ def verify_document(body, nonce_sent, expected_pcr0, root_pem, *, no_store=True)
     # 🔴 Every field is checked for PRESENCE AND TYPE before it is used. This is the
     # KeyError class: a document with `cabundle` cut out used to die three frames down
     # with the key name and nothing else — no verdict, no indication it was an attack.
+    # 🔴 ОГРАНИЧЕН, А НЕ ПРОСТО ПОЛОЖИТЕЛЕН. `fromtimestamp` бросает OverflowError или
+    # ValueError на абсурдном значении, и этот бросок не назовёшь ничем. Найдено ревью
+    # CodeRabbit на #97 и подтверждено замером: timestamp = 2**64 давал
+    # `ValueError: year must be in 1..9999`, 10**30 — `OverflowError: timestamp out of
+    # range for platform time_t`. Мой собственный набор порчи вырезал это поле, но не
+    # подставлял в него абсурд — дыра была в проверке, а не только в коде.
     ts = doc.get("timestamp")
-    if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
+    if not isinstance(ts, int) or isinstance(ts, bool) or not 0 < ts <= MAX_TIMESTAMP_MS:
         return _fail(v, "the document has no usable `timestamp` (needed to validate the "
                        f"short-lived certificates as-of signing time): {ts!r}")
     leaf_der = _as_bytes(doc.get("certificate"))
@@ -302,7 +330,11 @@ def verify_document(body, nonce_sent, expected_pcr0, root_pem, *, no_store=True)
     #
     #    Only the PINNED root goes into trust_roots. The cabundle travels inside the
     #    document, so trusting anything from it would let a forged chain vouch for itself.
-    moment = datetime.datetime.fromtimestamp(ts / 1000, datetime.timezone.utc)
+    try:
+        moment = datetime.datetime.fromtimestamp(ts / 1000, datetime.timezone.utc)
+    except (OverflowError, ValueError, OSError) as e:
+        return _fail(v, f"the document's `timestamp` ({ts}) is not a representable date "
+                        f"({type(e).__name__}) — the signed bytes are damaged or forged")
     try:
         vc = ValidationContext(trust_roots=[_asn1_cert(root_pem)],
                                allow_fetching=False, moment=moment)
@@ -475,7 +507,7 @@ def main():
         return 2
 
     v = verify_document(body, nonce, expected_pcr0, root_pem,
-                        no_store=(r.headers.get("cache-control") == "no-store"))
+                        no_store=has_no_store(r.headers.get("cache-control")))
     return report(v)
 
 
