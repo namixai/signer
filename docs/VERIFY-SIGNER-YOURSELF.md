@@ -557,12 +557,12 @@ how a verifier starts lying: fold it into `0` and silence passes for proof, fold
 `1` and every flaky network reads as an attack.
 
 This is measured, not asserted. An earlier revision of the script promised the same
-sentence and delivered a Python traceback for 16 of 22 corrupted documents — including
-seven that printed `cryptography.exceptions.InvalidSignature` with no message at all, and
+sentence and delivered a Python traceback for 18 of the 24 documents below — including
+six that printed `cryptography.exceptions.InvalidSignature` with no message at all, and
 one where a flipped bit in the body printed an error about parsing a certificate, which
 reads like a broken gateway rather than a tampered document. The set that found it is in
 [`poc/scripts/test_verify_doc_block.py`](../poc/scripts/test_verify_doc_block.py): it
-extracts this very code block from this very file, runs all 22 against it, and fails CI
+extracts this very code block from this very file, runs all 24 against it, and fails CI
 if any of them reaches a traceback or if the untouched document stops verifying. Run it
 yourself — you do not have to take the claim on our word, which is the point of the whole
 page.

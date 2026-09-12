@@ -3,15 +3,15 @@
 
 `docs/VERIFY-SIGNER-YOURSELF.md` tells an outside reviewer to paste a Python block and
 run it, and promises "any tampering fails loudly". Nothing ran that block. It drifted:
-measured 2026-09-12 against 22 corrupted documents, it produced a Python TRACEBACK for
-16 of them — seven of those `cryptography.exceptions.InvalidSignature` with no message
-at all, and one where a single flipped bit in the body printed an error about parsing a
+measured 2026-09-12 against the 23 corrupted documents below, it produced a Python
+TRACEBACK for 18 of the 24 — six of those `cryptography.exceptions.InvalidSignature`
+with no message at all, and one where a single flipped bit in the body printed an error about parsing a
 certificate. A reviewer cannot tell an attack from a crashed gateway that way, and a
 promise nobody runs is a claim nobody checks.
 
 So this test runs the block itself. It EXTRACTS the code out of the markdown — not a
 copy kept alongside it, because two copies drift and the one that drifts is the one
-nobody looks at — and drives it against the real attestation document plus 21 ways of
+nobody looks at — and drives it against the real attestation document plus 23 ways of
 breaking it.
 
 What fails this test:

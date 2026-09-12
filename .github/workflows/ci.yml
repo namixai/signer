@@ -71,10 +71,10 @@ jobs:
       - name: Vendored kmstool stdin parser (fail-closed cases)
         run: python3 scripts/test_secrets_stdin.py
       # 🔴 Гейт на код, который мы предлагаем СУДЬЕ. docs/VERIFY-SIGNER-YOURSELF.md
-      # обещает «any tampering fails loudly», и до 12.09 этот блок на 16 испорченных
-      # документах из 22 выдавал питоновский трейсбек — читатель не отличил бы атаку
-      # от упавшего шлюза. Блок никто не запускал, поэтому он и уехал. Теперь тест
-      # ВЫНИМАЕТ его из самой страницы и гоняет по 22 случаям. Копию рядом держать
+      # обещает «any tampering fails loudly», и до 12.09 этот блок выдавал питоновский
+      # трейсбек на 18 документах из 24 — читатель не отличил бы атаку от упавшего
+      # шлюза. Блок никто не запускал, поэтому он и уехал. Теперь тест ВЫНИМАЕТ его
+      # из самой страницы и гоняет по 24 случаям (23 порчи и нетронутый). Копию рядом держать
       # нельзя: две копии расходятся, и расходится та, в которую не смотрят.
       - name: Reader's verifier — the AWS Nitro root the page tells them to pin
         run: |
@@ -83,7 +83,7 @@ jobs:
           # Тот же пин, что в блоке. Расхождение здесь значит, что AWS сменила файл,
           # и тогда падать должна СБОРКА, а не тихо проверяться неизвестно что.
           echo "6eb9688305e4bbca67f44b59c29a0661ae930f09b5945b5d1d9ae01125c8d6c0  /tmp/root.pem" | sha256sum -c -
-      - name: Reader's verifier — 22 tampered documents, every refusal named
+      - name: Reader's verifier — 23 tampered documents, every refusal named
         env:
           NITRO_ROOT_PEM: /tmp/root.pem
         run: |
