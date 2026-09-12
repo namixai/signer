@@ -44,12 +44,19 @@ FAKE_RPC = ('{"jsonrpc":"2.0","result":"0x' + "0" * 63 + "1"
 
 
 def extract_recipe(rel_path: str, anchor: str) -> str:
-    """Pull the registry-check bash block out of the page. Ambiguity is a failure."""
+    """Pull the registry-check bash block out of the page. Ambiguity is a failure.
+
+    The anchor is matched as a HEADING at the start of a line, not as a substring: the
+    same text appears inside links and prose earlier in both pages, and `text.index`
+    would have latched onto the first of those and extracted a different block — a guard
+    pointed at the wrong code, which is worse than no guard. Raised by review on #98.
+    """
     text = (ROOT / rel_path).read_text(encoding="utf-8")
-    if anchor not in text:
-        raise AssertionError(f"{rel_path}: anchor {anchor!r} is gone — the recipe moved "
+    heading = re.search(rf"^{re.escape(anchor)}\b.*$", text, re.M)
+    if not heading:
+        raise AssertionError(f"{rel_path}: heading {anchor!r} is gone — the recipe moved "
                              f"and this guard is pointed at nothing")
-    block = re.search(r"```bash\n(.*?)\n```", text[text.index(anchor):], re.S)
+    block = re.search(r"```bash\n(.*?)\n```", text[heading.start():], re.S)
     if not block:
         raise AssertionError(f"{rel_path}: no bash block after {anchor!r}")
     return block.group(1)
@@ -60,7 +67,7 @@ def sandbox_bin(tmp: Path, *, with_jq: bool, with_curl_stub: bool) -> Path:
     d = tmp / "bin"
     d.mkdir()
     needed = ["sh", "bash", "od", "tr", "sed", "grep", "cat", "cut", "head", "tail",
-              "env", "printf", "awk", "expr", "cast"]
+              "env", "printf", "awk", "expr"]
     if with_jq:
         needed.append("jq")
     if not with_curl_stub:
@@ -85,6 +92,21 @@ def sandbox_bin(tmp: Path, *, with_jq: bool, with_curl_stub: bool) -> Path:
             f"printf '%s' '{FAKE_RPC}'\n"
         )
         (d / "curl").chmod(0o755)
+        # 🔴 `cast` заглушается ПРАВДОПОДОБНЫМ ответом, а не пустым нулём. Заглушка,
+        # которая просто выходит с 0, превратила бы «рецепт успешен» в утверждение про
+        # путь, который не выполнялся: половина с `cast` печатает разобранные значения,
+        # и если заглушка молчит, успех означает только «шелл дошёл до конца». Отмечено
+        # на ревью #98, и это верно — поэтому здесь настоящая форма вывода `cast call`
+        # для сигнатуры (bool,address).
+        (d / "cast").write_text(
+            "#!/bin/sh\n"
+            "printf 'true\\n0x21538eBF6598e5866BA496A954dE8E39097bFB59\\n'\n"
+        )
+        (d / "cast").chmod(0o755)
+    else:
+        real_cast = shutil.which("cast")
+        if real_cast:
+            (d / "cast").symlink_to(real_cast)
     return d
 
 
@@ -112,7 +134,15 @@ class JudgeRecipeTest(unittest.TestCase):
                     tmp = Path(td)
                     code, out = run_recipe(recipe, sandbox_bin(tmp, with_jq=False,
                                                                with_curl_stub=True), tmp)
-                self.assertNotEqual(code, 0, f"{rel}: succeeded without jq\n{out}")
+                # Ровно 127, а не «любой ненулевой». Рецепт документирует именно его —
+                # тот же код, которым шелл сам говорит «command not found». Приняв любое
+                # ненулевое, мы читали бы «упало не так, как обещано» как «упало
+                # правильно»: падение по совершенно другой причине прошло бы проверку.
+                self.assertEqual(
+                    code, 127,
+                    f"{rel}: exited {code}, but the recipe documents 127 — the shell's own "
+                    f"code for a missing command. A different code means it failed for a "
+                    f"different reason and this test would have accepted it\n{out}")
                 self.assertRegex(out, r"jq",
                                  f"{rel}: refused without naming jq\n{out}")
 
@@ -144,11 +174,27 @@ class JudgeRecipeTest(unittest.TestCase):
                     tmp = Path(td)
                     code, out = run_recipe(recipe, sandbox_bin(tmp, with_jq=True,
                                                                with_curl_stub=True), tmp)
+                # 🔴 КОД ВОЗВРАТА, а не только отсутствие строк. Проверка на «в выводе
+                # нет таких-то слов» проходит и тогда, когда рецепт упал по совершенно
+                # другой причине: защита, написанная против тишины, сама стала бы
+                # тишиной. Найдено ревью на #98, и это ровно тот класс, который весь
+                # этот файл и ловит.
+                self.assertEqual(
+                    code, 0,
+                    f"{rel}: exited {code} with jq present — the recipe must run to the "
+                    f"end when its prerequisites are there\n{out}")
                 self.assertNotIn("jq is not installed", out,
                                  f"{rel}: the preflight fired with jq present\n{out}")
                 self.assertNotIn("nonce not echoed", out,
                                  f"{rel}: the stub echoed the nonce and the recipe still "
                                  f"rejected it\n{out}")
+                # Граница клейма, сказанная вслух: сеть заглушена, поэтому это НЕ
+                # доказательство, что реестр ответил. Доказано ровно то, что вся
+                # оболочка рецепта отрабатывает и префлайт не мешает счастливому пути.
+                self.assertRegex(
+                    out, r"21538eBF6598e5866BA496A954dE8E39097bFB59|\"result\"",
+                    f"{rel}: reached the end without producing the registry answer — the "
+                    f"recipe stopped somewhere before its own last line\n{out}")
 
 
 if __name__ == "__main__":
