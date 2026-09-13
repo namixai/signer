@@ -36,6 +36,54 @@ NOT_A_SIGNING_CALL = {
 }
 
 
+def strip_balanced_calls(text: str, head: str) -> str:
+    """Вырезать выражения `head(...)` вместе со сбалансированными скобками.
+
+    🔴 Зачем не построчно. Проверка «значение квитанции не встречается вне `Err(`»
+    отбрасывала ЦЕЛУЮ СТРОКУ, если в ней есть `Err(` — и однострочник вида
+    `if refused { Err(..held..) } else { … held … }` прятал использование на успехе.
+    Замерено: такая строка в `sign_account_read` оставляла тест зелёным, и вторая
+    опора (тип успеха) её тоже не ловит, потому что сигнатура не меняется.
+
+    Вырезается ровно выражение, остальная часть строки остаётся под проверкой.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        j = text.find(head, i)
+        if j == -1:
+            out.append(text[i:])
+            break
+        out.append(text[i:j])
+        k = j + len(head)             # head уже включает открывающую скобку
+        depth = 1
+        while k < n and depth:
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+            k += 1
+        out.append(" " * (k - j))
+        i = k
+    return "".join(out)
+
+
+def receipt_value_escapes(body: str):
+    """Имена, которым присвоен take_receipt(...), использованные ВНЕ ветки Err.
+
+    Возвращает список нарушающих строк; пустой список — значение не утекает.
+    Имя берётся из самого присваивания, а не угадывается: слежка за именем вместо
+    значения — это ровно то, на чём проверка уже один раз оказалась зелёной.
+    """
+    m = re.search(r"let\s+(?:mut\s+)?([A-Za-z0-9_]+)\s*=\s*take_receipt\(", body)
+    if not m:
+        return None
+    held = m.group(1)
+    cleaned = strip_balanced_calls(body, "Err(")
+    return held, [line.strip() for line in cleaned.splitlines()
+                  if re.search(rf"\b{re.escape(held)}\b", line)
+                  and "take_receipt(" not in line]
+
+
 def _result_ok_type(signature: str):
     """Ok-часть `Result<Ok, Err>` — со скобочным балансом, а не «до первой запятой».
 
@@ -273,15 +321,14 @@ class ReceiptClaimTest(unittest.TestCase):
         body = fns["sign_account_read"]
         self.assertIn("take_receipt(", body, "sign_account_read больше не берёт квитанцию")
 
-        # (1) чьё имя держит квитанцию — берём из самого присваивания, не угадываем
-        m = re.search(r"let\s+(?:mut\s+)?([A-Za-z0-9_]+)\s*=\s*take_receipt\(", body)
+        # (1) чьё имя держит квитанцию — берём из самого присваивания, не угадываем;
+        #     выражения Err(...) вырезаются со скобочным балансом, а не построчно
+        found = receipt_value_escapes(body)
         self.assertIsNotNone(
-            m, "результат take_receipt() больше не присваивается имени — форма изменилась, "
-               "и следить за значением этим способом нельзя; перепроверьте руками")
-        held = m.group(1)
-        offenders = [line.strip() for line in body.splitlines()
-                     if re.search(rf"\b{re.escape(held)}\b", line)
-                     and "Err(" not in line and "take_receipt(" not in line]
+            found, "результат take_receipt() больше не присваивается имени — форма "
+                   "изменилась, и следить за значением этим способом нельзя; "
+                   "перепроверьте руками")
+        held, offenders = found
         self.assertFalse(
             offenders,
             f"значение квитанции (`{held}`) используется вне ветки Err: {offenders}. "
@@ -296,6 +343,43 @@ class ReceiptClaimTest(unittest.TestCase):
             "receipt", ok_type.lower(),
             f"тип успеха sign_account_read стал нести квитанцию ({ok_type.strip()}) "
             f"— формулировку в README надо менять")
+
+    def test_one_line_conditional_does_not_hide_a_success_use(self):
+        """🔴 Фикстура на однострочник — найдено ревью на #100, и обе опоры её пропускали.
+
+        Построчный фильтр отбрасывал всю строку, если в ней есть `Err(`. Значит
+        `if refused { Err(..held..) } else { … held … }` прятал использование на успехе,
+        а вторая опора (тип успеха) его не ловит, потому что сигнатура не меняется.
+        Замерено на настоящем файле: такая строка оставляла тест зелёным.
+        """
+        leaky = '''
+pub(crate) async fn sign_account_read(state: &AppState) -> Result<Map, Response> {
+    let receipt = take_receipt(&mut resp, customer_id);
+    if refused { return Err(enclave_error_response(mapped, receipt)); } else { record(&receipt); }
+    Ok(headers)
+}
+'''
+        body = _functions(strip_noncode(leaky).splitlines())[0]["sign_account_read"]
+        held, offenders = receipt_value_escapes(body)
+        self.assertEqual(held, "receipt")
+        self.assertTrue(
+            offenders,
+            "использование на успехе в однострочнике с Err( не замечено — фильтр снова "
+            "работает по строкам, а не по выражениям")
+
+        clean = '''
+pub(crate) async fn sign_account_read(state: &AppState) -> Result<Map, Response> {
+    let receipt = take_receipt(&mut resp, customer_id);
+    if refused { return Err(enclave_error_response(mapped, receipt)); }
+    Ok(headers)
+}
+'''
+        body = _functions(strip_noncode(clean).splitlines())[0]["sign_account_read"]
+        _held, offenders = receipt_value_escapes(body)
+        self.assertFalse(
+            offenders,
+            f"честная форма объявлена утечкой: {offenders} — вырезание Err(...) съело "
+            f"больше, чем должно")
 
     def test_a_comment_is_not_a_call(self):
         """🔴 Фикстура на класс «текст принят за механизм».
