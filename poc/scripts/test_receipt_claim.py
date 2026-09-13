@@ -36,6 +36,34 @@ NOT_A_SIGNING_CALL = {
 }
 
 
+def _result_ok_type(signature: str):
+    """Ok-часть `Result<Ok, Err>` — со скобочным балансом, а не «до первой запятой».
+
+    🔴 Первая версия брала `[^,]+` и на типе `Result<(Map, ReceiptValue), Response>`
+    захватывала `(std::collections::BTreeMap<String` — мутация «тип успеха понёс
+    квитанцию» её НЕ покрасила. Нашёл собственной мутацией сразу после того, как
+    написал проверку; вложенные `<>` и `()` здесь обычное дело, и наивный разбор
+    молча отвечает не на тот вопрос.
+    """
+    i = signature.find("-> Result<")
+    if i == -1:
+        return None
+    i += len("-> Result<")
+    depth, start = 0, i
+    while i < len(signature):
+        c = signature[i]
+        if c in "<([":
+            depth += 1
+        elif c in ">)]":
+            if depth == 0:            # закрылся сам Result — запятой верхнего уровня не было
+                return None
+            depth -= 1
+        elif c == "," and depth == 0:
+            return signature[start:i]
+        i += 1
+    return None
+
+
 def strip_noncode(text: str) -> str:
     """Blank out comments, string literals and raw strings, keeping line structure.
 
@@ -223,9 +251,19 @@ class ReceiptClaimTest(unittest.TestCase):
         """По-веточный факт, на который опирается формулировка про /cancel-all.
 
         `sign_account_read` — единственный путь к квитанции у /cancel-all и у чтений.
-        Он вкладывает её в `Err(...)`; на успехе возвращает одни заголовки. Если однажды
-        начнёт возвращать и на успехе, формулировку в README надо будет менять, и этот
-        случай покраснеет раньше, чем страница успеет соврать.
+        Он вкладывает её в `Err(...)`; на успехе возвращает одни заголовки.
+
+        🔴 Следим за ЗНАЧЕНИЕМ, а не за именем. Первая версия искала слово `receipt` в
+        строках вне `Err(` — и переименование `let receipt` в `let decision` с утечкой на
+        успех оставляло её ЗЕЛЁНОЙ. Проверено мутацией. Тот же класс, что весь этот файл
+        ловит: совпадение имён вместо свойства, теперь в третий раз и в моём же коде.
+
+        Две независимые опоры:
+          1. имя, которому присвоен результат `take_receipt(...)`, встречается только в
+             возвратах `Err(...)`;
+          2. тип успеха у функции не несёт квитанции вовсе — что бы ни назвали внутри,
+             на успехе наружу уходит карта заголовков, и провести квитанцию можно только
+             сменив сигнатуру, а её мы и проверяем.
         """
         src = strip_noncode(HANDLERS.read_text(encoding="utf-8", errors="replace"))
         fns, _ = _functions(src.splitlines())
@@ -234,13 +272,30 @@ class ReceiptClaimTest(unittest.TestCase):
                       "и формулировку в README надо перепроверить руками")
         body = fns["sign_account_read"]
         self.assertIn("take_receipt(", body, "sign_account_read больше не берёт квитанцию")
-        offenders = [l.strip() for l in body.splitlines()
-                     if "receipt" in l and "Err(" not in l and "take_receipt(" not in l]
+
+        # (1) чьё имя держит квитанцию — берём из самого присваивания, не угадываем
+        m = re.search(r"let\s+(?:mut\s+)?([A-Za-z0-9_]+)\s*=\s*take_receipt\(", body)
+        self.assertIsNotNone(
+            m, "результат take_receipt() больше не присваивается имени — форма изменилась, "
+               "и следить за значением этим способом нельзя; перепроверьте руками")
+        held = m.group(1)
+        offenders = [line.strip() for line in body.splitlines()
+                     if re.search(rf"\b{re.escape(held)}\b", line)
+                     and "Err(" not in line and "take_receipt(" not in line]
         self.assertFalse(
             offenders,
-            f"квитанция в sign_account_read упоминается вне ветки Err: {offenders}. "
-            f"Если она теперь уходит и на успехе, README про «/cancel-all не выдаёт на "
-            f"успехе» стал неверен")
+            f"значение квитанции (`{held}`) используется вне ветки Err: {offenders}. "
+            f"Если оно уходит и на успехе, README про «/cancel-all не выдаёт на успехе» "
+            f"стал неверен")
+
+        # (2) и вторая опора, независимая от имён: тип успеха
+        sig = body[:body.index("{")] if "{" in body else body
+        ok_type = _result_ok_type(sig)
+        self.assertIsNotNone(ok_type, f"не разобрал сигнатуру sign_account_read: {sig[:120]}")
+        self.assertNotIn(
+            "receipt", ok_type.lower(),
+            f"тип успеха sign_account_read стал нести квитанцию ({ok_type.strip()}) "
+            f"— формулировку в README надо менять")
 
     def test_a_comment_is_not_a_call(self):
         """🔴 Фикстура на класс «текст принят за механизм».
