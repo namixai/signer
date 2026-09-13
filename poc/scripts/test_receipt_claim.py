@@ -36,6 +36,71 @@ NOT_A_SIGNING_CALL = {
 }
 
 
+def strip_noncode(text: str) -> str:
+    """Blank out comments, string literals and raw strings, keeping line structure.
+
+    🔴 Why this is not fussiness. The matcher looked for `take_receipt(` in RAW text, so a
+    handler with no receipt whose COMMENT mentioned the call was classified as carrying
+    one — and CI then stopped demanding that the route be named in the README. Measured:
+    one inserted comment line in `post_sign_data` emptied the "lacks" set entirely. That
+    is "the diagnostic decides the outcome", moved into code parsing: prose taken for
+    mechanism, in the guard whose whole job is catching prose that outruns mechanism.
+
+    Newlines are preserved so line-based splitting downstream keeps working.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        # raw string: r"…" / r#"…"# / r##"…"##
+        if c == "r" and i + 1 < n and (text[i + 1] == '"' or text[i + 1] == "#"):
+            j = i + 1
+            hashes = 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                close = '"' + "#" * hashes
+                k = text.find(close, j + 1)
+                k = n if k == -1 else k + len(close)
+                out.append("".join(ch if ch == "\n" else " " for ch in text[i:k]))
+                i = k
+                continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j == -1 else j
+            out.append(" " * (j - i))
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            depth, j = 1, i + 2           # Rust block comments nest
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth += 1; j += 2
+                elif text.startswith("*/", j):
+                    depth -= 1; j += 2
+                else:
+                    j += 1
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _functions(src_lines):
     """Every fn in the file, private ones included, mapped to its body.
 
@@ -78,9 +143,15 @@ def _reaches_receipt(name, fns, seen=None):
     return False
 
 
-def handlers_with_receipt():
-    """(carries, lacks) — handler names, split by whether a receipt can reach a response."""
-    src = HANDLERS.read_text(encoding="utf-8", errors="replace").splitlines()
+def handlers_with_receipt(source: str | None = None):
+    """(carries, lacks) — handler names, split by whether a receipt can reach a response.
+
+    `source` lets the fixtures below drive this over synthetic Rust; production callers
+    pass nothing and get the real gateway.
+    """
+    raw = source if source is not None else HANDLERS.read_text(encoding="utf-8",
+                                                               errors="replace")
+    src = strip_noncode(raw).splitlines()
     fns, order = _functions(src)
     handlers = [n for n in order if n.startswith(("post_", "get_"))
                 and re.search(rf"pub async fn {re.escape(n)}\b", fns[n])]
@@ -132,6 +203,71 @@ class ReceiptClaimTest(unittest.TestCase):
             f"these signing routes return no receipt and the README does not say so: "
             f"{sorted(unnamed)}. The promise would be wider than the mechanism — narrow "
             f"the claim or give the route a receipt.")
+
+    def test_cancel_all_stays_named(self):
+        """🔴 Страж обязан держать КАЖДОЕ исключение, а не одно из двух.
+
+        Измерено до правки: убрать `post_cancel_all` из маркера — оба теста зелёные.
+        Причина в том, что `test_named_exceptions_are_really_exceptions` утверждал только
+        `post_sign_data`, а разборщик ветки не видит: `/cancel-all` доходит до квитанции
+        через `sign_account_read`, поэтому попадает в «несут» и не требует упоминания.
+        Значит клейм, ради которого написан файл, держался наполовину.
+        """
+        named = exceptions_named_in_readme()
+        self.assertIn(
+            "post_cancel_all", named,
+            "README перестал называть /cancel-all среди исключений, а его УСПЕШНЫЙ путь "
+            "квитанции не несёт — проверено отдельным случаем ниже")
+
+    def test_account_read_returns_a_receipt_only_on_refusal(self):
+        """По-веточный факт, на который опирается формулировка про /cancel-all.
+
+        `sign_account_read` — единственный путь к квитанции у /cancel-all и у чтений.
+        Он вкладывает её в `Err(...)`; на успехе возвращает одни заголовки. Если однажды
+        начнёт возвращать и на успехе, формулировку в README надо будет менять, и этот
+        случай покраснеет раньше, чем страница успеет соврать.
+        """
+        src = strip_noncode(HANDLERS.read_text(encoding="utf-8", errors="replace"))
+        fns, _ = _functions(src.splitlines())
+        self.assertIn("sign_account_read", fns,
+                      "sign_account_read исчез — путь к квитанции у /cancel-all изменился, "
+                      "и формулировку в README надо перепроверить руками")
+        body = fns["sign_account_read"]
+        self.assertIn("take_receipt(", body, "sign_account_read больше не берёт квитанцию")
+        offenders = [l.strip() for l in body.splitlines()
+                     if "receipt" in l and "Err(" not in l and "take_receipt(" not in l]
+        self.assertFalse(
+            offenders,
+            f"квитанция в sign_account_read упоминается вне ветки Err: {offenders}. "
+            f"Если она теперь уходит и на успехе, README про «/cancel-all не выдаёт на "
+            f"успехе» стал неверен")
+
+    def test_a_comment_is_not_a_call(self):
+        """🔴 Фикстура на класс «текст принят за механизм».
+
+        Обработчик без квитанции, у которого нужные слова стоят в комментарии, в строковом
+        литерале и в сырой строке Rust. До правки один такой комментарий в `post_sign_data`
+        опустошал множество «не несут» целиком.
+        """
+        fixture = '''
+pub async fn post_sign_nothing(State(state): State<AppState>) -> Response {
+    // historical note: this used to call take_receipt(&mut resp, customer);
+    /* and sign_structured_request( was considered here too */
+    let msg = "take_receipt(";
+    let raw = r#"sign_structured_request("#;
+    error_response(err_code::INTERNAL_ERROR)
+}
+
+pub async fn post_sign_really(State(state): State<AppState>) -> Response {
+    let receipt = take_receipt(&mut resp, customer);
+    Json(Thing { receipt }).into_response()
+}
+'''
+        carries, lacks = handlers_with_receipt(fixture)
+        self.assertIn("post_sign_nothing", lacks,
+                      "комментарий/литерал засчитан как вызов — текст принят за механизм")
+        self.assertIn("post_sign_really", carries,
+                      "настоящий вызов перестал распознаваться — стриппер съел код")
 
     def test_named_exceptions_are_really_exceptions(self):
         """An exception list that outlives the exception is its own kind of false claim."""
