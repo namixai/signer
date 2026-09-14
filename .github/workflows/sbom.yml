@@ -48,7 +48,7 @@ jobs:
         run: rustup show
       - name: Install cargo-cyclonedx (prebuilt)
         # PREBUILT binary — no per-run source compile. SHA-pinned + Dependabot-tracked.
-        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2
         with:
           tool: cargo-cyclonedx
       - name: Generate SBOM (enclave target)
