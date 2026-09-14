@@ -68,7 +68,7 @@
 # Docker base images — pinned by digest (immutable)
 ###############################################################################
 # clux/muslrust:1.83.0-stable
-clux_muslrust_digest=sha256:b7fc8af3935272606a9682e5bbe21516744cf2f3934ce6f4d250198db3b2bd5c
+clux_muslrust_digest=sha256:12c891e359da48060efbc2b658dec2db539f92bc1e35564890bf5755b265ee91
 
 # public.ecr.aws/amazonlinux/amazonlinux:2
 amazonlinux_2_digest=sha256:c80c6d724a1907d0fdfe1e04f6ddff1e839311dadf19f9645646d4506bc0d2e5
@@ -87,12 +87,12 @@ aws_c_http=0600662610aa871a11aebe6ed67a11997317cbef          # tag v0.7.6
 aws_c_auth=831fa583b83574db29cbae139b42e0d7a1d1ebb8          # tag v0.6.15
 json_c=13fede6e87d94ea9015b8d2745a235e1b02700e7              # tag json-c-0.16-20220414
 aws_nitro_enclaves_nsm_api=5798fec36f49e1d199c77947f4e51f86b663750f  # tag v0.4.0
-aws_nitro_enclaves_sdk_c=4c88098890de1e371820b9e3c6bc535e69493119    # tag v0.4.0
+aws_nitro_enclaves_sdk_c=cd61b6187c8b20867ba4368d1ae62c5790c0269a    # ARG AWS_NITRO_SDK_C_REF в enclave/Dockerfile
 
 ###############################################################################
 # Rust toolchain — exact version (not floating)
 ###############################################################################
-rust_enclave=1.83.0           # rust-toolchain.toml
+rust_enclave=1.95.0           # rust-toolchain.toml
 rust_kmstool_nsm_lib=1.92.0   # built inside kmstool-builder stage
 
 ###############################################################################
