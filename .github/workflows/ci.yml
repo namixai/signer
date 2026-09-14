@@ -70,6 +70,15 @@ jobs:
       # standalone (plain C, no SDK types) and drives it; ubuntu-latest has cc.
       - name: Vendored kmstool stdin parser (fail-closed cases)
         run: python3 scripts/test_secrets_stdin.py
+      # 🔴 Пины сборки против самих Dockerfile и rust-toolchain.toml. `build-pins.txt` —
+      # поверхность ВНЕШНЕГО аудитора: по ней он пересобирает образ, чтобы сверить PCR0,
+      # и на неё ссылаются VERIFY-SIGNER-YOURSELF.md и REPRODUCIBLE-BUILD.md. Сам файл
+      # в комментарии утверждал «runs in CI on every PR» — это была фраза, а не факт:
+      # гейт не звал ни один воркфлоу ни в одном из двух репозиториев, а в публичном
+      # его не было вовсе. Аудит 14.09 нашёл три расходящихся пина руками; этот шаг
+      # существует, чтобы следующие три нашлись машиной.
+      - name: Build pins match the Dockerfile they claim to describe
+        run: python3 scripts/test_build_pins_match_dockerfile.py
       # 🔴 Обещание README против обработчиков, которые его держат. Страница
       # говорила «Every signed call returns a Verifiable Policy Proof», а
       # /sign/data — подписанный вызов без квитанции: клейм был шире механизма
