@@ -94,9 +94,51 @@ def _amazonlinux_digest() -> str:
 
 
 def _kmstool_rust() -> str:
-    m = re.search(r"--default-toolchain\s+([0-9][0-9.]*)", _dockerfile())
-    _need(m, "в Dockerfile нет `--default-toolchain <версия>`")
-    return m.group(1)
+    """Версия тулчейна kmstool — из АКТИВНЫХ строк Dockerfile, не из комментариев.
+
+    🔴 Замерено 14.09, и промах был в опасную сторону. Поиск шёл по всему тексту, и
+    устаревший комментарий со значением, совпадающим с пином, ЗАТЕНЯЛ активную строку:
+    Dockerfile собирал на `9.9.9`, `build-pins.txt` говорил `1.92.0`, а гейт печатал
+    «5/5 passed». То есть проверка, заведённая ловить тихое расхождение, сама тихо его
+    пропускала — прозу принимала за механизм. Найдено ревью CodeRabbit на #101.
+
+    Активных значений должно быть ровно одно: две разные версии в живых строках — это
+    не «возьмём первую», а расхождение, о котором надо сказать.
+    """
+    got = {
+        m.group(1)
+        for line in _dockerfile().splitlines()
+        if not line.lstrip().startswith("#")
+        for m in [re.search(r"--default-toolchain\s+([0-9][0-9.]*)", _strip_inline_comment(line))]
+        if m
+    }
+    _need(got, "в Dockerfile нет активной строки `--default-toolchain <версия>`")
+    _need(len(got) == 1,
+          f"в активных строках Dockerfile несколько версий тулчейна kmstool: {sorted(got)}")
+    return got.pop()
+
+
+def _strip_inline_comment(line: str) -> str:
+    """Отрезать хвостовой `#…`, не трогая решётки внутри кавычек.
+
+    Без этого `RUN foo   # --default-toolchain 1.70.0` снова затенял бы активное
+    значение — тем же способом, только на одной строке.
+    """
+    out, quote = [], None
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out)
 
 
 NON_DOCKERFILE_PINS = {
@@ -174,7 +216,21 @@ def test_every_dockerfile_ref_arg_is_pinned():
 
 def test_every_pin_matches_its_source_in_the_tree():
     p = pins()
-    df_args = dict(re.findall(r"^ARG\s+([A-Z0-9_]+)=(\S+)", _dockerfile(), re.M))
+    df_args = dict(re.findall(r"^ARG\s+([A-Z0-9_]+)\s*=\s*(\S+)", _dockerfile(), re.M))
+
+    # 🔴 СНАЧАЛА — что пин вообще есть. Цикл ниже идёт по ключам, КОТОРЫЕ ОСТАЛИСЬ в
+    # файле, поэтому удалённый пин не сверялся ни с чем и гейт оставался зелёным.
+    # Замерено 14.09: убрать строку `rust_enclave=` из манифеста — 5/5 passed, при том
+    # что манифест аудитора потерял зависимость сборки. Отсутствие голосовало за успех
+    # ровно там, где файл читается как истина. Найдено ревью CodeRabbit на #101.
+    expected = set(NON_DOCKERFILE_PINS) | set(ARG_OF)
+    missing = sorted(k for k in expected if k not in p)
+    _need(not missing,
+          "пины, для которых в дереве есть источник, ПРОПАЛИ из build-pins.txt: "
+          + ", ".join(missing)
+          + ". Аудитор читает этот файл как полный список зависимостей сборки; "
+            "молчаливая недостача здесь — это не пустое место, а неверный список.")
+
     mismatched, unsourced = [], []
     for key, value in sorted(p.items()):
         if key in PINS_WITHOUT_TREE_SOURCE or YUM_PIN.match(key):
@@ -217,10 +273,15 @@ def dockerfile_yum_packages() -> set:
     строку, и упоминание в прозе: пакет, снятый с установки, продолжал бы
     «подтверждать» свой пин (CodeRabbit)."""
     df = _dockerfile()
-    m = re.search(r"^RUN\s+yum\s+install\b(.*?)(?=^\s*$|^[A-Z]+\s)", df, re.M | re.S)
-    _need(m, "в Dockerfile не найден блок `RUN yum install`")
+    # 🔴 findall, не search: `search` брал ТОЛЬКО ПЕРВЫЙ блок, и вторая стадия сборки со
+    # своим `RUN yum install` осталась бы непроверенной — пакет, добавленный туда,
+    # никогда бы не сверился с пином. Сегодня блок один (замерено), и это ровно та
+    # причина, по которой дефект не виден: он ждёт второй стадии. Найдено ревью Gemini
+    # на #101.
+    blocks = re.findall(r"^RUN\s+yum\s+install\b(.*?)(?=^\s*$|^[A-Z]+\s)", df, re.M | re.S)
+    _need(blocks, "в Dockerfile не найден блок `RUN yum install`")
     out = set()
-    for raw in m.group(1).splitlines():
+    for raw in "\n".join(blocks).splitlines():
         line = raw.split("#", 1)[0].replace("\\", " ")
         for tok in line.split():
             if tok in {"-y", "&&", "yum", "clean", "all", "install"} or tok.startswith("-"):
