@@ -324,7 +324,7 @@ Then ask your agent to place a small limit order. **Point the venue at testnet y
 
 For direct programmatic use, the TypeScript SDK is on npm — `npm i @usenami/signer` (see [`sdk/typescript`](./sdk/typescript)).
 
-Every **order and cancel** — the whole money path, on both the allow and the refuse branch — returns a **Verifiable Policy Proof**: a Nitro attestation receipt proving the enclave decided on your specific request under your declared UPL policy. The generic `/sign`, `/sign/x402` and `/sign/permit2` routes carry one too, so the SDK's calls all have it.
+Every **order and cancel** — the whole money path, on both the allow and the refuse branch — returns a **Verifiable Policy Proof**: a Nitro attestation receipt proving the enclave decided on your specific request under your declared UPL policy. The generic `/sign` and `/sign/x402` routes carry one too, so the SDK's calls all have it. (`/sign/permit2-permit-single` is not a route you can obtain a signature from — see *Project status* below.)
 
 <!-- receipt-exceptions: post_sign_data post_cancel_all -->
 <!-- Machine-readable on purpose. poc/scripts/test_receipt_claim.py reads THIS line, not
@@ -379,7 +379,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
 > | tag `pcr0-103ccd79` = commit `96cd4e46` (2026-08-23, merge of #55) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured 2026-08-23/26; **previously** deployed to production 2026-08-24 → 2026-09-03, deregistered since |
 > | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; production 2026-09-03 → 2026-09-10, **deregistered since** |
-> | tag `pcr0-fbaad62f` = commit `865f4182` (2026-09-10) | `SIGNER_REQUIRE_POLICY=1` | `fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f` — adds the Permit2 `PermitSingle` action; measured 2026-09-10 from two separate clean public clones at the tag; **production since 2026-09-10, demo since 2026-09-11**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
+> | tag `pcr0-fbaad62f` = commit `865f4182` (2026-09-10) | `SIGNER_REQUIRE_POLICY=1` | `fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f` — adds the Permit2 `PermitSingle` action, which no key can be provisioned for (see *Project status* below); measured 2026-09-10 from two separate clean public clones at the tag; **production since 2026-09-10, demo since 2026-09-11**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
 > | commit `1207d37` (2026-08-19, on the `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | a previous measurement that **belongs to no lane — never deployed, never registered**: `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9`. HEAD no longer reproduces it: `anyhow` and `thiserror` were bumped after it was taken |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
@@ -467,9 +467,29 @@ A value printed in a README goes stale silently; the one this repository publish
 
 Shipped:
 - **UPL** (Usenami Policy Layer) — JSON policy validated in-enclave on every sign request, including order-size and transfer-recipient enforcement (live)
-- **Verifiable Policy Proof** — Nitro attestation receipt on every order and cancel decision, allow or refuse, plus the generic `/sign`, `/sign/x402` and `/sign/permit2` routes (live). Not on `/sign/data`, and not on a successful `/cancel-all` — see the exceptions named above.
+- **Verifiable Policy Proof** — Nitro attestation receipt on every order and cancel decision, allow or refuse, plus the generic `/sign` and `/sign/x402` routes (live). Not on `/sign/data`, and not on a successful `/cancel-all` — see the exceptions named above.
 - **On-chain attestation registry** on Base — removes the trust-Usenami-website assumption (live)
 - **MCP server** (`@usenami/signer-mcp`) + **Eliza plugin** — sign from any MCP-aware AI agent (shipped)
+
+**Permit2 — in the image, not obtainable.** The enclave image built from tag `pcr0-fbaad62f`
+contains a Permit2 `PermitSingle` action, and no key can be provisioned for it today — so
+nobody, us included, can obtain a Permit2 signature from this service. Until 2026-09-20 the
+list above named `/sign/permit2` among the live routes. That was wrong twice over: the
+gateway route is `/sign/permit2-permit-single`, and it has no key to sign with.
+
+Why this is a limitation we are leaving open, and not a defect in a queue: the enclave
+classifies `permit2` as a money venue, so under the strict build (`SIGNER_REQUIRE_POLICY=1`,
+which production runs) a key for it must carry a non-empty `order_caps`. `order_caps` is a
+per-symbol order ceiling on an exchange — it cannot express a Permit2 allowance. A policy
+carrying only the `permit2` clause is refused at load. It would load with a decorative
+`order_caps` that constrains nothing, which is the exact false guarantee that check exists
+to prevent, so we do not provision it that way. No `permit2` grant has been issued on either
+lane. We are not saying "coming soon" either — half of this feature is worse than none of it.
+
+If you are checking this against the code rather than taking the page's word for it: the
+`policy-cli` in this repository accepts a `permit2` clause. The tool we provision production
+keys with does not carry that field, so a clause parsing here is not evidence that a key
+exists behind it.
 
 ---
 
