@@ -4,7 +4,7 @@
 
 Your exchange API secrets never leave a measured AWS Nitro Enclave. Even root on the host VM can't read them. AWS KMS releases secrets only to a specific, attested binary — change one byte, KMS denies.
 
-🔗 **Live demo:** [signer-demo.usenami.io:8443/healthz](http://signer-demo.usenami.io:8443/healthz) (open — it answers 200 to anyone; earlier revisions of this line said "allowlisted pilots only", which was never true of `/healthz`) &middot; full walkthrough in [`DEMO.md`](DEMO.md)
+**21 September 2026: we've switched off our hosted lanes.** The production box and the public demo are both stopped. We have no users yet, so we're not paying for idle machines. Everything below about how the enclave decides still holds, and the reproducible build and the on-chain registry haven't changed. There is just nowhere to send a request: `signer.usenami.io` and `signer-demo.usenami.io` don't answer. The registry still lists `fbaad62f…` as active; that records what we authorized, not a box that's running.
 📜 **License:** Apache-2.0
 
 ---
@@ -16,7 +16,7 @@ You upload an encrypted secret once. Your bot calls our SDK to sign requests. Th
 ```
 Your bot  →  Usenami SDK  →  Gateway :8443  →  [vsock]  →  Nitro Enclave
                                                             ├ KMS Decrypt (attestation-gated)
-                                                            ├ UPL policy validation (live)
+                                                            ├ UPL policy validation (built)
                                                             └ HMAC-SHA256 or EIP-712 sign
                                                                   ↓
 Your bot  ←  signed headers / signature  ←  Gateway
@@ -126,7 +126,7 @@ sdk/
 >
 > | PCR0 | what it is | `isPCR0Active` → `(active, owner)` |
 > |---|---|---|
-> | `fbaad62f…` | **production and public demo** — production since 2026-09-10, demo since 2026-09-11 | **`(true, 0x21538eBF…)`** |
+> | `fbaad62f…` | **production and public demo** — production 2026-09-10 → 2026-09-21, demo 2026-09-11 → 2026-09-21, stopped since, still registered | **`(true, 0x21538eBF…)`** |
 > | `60036cd3…` | production 2026-09-03 → 2026-09-10 | `(false, 0x0000…0000)` — deregistered |
 > | `103ccd79…` | production 2026-08-24 → 2026-09-03, then the demo box until 2026-09-11 | `(false, 0x0000…0000)` — deregistered |
 > | `32d25d8c…` | production 2026-08-10 → 08-24, then the demo box alone until 2026-08-27 | `(false, 0x0000…0000)` |
@@ -379,7 +379,7 @@ SIGNER_REQUIRE_POLICY=1 ./scripts/build-eif.sh
 > | commit `db68182` | `SIGNER_REQUIRE_POLICY=0 SIGNER_ROTATION_GATE=0` | `9f80b8d4…` — permissive, not deployed anywhere |
 > | tag `pcr0-103ccd79` = commit `96cd4e46` (2026-08-23, merge of #55) | `SIGNER_REQUIRE_POLICY=1` | `103ccd79de6c5dc66b3aa52465fc6f6e025170612de160415c7bc690a7622a36dcb49f57d0b07786d107c6a52b8392e3` — measured 2026-08-23/26; **previously** deployed to production 2026-08-24 → 2026-09-03, deregistered since |
 > | tag `pcr0-60036cd3` = commit `3bf4f62c` (2026-09-02) | `SIGNER_REQUIRE_POLICY=1` | `60036cd3555641a52ea1937cfe593531082c2f01fde49e199ce98858f8649a7db17d3d7b6092dfec131ef7e2e8471e71` — measured 2026-09-02 from a clean public clone at the tag; production 2026-09-03 → 2026-09-10, **deregistered since** |
-> | tag `pcr0-fbaad62f` = commit `865f4182` (2026-09-10) | `SIGNER_REQUIRE_POLICY=1` | `fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f` — adds the Permit2 `PermitSingle` action, which no key can be provisioned for (see [Project status](#project-status-2026-08-22) below); measured 2026-09-10 from two separate clean public clones at the tag; **production since 2026-09-10, demo since 2026-09-11**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
+> | tag `pcr0-fbaad62f` = commit `865f4182` (2026-09-10) | `SIGNER_REQUIRE_POLICY=1` | `fbaad62f826c1451c51b03edb9b87b319bcff651d3283c24a24540899662dddc0c331e34cdd0315cbaf4c6aa05a2831f` — adds the Permit2 `PermitSingle` action, which no key can be provisioned for (see [Project status](#project-status-2026-08-22) below); measured 2026-09-10 from two separate clean public clones at the tag; **production 2026-09-10 → 2026-09-21, demo 2026-09-11 → 2026-09-21, both stopped since**; whether an endpoint attests it **today** is that endpoint's `/attestation` to answer, and the registry's `isPCR0Active` + owner to confirm |
 > | commit `1207d37` (2026-08-19, on the `main` lineage) | `SIGNER_REQUIRE_POLICY=1` | a previous measurement that **belongs to no lane — never deployed, never registered**: `b502601bcd11517d7bb0ddcd4b21b5374097248936be79b832d3bd53cb02d2141c88bffb29c975a9c431ac73207a1cf9`. HEAD no longer reproduces it: `anyhow` and `thiserror` were bumped after it was taken |
 >
 > Between 2026-08-17 and 2026-08-20 this section pointed a `main` checkout at the
@@ -466,8 +466,8 @@ NSM-signed COSE document carrying the running measurement, and it is the authori
 A value printed in a README goes stale silently; the one this repository published did.
 
 Shipped:
-- **UPL** (Usenami Policy Layer) — JSON policy validated in-enclave on every sign request, including order-size and transfer-recipient enforcement (live)
-- **Verifiable Policy Proof** — Nitro attestation receipt on every order and cancel decision, allow or refuse, plus the generic `/sign` and `/sign/x402` routes (live). Not on `/sign/data`, and not on a successful `/cancel-all` — see the exceptions named above.
+- **UPL** (Usenami Policy Layer) — JSON policy validated in-enclave on every sign request, including order-size and transfer-recipient enforcement (built; hosted lanes stopped 2026-09-21)
+- **Verifiable Policy Proof** — Nitro attestation receipt on every order and cancel decision, allow or refuse, plus the generic `/sign` and `/sign/x402` routes (built; hosted lanes stopped 2026-09-21). Not on `/sign/data`, and not on a successful `/cancel-all` — see the exceptions named above.
 - **On-chain attestation registry** on Base — removes the trust-Usenami-website assumption (live)
 - **MCP server** (`@usenami/signer-mcp`) + **Eliza plugin** — sign from any MCP-aware AI agent (shipped)
 
