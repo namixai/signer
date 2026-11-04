@@ -11,6 +11,22 @@
 # cargo-deny), so the expiry is documented here and enforced by process — every
 # ignore is re-evaluated at the next PCR0 rotation (when the vendored tree is
 # re-synced anyway) and, at the latest, reviewed by 2026-10-23 (90 days).
+#
+# Reviewed 2026-11-04 (the 2026-10-23 date had passed with CI red on new advisories).
+# The four entries below the first line still hold. New advisories, one by one:
+#   - rustls 0.23.45 (RUSTSEC-2026-0346/0347/0348/0349), rustls-webpki 0.103.15
+#     (RUSTSEC-2026-0382), webpki-roots 1.0.7 (RUSTSEC-2026-0381): host-side ONLY
+#     (`cargo tree -i` roots: signer-gateway; `-p signer-enclave -i` matches nothing).
+#     FIXED, not ignored: bumped in Cargo.lock to 0.23.46 / 0.103.16 / 1.0.10.
+#     `scripts/enclave-closure-check.py` still reports the measured enclave closure
+#     unchanged (134 crates), so the PCR0 does not move.
+#   - quinn-proto 0.11.14 (four new ids): ignored below, same lockfile-only reason as 0185.
+#   - tokio 1.52.3 (RUSTSEC-2026-0386, unsound): ignored below, the API is never called.
+#   - crypto-bigint 0.5.5 (RUSTSEC-2026-0387): REACHABLE on the attested signing path
+#     (k256 0.13.4 -> ecdsa / elliptic-curve -> crypto-bigint, root signer-enclave).
+#     NOT ignored: CI stays red on it until the fix (crypto-bigint >= 0.7.6, a new
+#     k256 / elliptic-curve line, a new PCR0). The signer is stopped since 2026-09-21,
+#     so nothing signs meanwhile. Next review: that fix, or 2027-02-01.
 
 [advisories]
 ignore = [
@@ -41,4 +57,20 @@ ignore = [
   # the enclave never calls `downcast`/`downcast_mut` (grep-verified across
   # enclave/src). Fix requires an anyhow bump = new PCR0. Review-by: 2026-10-23 / rotation.
   "RUSTSEC-2026-0190",
+
+  # RUSTSEC-2026-0338 / 0339 / 0340 / 0342 — quinn-proto 0.11.14: STREAM and DATAGRAM
+  # frame handling, connection-ID retirement, ACK delay. Same crate and same reason as
+  # 0185 above: NOT COMPILED into any binary (`cargo tree -i quinn-proto@0.11.14`
+  # has no root on 2026-11-04; reqwest's http3 stays off). Review-by: next PCR0 rotation.
+  "RUSTSEC-2026-0338",
+  "RUSTSEC-2026-0339",
+  "RUSTSEC-2026-0340",
+  "RUSTSEC-2026-0342",
+
+  # RUSTSEC-2026-0386 — tokio 1.52.3: `AsyncFd::new` and related constructors violate
+  # I/O safety (unsound, not a CVE). tokio IS on the attested path (signer-enclave) and
+  # in signer-gateway / signer-client, BUT the unsound API is unreachable: no crate here
+  # calls `AsyncFd` (grep over enclave/, gateway/, parent/, policy-cli/ src = 0 on
+  # 2026-11-04). Fix = a tokio bump = new PCR0. Review-by: next PCR0 rotation.
+  "RUSTSEC-2026-0386",
 ]
