@@ -21,12 +21,32 @@
 #     `scripts/enclave-closure-check.py` still reports the measured enclave closure
 #     unchanged (134 crates), so the PCR0 does not move.
 #   - quinn-proto 0.11.14 (four new ids): ignored below, same lockfile-only reason as 0185.
-#   - tokio 1.52.3 (RUSTSEC-2026-0386, unsound): ignored below, the API is never called.
+#   - tokio 1.52.3 (RUSTSEC-2026-0386, unsound `AsyncFd::new` and related constructors):
+#     REACHABLE through tokio-vsock 0.5.0, which wraps every vsock socket with
+#     `AsyncFd::new` (`VsockListener::new`, `VsockStream::new`). The advisory needs an
+#     AsyncFd whose descriptor it does not own exclusively, or one that is closed or
+#     replaced while the AsyncFd is alive. Construction path by path:
+#       * bind / accept (the enclave's only vsock calls, enclave/src/vsock_server.rs):
+#         the inner `vsock` 0.4.0 type holds an `OwnedFd` that only the AsyncFd owns. It
+#         is closed only on drop, after deregistration. tokio-vsock never dups it, and no
+#         crate here touches the raw fd (grep for as_raw_fd / into_raw_fd / from_raw_fd /
+#         try_clone / AsyncFd over enclave/, gateway/, parent/, policy-cli/ = 0). Holds.
+#       * connect (signer-gateway src/vsock.rs, signer-client src/main.rs; host side):
+#         does NOT hold. In tokio-vsock 0.5.0 `VsockStream::connect` (src/stream.rs, the
+#         `Err(_would_block) => continue` arm), a would-block result from the SO_ERROR
+#         check drops the AsyncFd, which closes the socket, and the next pass re-wraps the
+#         same raw number with `from_raw_fd`: an AsyncFd over a closed, possibly reused
+#         descriptor. That arm needs SO_ERROR = EAGAIN; we have not shown that the kernel
+#         never reports it.
+#     NOT ignored: CI stays red on it. A tokio bump alone (>= 1.53.3, which changes the
+#     enclave closure, so a new PCR0) does not close the connect arm, which lives in
+#     tokio-vsock (0.7.3 is current; not reviewed here). Both go into the rotation.
 #   - crypto-bigint 0.5.5 (RUSTSEC-2026-0387): REACHABLE on the attested signing path
 #     (k256 0.13.4 -> ecdsa / elliptic-curve -> crypto-bigint, root signer-enclave).
 #     NOT ignored: CI stays red on it until the fix (crypto-bigint >= 0.7.6, a new
-#     k256 / elliptic-curve line, a new PCR0). The signer is stopped since 2026-09-21,
-#     so nothing signs meanwhile. Next review: that fix, or 2027-02-01.
+#     k256 / elliptic-curve line, a new PCR0).
+# The signer is stopped since 2026-09-21, so nothing signs or connects meanwhile.
+# Next review of both open items: the PCR0 rotation that fixes them, or 2027-02-01.
 
 [advisories]
 ignore = [
@@ -66,11 +86,4 @@ ignore = [
   "RUSTSEC-2026-0339",
   "RUSTSEC-2026-0340",
   "RUSTSEC-2026-0342",
-
-  # RUSTSEC-2026-0386 — tokio 1.52.3: `AsyncFd::new` and related constructors violate
-  # I/O safety (unsound, not a CVE). tokio IS on the attested path (signer-enclave) and
-  # in signer-gateway / signer-client, BUT the unsound API is unreachable: no crate here
-  # calls `AsyncFd` (grep over enclave/, gateway/, parent/, policy-cli/ src = 0 on
-  # 2026-11-04). Fix = a tokio bump = new PCR0. Review-by: next PCR0 rotation.
-  "RUSTSEC-2026-0386",
 ]
