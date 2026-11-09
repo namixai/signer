@@ -41,7 +41,7 @@ tower-http = { version = "0.7", features = ["trace", "limit", "timeout"] }
 tower = { version = "0.5", features = ["limit", "load-shed"] }
 
 # Async sync primitives
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # IMDSv2 is a 2-call HTTP flow over the link-local 169.254.169.254 address.
 # We pin reqwest at 0.12.5, which still resolves under digest 0.10 (newer
